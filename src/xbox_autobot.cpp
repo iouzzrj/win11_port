@@ -1,4 +1,5 @@
 #include "xbox_autobot.h"
+#include "autobot_levels.h"
 #include <math.h>
 #include <vector>
 #include <string>

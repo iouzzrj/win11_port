@@ -39,6 +39,7 @@ add_executable(GhostWin11 WIN32
     include/ghost_runtime.h
     include/ghost_symbols.h
     include/xbox_d3d8_types.h
+    include/autobot_levels.h
 )
 
 target_include_directories(GhostWin11 PRIVATE
