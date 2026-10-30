@@ -1,0 +1,9 @@
+build/
+out/
+.vs/
+*.obj
+*.pdb
+*.map
+*.ilk
+*.exp
+*.lib

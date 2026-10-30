@@ -1,0 +1,42 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "x86-release",
+      "displayName": "Windows x86 Release",
+      "description": "Build 32-bit x86 GhostWin11.exe (Release) using Visual Studio",
+      "binaryDir": "${sourceDir}/build",
+      "architecture": {
+        "value": "Win32",
+        "strategy": "set"
+      }
+    },
+    {
+      "name": "x86-debug",
+      "displayName": "Windows x86 RelWithDebInfo",
+      "description": "Build 32-bit x86 GhostWin11.exe with full symbols",
+      "binaryDir": "${sourceDir}/build",
+      "architecture": {
+        "value": "Win32",
+        "strategy": "set"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "x86-release",
+      "configurePreset": "x86-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "x86-debug",
+      "configurePreset": "x86-debug",
+      "configuration": "RelWithDebInfo"
+    }
+  ]
+}
