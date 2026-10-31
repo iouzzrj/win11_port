@@ -24,23 +24,54 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+# Generate C++ raw string literal include from pure shaders/ghost.hlsl
+set(GHOST_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(GHOST_HLSL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ghost.hlsl")
+set(GHOST_HLSL_INC "${GHOST_GEN_DIR}/ghost_hlsl.inc")
+
+add_custom_command(
+    OUTPUT "${GHOST_HLSL_INC}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${GHOST_GEN_DIR}"
+    COMMAND "${Python3_EXECUTABLE}" -c
+        "import sys, pathlib; p = pathlib.Path(sys.argv[1]); out = pathlib.Path(sys.argv[2]); out.write_text('R\"GHOST_HLSL(\\n' + p.read_text(encoding='utf-8') + ')GHOST_HLSL\"\\n', encoding='utf-8')"
+        "${GHOST_HLSL_SRC}" "${GHOST_HLSL_INC}"
+    DEPENDS "${GHOST_HLSL_SRC}"
+    COMMENT "Embedding shaders/ghost.hlsl into generated/ghost_hlsl.inc"
+    VERBATIM
+)
+
 # Define the GhostWin11 executable target
 # NOTE: src/xbox_space.cpp MUST be the first source file so the linker places '.xbox'
 # (0x00401000..0x00950FFF) as Section #1 before host '.text' (0x00951000+).
 add_executable(GhostWin11 WIN32
     src/xbox_space.cpp
     src/main.cpp
-    src/launcher_ui.cpp
-    src/xbox_kernel_xapi.cpp
-    src/xbox_d3d8.cpp
-    src/xbox_audio.cpp
+    src/config.cpp
+    src/launcher.cpp
+    src/patch.cpp
+    src/xbox_kernel.cpp
+    src/xbox_xapi.cpp
     src/xbox_input.cpp
+    src/xbox_video.cpp
+    src/audio_adpcm.cpp
+    src/audio_buffer.cpp
+    src/audio_stream.cpp
+    src/d3d11_backend.cpp
+    src/d3d8_texture.cpp
+    src/d3d8_shader.cpp
+    src/d3d8_draw.cpp
     include/ghost_runtime.h
+    include/ghost_addresses.h
     include/xbox_d3d8_types.h
+    shaders/ghost.hlsl
+    "${GHOST_HLSL_INC}"
 )
+
+set_source_files_properties(shaders/ghost.hlsl PROPERTIES HEADER_FILE_ONLY TRUE)
 
 target_include_directories(GhostWin11 PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${GHOST_GEN_DIR}"
 )
 
 target_compile_definitions(GhostWin11 PRIVATE

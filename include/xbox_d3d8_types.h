@@ -279,3 +279,233 @@ enum XboxTextureStageState : uint32_t {
 
     XBOX_D3DTSS_MAX                           = 32
 };
+
+// ============================================================================
+// Xbox D3D8 Hardware Structures & Unified D3D11 Vertex / Constant Buffer Types
+// ============================================================================
+
+static constexpr uint32_t kXboxTexAddressWrap   = 1u;
+static constexpr uint32_t kXboxTexAddressMirror = 2u;
+static constexpr uint32_t kXboxTexAddressClamp  = 3u;
+static constexpr uint32_t kXboxTexAddressBorder = 4u;
+static constexpr uint32_t kXboxTexFilterPoint   = 1u;
+static constexpr uint32_t kCustomVsBumpEnv      = 8u;
+static constexpr uint32_t kCustomVsEnvmap       = 9u;
+
+#pragma pack(push, 1)
+struct XboxPixelContainer {
+    uint32_t Common; // +0x00
+    uint32_t Data;   // +0x04 (pointer to pixel memory)
+    uint32_t Lock;   // +0x08
+    uint32_t Format; // +0x0C (D3DFORMAT shift=8, dimensionality, mipmap levels, etc.)
+    uint32_t Size;   // +0x10 (0 if power-of-two swizzled; non-zero for linear/rect textures)
+};
+
+struct XboxVertexBuffer {
+    uint32_t Common; // +0x00
+    uint32_t Data;   // +0x04 (pointer to vertex/index data)
+    uint32_t Lock;   // +0x08
+};
+
+struct XboxPushBuffer {
+    uint32_t Common;         // +0x00
+    uint32_t Data;           // +0x04
+    uint32_t Lock;           // +0x08
+    uint32_t Size;           // +0x0C
+    uint32_t AllocationSize; // +0x10
+};
+
+struct XboxLockedRect {
+    int32_t Pitch;
+    void*   pBits;
+};
+
+struct XboxViewport {
+    uint32_t X;
+    uint32_t Y;
+    uint32_t Width;
+    uint32_t Height;
+    float    MinZ;
+    float    MaxZ;
+};
+
+struct Mat44 {
+    float m[4][4];
+};
+
+struct XboxMaterial8 {
+    float Diffuse[4];
+    float Ambient[4];
+    float Specular[4];
+    float Emissive[4];
+    float Power;
+};
+
+struct XboxLight8 {
+    uint32_t Type; // 1=POINT, 2=SPOT, 3=DIRECTIONAL
+    float    Diffuse[4];
+    float    Specular[4];
+    float    Ambient[4];
+    float    Position[3];
+    float    Direction[3];
+    float    Range;
+    float    Falloff;
+    float    Attenuation0;
+    float    Attenuation1;
+    float    Attenuation2;
+    float    Theta;
+    float    Phi;
+};
+
+struct UnifiedVertex {
+    float x, y, z, w;
+    float nx, ny, nz;
+    float r, g, b, a;
+    float u0, v0;
+    float u1, v1;
+    float u2, v2;
+    float u3, v3;
+};
+
+struct alignas(16) PerDrawCBData {
+    float    wvpRow0[4];
+    float    wvpRow1[4];
+    float    wvpRow2[4];
+    float    wvpRow3[4];
+    float    viewport[4];   // x, y, width, height
+    float    tfactor[4];    // r, g, b, a
+    uint32_t stage0Ops[4];  // colorOp, colorArg1, colorArg2, colorArg0
+    uint32_t stage0Alpha[4];// alphaOp, alphaArg1, alphaArg2, alphaArg0
+    uint32_t stage1Ops[4];  // colorOp, colorArg1, colorArg2, colorArg0
+    uint32_t stage1Alpha[4];// alphaOp, alphaArg1, alphaArg2, alphaArg0
+    uint32_t stage2Ops[4];  // colorOp, colorArg1, colorArg2, colorArg0
+    uint32_t stage2Alpha[4];// alphaOp, alphaArg1, alphaArg2, alphaArg0
+    uint32_t stage3Ops[4];  // colorOp, colorArg1, colorArg2, colorArg0
+    uint32_t stage3Alpha[4];// alphaOp, alphaArg1, alphaArg2, alphaArg0
+    uint32_t flags[4];      // x=isRhw, y=texMask(bit0..3), z=alphaTestEnable, w=psMode
+    float    alphaTest[4];  // x=alphaFunc (1..8), y=alphaRef (0..1), z=gamma, w=brightness
+    float    uvScale01[4];  // x=uScale0, y=vScale0, z=uScale1, w=vScale1 (for linear textures)
+    float    uvScale23[4];  // x=uScale2, y=vScale2, z=uScale3, w=vScale3 (for linear textures)
+    float    bumpParams[4]; // x=mat00, y=mat01, z=mat10, w=mat11
+    float    fogParams[4];  // x=fogMode(0=off,1=exp,2=exp2,3=linear), y=fogStart, z=fogEnd, w=fogDensity
+    float    fogColor[4];   // r, g, b, isAdditiveBlend
+    float    psConst0[4];   // c0
+    float    psConst1[4];   // c1
+    float    psConst2[4];   // c2
+    float    psConst3[4];   // c3
+};
+#pragma pack(pop)
+
+struct XboxShaderDeclInfo {
+    bool     isValid;
+    bool     hasPos;
+    bool     hasRhw;
+    bool     hasNorm;
+    bool     hasDiff;
+    bool     hasUv0;
+    bool     hasUv1;
+    bool     hasUv2;
+    bool     hasUv3;
+    uint16_t offPos;
+    uint16_t offRhw;
+    uint16_t offNorm;
+    uint16_t offDiff;
+    uint16_t offUv0;
+    uint16_t offUv1;
+    uint16_t offUv2;
+    uint16_t offUv3;
+    uint32_t stride;
+    int32_t  vsType; // 0..65 if from aVertexShaders[0..65] at 0x007D0BE0, else -1
+};
+
+// ============================================================================
+// Shared D3D11 / Xbox D3D8 Subsystem State & Cross-Module Declarations
+// ============================================================================
+
+struct ID3D11Device;
+struct ID3D11DeviceContext;
+struct IDXGISwapChain;
+struct ID3D11Texture2D;
+struct ID3D11ShaderResourceView;
+struct ID3D11RenderTargetView;
+struct ID3D11DepthStencilView;
+struct ID3D11VertexShader;
+struct ID3D11PixelShader;
+struct ID3D11InputLayout;
+struct ID3D11Buffer;
+struct ID3D11BlendState;
+struct ID3D11DepthStencilState;
+struct ID3D11RasterizerState;
+struct ID3D11SamplerState;
+
+// d3d11_backend.cpp
+extern ID3D11Device*             g_d3dDevice;
+extern ID3D11DeviceContext*      g_d3dCtx;
+extern IDXGISwapChain*           g_swapChain;
+extern ID3D11Texture2D*          g_backBufferTex;
+extern ID3D11Texture2D*          g_backBufferCopyTex;
+extern ID3D11ShaderResourceView* g_backBufferCopySRV;
+extern bool                      g_backBufferDirty;
+extern ID3D11RenderTargetView*   g_rtv;
+extern ID3D11Texture2D*          g_depthTex;
+extern ID3D11DepthStencilView*   g_dsv;
+extern ID3D11RenderTargetView*   g_curActiveRTV;
+extern ID3D11DepthStencilView*   g_curActiveDSV;
+extern void*                     g_curOffscreenRT;
+extern float                     g_gamma;
+extern float                     g_brightness;
+extern bool                      g_scissorEnabled;
+extern ID3D11VertexShader*       g_vs;
+extern ID3D11PixelShader*        g_ps;
+extern ID3D11InputLayout*        g_inputLayout;
+extern ID3D11Buffer*             g_cbPerDraw;
+extern ID3D11Buffer*             g_dynVB;
+extern uint32_t                  g_dynVBCapacity;
+
+uint32_t MapXboxCmpFuncInt(uint32_t v);
+ID3D11BlendState* GetBlendState(uint32_t alphaBlendEnable, uint32_t srcBlend, uint32_t dstBlend, uint32_t blendOp, uint32_t colorWrite);
+ID3D11DepthStencilState* GetDepthState(
+    uint32_t zEnable, uint32_t zWriteEnable, uint32_t zFunc,
+    uint32_t stencilEnable, uint32_t stencilFail, uint32_t stencilZFail, uint32_t stencilPass,
+    uint32_t stencilFunc, uint32_t stencilReadMask, uint32_t stencilWriteMask);
+ID3D11RasterizerState* GetRastState(uint32_t cullMode, uint32_t fillMode, uint32_t zBias, bool scissor);
+ID3D11SamplerState* GetSamplerState(uint32_t addrU, uint32_t addrV, uint32_t magFilter, uint32_t borderColor);
+void DrawOsdOverlayOnBackbuffer();
+
+// d3d8_texture.cpp
+extern XboxPixelContainer* g_boundTextures[4];
+void DecodeXboxTextureFormat(
+    const XboxPixelContainer* pTex,
+    uint32_t* outWidth, uint32_t* outHeight, uint32_t* outLevels,
+    uint32_t* outXboxFmt, bool* outSwizzled, uint32_t* outLinearPitch);
+ID3D11ShaderResourceView* GetOrCreateD3D11SRV(XboxPixelContainer* pTex, float* outUScale = nullptr, float* outVScale = nullptr);
+void __cdecl Bridge_rlMain_SetRenderTarget(void* pTex, int bClear, int bFast);
+void InitXboxD3D8TextureBridges();
+
+// d3d8_shader.cpp
+extern uint32_t        g_currentVsHandle;
+extern uint32_t        g_currentPsHandle;
+extern int32_t         g_currentPsType;
+extern float           g_psConstants[8][4];
+extern int32_t         g_activeCustomVS;
+extern const uint32_t* g_curPrelitColors;
+extern uint32_t        g_curPrelitBaseVertex;
+extern float           g_cloakDistort;
+extern float           g_cloakC35[4];
+extern float           g_shieldC35x;
+extern float           g_teleportC32[2];
+extern float           g_teleportC33x;
+extern float           g_motionBlurVec[4];
+
+bool GetXboxVertexShaderDecl(uint32_t handle, XboxShaderDeclInfo* outDecl);
+void __stdcall Bridge_D3DDevice_SetVertexShader(uint32_t Handle);
+void InitXboxD3D8ShaderBridges();
+
+// d3d8_draw.cpp
+extern XboxViewport g_viewport;
+void UnpackD3DColor(uint32_t c, float* r, float* g, float* b, float* a);
+void __stdcall Bridge_D3DDevice_SetStreamSource(uint32_t StreamNumber, XboxVertexBuffer* pStreamData, uint32_t Stride);
+void __stdcall Bridge_D3DDevice_SetIndices(XboxVertexBuffer* pIndexData, uint32_t BaseVertexIndex);
+void __stdcall Bridge_D3DDevice_SetTransform(uint32_t State, const Mat44* pMatrix);
+void __stdcall Bridge_D3DDevice_SetViewport(const XboxViewport* pViewport);
+void InitXboxD3D8DrawBridges();
