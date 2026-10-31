@@ -20,12 +20,11 @@ struct XBOX_XINPUT_STATE {
 };
 
 struct XBOX_XINPUT_KEYSTROKE {
-    uint16_t VirtualKey;
-    wchar_t  Unicode;
-    uint16_t Flags;
-    uint8_t  UserIndex;
-    uint8_t  HidCode;
+    uint8_t VirtualKey; // +0x00
+    char    Ascii;      // +0x01
+    uint8_t Flags;      // +0x02 (0x01=CTRL, 0x02=SHIFT, 0x04=ALT, 0x40=KEYUP, 0x80=REPEAT)
 };
+static_assert(sizeof(XBOX_XINPUT_KEYSTROKE) == 3, "XBOX_XINPUT_KEYSTROKE must be 3 bytes");
 #pragma pack(pop)
 
 // Xbox wButtons bitmasks (identical to Windows XInput for bits 0..7)
@@ -67,14 +66,20 @@ static volatile int g_keyHead = 0;
 static volatile int g_keyTail = 0;
 
 void PushDebugKeystroke(uint16_t vk, wchar_t ch, bool keyUp) {
-    if (g_autoBotEnabled) return;
     int next = (g_keyHead + 1) & 63;
     if (next == g_keyTail) return;
-    g_keyQueue[g_keyHead].VirtualKey = vk;
-    g_keyQueue[g_keyHead].Unicode = ch;
-    g_keyQueue[g_keyHead].Flags = keyUp ? 0x0002 : 0x0001; // XINPUT_KEYSTROKE_KEYUP / KEYDOWN
-    g_keyQueue[g_keyHead].UserIndex = 0;
-    g_keyQueue[g_keyHead].HidCode = 0;
+    if (vk == VK_SHIFT)   vk = VK_LSHIFT;
+    if (vk == VK_CONTROL) vk = VK_LCONTROL;
+    if (vk == VK_MENU)    vk = VK_LMENU;
+
+    uint8_t flags = keyUp ? 0x40u : 0x00u; // 0x40 = XINPUT_DEBUG_KEYSTROKE_FLAG_KEYUP
+    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) flags |= 0x01u;
+    if (GetAsyncKeyState(VK_SHIFT)   & 0x8000) flags |= 0x02u;
+    if (GetAsyncKeyState(VK_MENU)    & 0x8000) flags |= 0x04u;
+
+    g_keyQueue[g_keyHead].VirtualKey = static_cast<uint8_t>(vk & 0xFFu);
+    g_keyQueue[g_keyHead].Ascii      = (ch >= 1 && ch <= 127) ? static_cast<char>(ch) : 0;
+    g_keyQueue[g_keyHead].Flags      = flags;
     g_keyHead = next;
 }
 
@@ -85,7 +90,6 @@ void UpdateXboxInputTick() {
 static void __stdcall Bridge_XInitDevices(DWORD dwPreallocTypeCount, void* PreallocTypes) {
     (void)dwPreallocTypeCount; (void)PreallocTypes;
     *reinterpret_cast<uint32_t*>(0x00747C38) = 1; // _XPP_XInitDevicesHasBeenCalled
-    LogPrintf("[Input] XInitDevices called");
 }
 
 static DWORD __stdcall Bridge_XGetDevices(void* pDeviceType) {
@@ -115,7 +119,6 @@ static HANDLE __stdcall Bridge_XInputOpen(
 {
     (void)pDeviceType; (void)dwSlot; (void)pPollingParameters;
     if (dwPort == 0) {
-        LogPrintf("[Input] XInputOpen(port=%u) -> handle 0x1001", dwPort);
         return reinterpret_cast<HANDLE>(0x1001 + dwPort);
     }
     return nullptr;
@@ -191,10 +194,6 @@ static DWORD __stdcall Bridge_XInputGetState(HANDLE hDevice, XBOX_XINPUT_STATE* 
 
     memset(pState, 0, sizeof(*pState));
     pState->dwPacketNumber = g_packetCounter;
-
-    if (ApplyAutoBotInput(pState)) {
-        return ERROR_SUCCESS;
-    }
 
     // 1. Poll physical XInput controller if present
     if (g_pfnXInputGetState) {
@@ -317,6 +316,4 @@ void InitXboxInput() {
 
     // Stub cXBoxMemoryUnits::Startup (0x005AC2F0) to skip the 1.5s MU enumeration sleep
     PatchRet(0x005AC2F0, 0, 0, false);
-
-    LogPrintf("[Init] Xbox Input (XInput + Keyboard/Mouse) bridges installed.");
 }

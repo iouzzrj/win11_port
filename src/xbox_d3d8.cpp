@@ -880,7 +880,6 @@ struct CachedTexture {
 };
 
 static std::vector<CachedTexture> g_texCache;
-static uint32_t g_texUploadLogCount = 0;
 
 static void MarkTextureDirtyByData(uint32_t dataPtr) {
     for (size_t i = 0; i < g_texCache.size(); ++i) {
@@ -1091,12 +1090,7 @@ static void UploadXboxTextureToD3D11(CachedTexture& entry, const XboxPixelContai
     bool isCubeMap = (pTex->Format & kXboxTexFormatCubemapMask) != 0u;
     bool isVolume  = (((pTex->Format >> kXboxTexFormatDimShift) & kXboxTexFormatDimMask) == kXboxTexDimensionVolume);
     uint32_t depth = isVolume ? (1u << ((pTex->Format >> kXboxTexFormatDepthShift) & 0x0Fu)) : 1u;
-
-    if (g_texUploadLogCount < 25) {
-        g_texUploadLogCount++;
-        LogPrintf("[Tex] Upload #%u: %ux%ux%u xboxFmt=0x%02X swiz=%d cube=%d vol=%d pitch=%u data=0x%08X",
-            g_texUploadLogCount, w, h, depth, xboxFmt, isSwizzled ? 1 : 0, isCubeMap ? 1 : 0, isVolume ? 1 : 0, linearPitch, pTex->Data);
-    }
+    (void)isCubeMap; (void)depth;
 
     std::vector<uint32_t> bgraPixels(w * h, 0xFFFFFFFFu);
     const uint8_t* srcData = reinterpret_cast<const uint8_t*>(pTex->Data);
@@ -2769,8 +2763,6 @@ static void DecodeVerticesToUnified(
     }
 }
 
-static uint32_t g_drawCallsThisFrame = 0;
-
 static void ApplyRenderTargetSurfaceD3D11(XboxPixelContainer* pRenderTarget, XboxPixelContainer* pZStencil) {
     (void)pZStencil;
     if (!g_d3dCtx) return;
@@ -3100,7 +3092,6 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
 static void __stdcall Bridge_D3DDevice_DrawVerticesUP(
     DWORD PrimitiveType, UINT VertexCount, const void* pVertexStreamZeroData, UINT VertexStreamZeroStride)
 {
-    g_drawCallsThisFrame++;
     g_curPrelitColors = nullptr;
     g_activeCustomVS  = 0;
     if (!pVertexStreamZeroData || VertexCount == 0 || VertexStreamZeroStride == 0) return;
@@ -3125,7 +3116,6 @@ static void __stdcall Bridge_D3DDevice_DrawVertices(
 static void __stdcall Bridge_D3DDevice_DrawIndexedVertices(
     DWORD PrimitiveType, UINT VertexCount, const uint16_t* pIndexData)
 {
-    g_drawCallsThisFrame++;
     if (!g_streams[0].data || g_streams[0].stride == 0 || !pIndexData || VertexCount == 0) return;
 
     static std::vector<UnifiedVertex> verts;
@@ -3294,7 +3284,6 @@ static void __stdcall Bridge_D3DDevice_SetVertexDataColor(int Register, DWORD Co
 
 static void __stdcall Bridge_D3DDevice_End() {
     if (g_immVerts.empty()) return;
-    g_drawCallsThisFrame++;
     bool isRhw = ((g_currentVsHandle & 0x00010001u) == 0) && ((g_currentVsHandle & 0x004u) != 0);
 
     // Route Stage 0..3 UVs according to D3DTSS_TEXCOORDINDEX and D3DTSS_TEXTURETRANSFORMFLAGS
@@ -3466,9 +3455,256 @@ static BOOL __stdcall Bridge_D3DDevice_GetOverlayUpdateStatus() {
 }
 
 static std::vector<uint32_t> g_overlayPixels;
-static uint32_t g_overlayFrameCount = 0;
 volatile uint32_t g_swapFrameCount    = 0;
-volatile uint32_t g_rendered3DFrames  = 0;
+
+// ============================================================================
+// Top-Right In-Game OSD Overlay (GPU Name & FPS)
+// ============================================================================
+
+static ID3D11Texture2D*          g_osdTex  = nullptr;
+static ID3D11ShaderResourceView* g_osdSRV  = nullptr;
+static ID3D11Buffer*             g_osdVB   = nullptr;
+static uint32_t                  g_osdTexW = 0;
+static uint32_t                  g_osdTexH = 0;
+static wchar_t                   g_lastOsdText[256] = { 0 };
+static HFONT                     g_hOsdFont = nullptr;
+
+static void UpdateOsdTexture(const wchar_t* text) {
+    if (!g_d3dDevice || !g_d3dCtx || !text || !text[0]) return;
+    if (!g_hOsdFont) {
+        g_hOsdFont = CreateFontW(
+            -12, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+            DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    }
+
+    HDC hdcScreen = GetDC(nullptr);
+    HDC hdc = CreateCompatibleDC(hdcScreen);
+    ReleaseDC(nullptr, hdcScreen);
+    if (!hdc) return;
+
+    HGDIOBJ oldFont = SelectObject(hdc, g_hOsdFont);
+    SIZE sz = {};
+    GetTextExtentPoint32W(hdc, text, (int)wcslen(text), &sz);
+
+    uint32_t w = (uint32_t)(sz.cx + 14);
+    uint32_t h = (uint32_t)(sz.cy + 6);
+    if (w < 16)  w = 16;
+    if (w > 620) w = 620;
+    if (h < 14)  h = 14;
+    if (h > 64)  h = 64;
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = (LONG)w;
+    bmi.bmiHeader.biHeight      = -(LONG)h; // top-down DIB
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* dibBits = nullptr;
+    HBITMAP hbm = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &dibBits, nullptr, 0);
+    if (hbm && dibBits) {
+        HGDIOBJ oldBm = SelectObject(hdc, hbm);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, RGB(255, 255, 255));
+
+        uint32_t numPx = w * h;
+        std::vector<uint8_t> shadowMask(numPx, 0);
+        std::vector<uint8_t> glyphMask(numPx, 0);
+
+        // 1. Render 1px drop-shadow mask at (+6, +4)
+        memset(dibBits, 0, numPx * 4);
+        RECT rcShadow = { 8, 4, (LONG)w, (LONG)h };
+        DrawTextW(hdc, text, -1, &rcShadow, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+        GdiFlush();
+        const uint32_t* px = reinterpret_cast<const uint32_t*>(dibBits);
+        for (uint32_t i = 0; i < numPx; ++i) {
+            uint8_t r = (uint8_t)((px[i] >> 16) & 0xFF);
+            uint8_t g = (uint8_t)((px[i] >> 8)  & 0xFF);
+            uint8_t b = (uint8_t)(px[i] & 0xFF);
+            uint8_t m = r > g ? r : g;
+            shadowMask[i] = m > b ? m : b;
+        }
+
+        // 2. Render crisp foreground glyph mask at (+7, +3)
+        memset(dibBits, 0, numPx * 4);
+        RECT rcGlyph = { 7, 3, (LONG)w - 1, (LONG)h - 1 };
+        DrawTextW(hdc, text, -1, &rcGlyph, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+        GdiFlush();
+        for (uint32_t i = 0; i < numPx; ++i) {
+            uint8_t r = (uint8_t)((px[i] >> 16) & 0xFF);
+            uint8_t g = (uint8_t)((px[i] >> 8)  & 0xFF);
+            uint8_t b = (uint8_t)(px[i] & 0xFF);
+            uint8_t m = r > g ? r : g;
+            glyphMask[i] = m > b ? m : b;
+        }
+
+        // 3. Composite semi-transparent rounded dark pill + shadow + bright glyph into BGRA8
+        std::vector<uint32_t> outBgra(numPx, 0);
+        for (uint32_t y = 0; y < h; ++y) {
+            for (uint32_t x = 0; x < w; ++x) {
+                // 3px corner bevel clip for rounded badge
+                uint32_t dx = (x < 3) ? (2 - x) : ((x >= w - 3) ? (x - (w - 3)) : 0);
+                uint32_t dy = (y < 3) ? (2 - y) : ((y >= h - 3) ? (y - (h - 3)) : 0);
+                bool insidePill = (dx + dy <= 2);
+
+                uint32_t idx = y * w + x;
+                float bgA = insidePill ? (135.0f / 255.0f) : 0.0f;
+                float shA = shadowMask[idx] * (1.0f / 255.0f);
+                float fgA = glyphMask[idx]  * (1.0f / 255.0f);
+
+                // Base dark translucent pill color: RGB(12, 16, 22)
+                float r = 12.0f * (1.0f - shA);
+                float g = 16.0f * (1.0f - shA);
+                float b = 22.0f * (1.0f - shA);
+                float a = bgA + shA * (1.0f - bgA);
+
+                // Blend foreground glyph: RGB(240, 246, 255)
+                r = r * (1.0f - fgA) + 240.0f * fgA;
+                g = g * (1.0f - fgA) + 246.0f * fgA;
+                b = b * (1.0f - fgA) + 255.0f * fgA;
+                a = a + fgA * (1.0f - a);
+
+                uint32_t outR = (uint32_t)(r + 0.5f); if (outR > 255) outR = 255;
+                uint32_t outG = (uint32_t)(g + 0.5f); if (outG > 255) outG = 255;
+                uint32_t outB = (uint32_t)(b + 0.5f); if (outB > 255) outB = 255;
+                uint32_t outA = (uint32_t)(a * 255.0f + 0.5f); if (outA > 255) outA = 255;
+
+                outBgra[idx] = (outA << 24) | (outR << 16) | (outG << 8) | outB;
+            }
+        }
+
+        if (!g_osdTex || g_osdTexW != w || g_osdTexH != h) {
+            if (g_osdSRV) { g_osdSRV->Release(); g_osdSRV = nullptr; }
+            if (g_osdTex) { g_osdTex->Release(); g_osdTex = nullptr; }
+            g_osdTexW = w;
+            g_osdTexH = h;
+
+            D3D11_TEXTURE2D_DESC td = {};
+            td.Width            = w;
+            td.Height           = h;
+            td.MipLevels        = 1;
+            td.ArraySize        = 1;
+            td.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage            = D3D11_USAGE_DEFAULT;
+            td.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+
+            D3D11_SUBRESOURCE_DATA initData = {};
+            initData.pSysMem     = outBgra.data();
+            initData.SysMemPitch = w * 4;
+            if (SUCCEEDED(g_d3dDevice->CreateTexture2D(&td, &initData, &g_osdTex))) {
+                g_d3dDevice->CreateShaderResourceView(g_osdTex, nullptr, &g_osdSRV);
+            }
+        } else {
+            g_d3dCtx->UpdateSubresource(g_osdTex, 0, nullptr, outBgra.data(), w * 4, 0);
+        }
+
+        SelectObject(hdc, oldBm);
+        DeleteObject(hbm);
+    }
+
+    SelectObject(hdc, oldFont);
+    DeleteDC(hdc);
+}
+
+static void DrawOsdOverlayOnBackbuffer() {
+    if (!g_d3dDevice || !g_d3dCtx || !g_rtv || !g_vs || !g_ps || !g_cbPerDraw) return;
+    if (!g_osdShowFps) return;
+
+    wchar_t curText[64];
+    swprintf(curText, 64, L"%.1f FPS", g_osdCurrentFps);
+
+    if (wcscmp(curText, g_lastOsdText) != 0 || !g_osdSRV) {
+        wcscpy(g_lastOsdText, curText);
+        UpdateOsdTexture(curText);
+    }
+    if (!g_osdSRV || g_osdTexW == 0 || g_osdTexH == 0) return;
+
+    if (!g_osdVB) {
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth      = 4 * sizeof(UnifiedVertex);
+        bd.Usage          = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags      = D3D11_BIND_VERTEX_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(g_d3dDevice->CreateBuffer(&bd, nullptr, &g_osdVB))) return;
+    }
+
+    float x0 = (float)(640 - (int)g_osdTexW - 8);
+    float y0 = 8.0f;
+    float x1 = x0 + (float)g_osdTexW;
+    float y1 = y0 + (float)g_osdTexH;
+
+    UnifiedVertex quad[4] = {};
+    quad[0] = { x0, y0, 0.0f, 1.0f, 0,0,1, 1,1,1,1, 0.0f, 0.0f, 0,0, 0,0, 0,0 };
+    quad[1] = { x1, y0, 0.0f, 1.0f, 0,0,1, 1,1,1,1, 1.0f, 0.0f, 0,0, 0,0, 0,0 };
+    quad[2] = { x0, y1, 0.0f, 1.0f, 0,0,1, 1,1,1,1, 0.0f, 1.0f, 0,0, 0,0, 0,0 };
+    quad[3] = { x1, y1, 0.0f, 1.0f, 0,0,1, 1,1,1,1, 1.0f, 1.0f, 0,0, 0,0, 0,0 };
+
+    D3D11_MAPPED_SUBRESOURCE mappedVB = {};
+    if (SUCCEEDED(g_d3dCtx->Map(g_osdVB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedVB))) {
+        memcpy(mappedVB.pData, quad, sizeof(quad));
+        g_d3dCtx->Unmap(g_osdVB, 0);
+    }
+
+    PerDrawCBData cb = {};
+    cb.viewport[0]    = 0.0f;
+    cb.viewport[1]    = 0.0f;
+    cb.viewport[2]    = 640.0f;
+    cb.viewport[3]    = 480.0f;
+    cb.stage0Ops[0]   = 2u; // D3DTOP_SELECTARG1
+    cb.stage0Ops[1]   = 2u; // D3DTA_TEXTURE
+    cb.stage0Alpha[0] = 2u; // D3DTOP_SELECTARG1
+    cb.stage0Alpha[1] = 2u; // D3DTA_TEXTURE
+    cb.flags[0]       = 1u; // isRhw = 1
+    cb.flags[1]       = 1u; // texMask = Stage 0
+    cb.alphaTest[2]   = 1.0f; // gamma = 1.0
+    cb.alphaTest[3]   = 1.0f; // brightness = 1.0
+    cb.uvScale01[0]   = 1.0f;
+    cb.uvScale01[1]   = 1.0f;
+
+    D3D11_MAPPED_SUBRESOURCE mappedCB = {};
+    if (SUCCEEDED(g_d3dCtx->Map(g_cbPerDraw, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedCB))) {
+        memcpy(mappedCB.pData, &cb, sizeof(cb));
+        g_d3dCtx->Unmap(g_cbPerDraw, 0);
+    }
+
+    g_d3dCtx->OMSetRenderTargets(1, &g_rtv, nullptr);
+    D3D11_VIEWPORT vp11 = { 0.0f, 0.0f, 640.0f, 480.0f, 0.0f, 1.0f };
+    g_d3dCtx->RSSetViewports(1, &vp11);
+
+    ID3D11BlendState*        bs  = GetBlendState(1u, 5u /* SRCALPHA */, 6u /* INVSRCALPHA */, 1u /* ADD */, 0x0Fu);
+    ID3D11DepthStencilState* ds  = GetDepthState(0u, 0u, 8u, 0u, 1u, 1u, 1u, 8u, 0xFFu, 0xFFu);
+    ID3D11RasterizerState*   rs  = GetRastState(0u, 3u, 0u, false);
+    ID3D11SamplerState*      smp = GetSamplerState(kXboxTexAddressClamp, kXboxTexAddressClamp, kXboxTexFilterPoint, 0u);
+
+    float blendFactor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    g_d3dCtx->OMSetBlendState(bs, blendFactor, 0xFFFFFFFFu);
+    g_d3dCtx->OMSetDepthStencilState(ds, 0);
+    g_d3dCtx->RSSetState(rs);
+
+    g_d3dCtx->IASetInputLayout(g_inputLayout);
+    UINT stride = sizeof(UnifiedVertex);
+    UINT offset = 0;
+    g_d3dCtx->IASetVertexBuffers(0, 1, &g_osdVB, &stride, &offset);
+    g_d3dCtx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+
+    g_d3dCtx->VSSetShader(g_vs, nullptr, 0);
+    g_d3dCtx->VSSetConstantBuffers(0, 1, &g_cbPerDraw);
+    g_d3dCtx->PSSetShader(g_ps, nullptr, 0);
+    g_d3dCtx->PSSetConstantBuffers(0, 1, &g_cbPerDraw);
+
+    ID3D11ShaderResourceView* srvs[4] = { g_osdSRV, nullptr, nullptr, nullptr };
+    ID3D11SamplerState*       smps[4] = { smp, smp, smp, smp };
+    g_d3dCtx->PSSetShaderResources(0, 4, srvs);
+    g_d3dCtx->PSSetSamplers(0, 4, smps);
+
+    g_d3dCtx->Draw(4, 0);
+
+    ID3D11ShaderResourceView* nullSrv = nullptr;
+    g_d3dCtx->PSSetShaderResources(0, 1, &nullSrv);
+}
 
 static void __stdcall Bridge_D3DDevice_UpdateOverlay(
     XboxPixelContainer* pSurface, const RECT* pSrcRect, const RECT* pDstRect,
@@ -3486,11 +3722,6 @@ static void __stdcall Bridge_D3DDevice_UpdateOverlay(
     }
     if (w == 0 || h == 0 || w > 2048 || h > 2048) return;
     if (pitch == 0) pitch = w * 2;
-
-    g_overlayFrameCount++;
-    if (g_overlayFrameCount <= 5 || (g_overlayFrameCount % 60) == 0) {
-        LogPrintf("[Overlay] UpdateOverlay frame #%u (%ux%u fmt=0x%02X pitch=%u)", g_overlayFrameCount, w, h, xboxFmt, pitch);
-    }
 
     g_overlayPixels.resize(w * h);
     const uint8_t* srcBase = reinterpret_cast<const uint8_t*>(pSurface->Data);
@@ -3551,8 +3782,13 @@ static void __stdcall Bridge_D3DDevice_UpdateOverlay(
             }
         }
         if (g_overlayTex && g_backBufferTex && w == 640 && h == 480) {
+            g_swapFrameCount++;
             g_d3dCtx->UpdateSubresource(g_backBufferTex, 0, nullptr, g_overlayPixels.data(), w * 4, 0);
+            DrawOsdOverlayOnBackbuffer();
             g_swapChain->Present(0, 0);
+            if (g_rtv && g_dsv) {
+                g_d3dCtx->OMSetRenderTargets(1, &g_rtv, g_dsv);
+            }
         }
     }
     UpdateXboxKernelTick();
@@ -3560,52 +3796,15 @@ static void __stdcall Bridge_D3DDevice_UpdateOverlay(
     UpdateXboxAudioTick();
 }
 
-static ID3D11Texture2D* g_persistentStageTex = nullptr;
-
-bool ReadBackbufferBgra(void* outBgraBuf, uint32_t width, uint32_t height, uint32_t dstRowPitch) {
-    if (!outBgraBuf || !g_d3dDevice || !g_d3dCtx || !g_backBufferTex) return false;
-    if (!g_persistentStageTex) {
-        D3D11_TEXTURE2D_DESC td = {};
-        g_backBufferTex->GetDesc(&td);
-        td.Usage = D3D11_USAGE_STAGING;
-        td.BindFlags = 0;
-        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        td.MiscFlags = 0;
-        if (FAILED(g_d3dDevice->CreateTexture2D(&td, nullptr, &g_persistentStageTex))) {
-            return false;
-        }
-    }
-    g_d3dCtx->CopyResource(g_persistentStageTex, g_backBufferTex);
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (FAILED(g_d3dCtx->Map(g_persistentStageTex, 0, D3D11_MAP_READ, 0, &mapped))) {
-        return false;
-    }
-    uint32_t copyRowBytes = width * 4;
-    if (copyRowBytes > mapped.RowPitch) copyRowBytes = mapped.RowPitch;
-    if (copyRowBytes > dstRowPitch)     copyRowBytes = dstRowPitch;
-    for (uint32_t y = 0; y < height; ++y) {
-        const uint8_t* srcRow = reinterpret_cast<const uint8_t*>(mapped.pData) + y * mapped.RowPitch;
-        uint8_t*       dstRow = reinterpret_cast<uint8_t*>(outBgraBuf) + y * dstRowPitch;
-        memcpy(dstRow, srcRow, copyRowBytes);
-    }
-    g_d3dCtx->Unmap(g_persistentStageTex, 0);
-    return true;
-}
-
 static void __stdcall Bridge_D3DDevice_Swap(DWORD Flags) {
     (void)Flags;
     g_swapFrameCount++;
-    if (g_drawCallsThisFrame > 0) {
-        g_rendered3DFrames++;
-    }
-    if (g_swapFrameCount <= 5 || (g_swapFrameCount % 60) == 0 || g_rendered3DFrames <= 10 || (g_rendered3DFrames % 15) == 0) {
-        LogPrintf("[D3D11] Swap frame #%u (3dFrame=#%u draws=%u)", g_swapFrameCount, g_rendered3DFrames, g_drawCallsThisFrame);
-    }
-    g_drawCallsThisFrame = 0;
     g_curOffscreenRT = nullptr;
     g_curActiveRTV   = g_rtv;
     g_curActiveDSV   = g_dsv;
     g_backBufferDirty = true;
+
+    DrawOsdOverlayOnBackbuffer();
 
     if (g_swapChain) {
         g_swapChain->Present(0, 0);
@@ -3782,15 +3981,7 @@ bool InitD3D11HostDevice() {
     IDXGIFactory* pFactory = nullptr;
     IDXGIAdapter* pSelectedAdapter = nullptr;
     if (SUCCEEDED(CreateDXGIFactory(__uuidof(IDXGIFactory), reinterpret_cast<void**>(&pFactory))) && pFactory) {
-        if (SUCCEEDED(pFactory->EnumAdapters((UINT)g_selectedAdapterIndex, &pSelectedAdapter)) && pSelectedAdapter) {
-            DXGI_ADAPTER_DESC desc = {};
-            if (SUCCEEDED(pSelectedAdapter->GetDesc(&desc))) {
-                LogPrintf("[D3D11] Creating device on selected GPU Adapter #%d: %ls (Dedicated VRAM=%u MB, Vendor=0x%04X, Device=0x%04X)",
-                    g_selectedAdapterIndex, desc.Description,
-                    (unsigned)(desc.DedicatedVideoMemory / (1024 * 1024)),
-                    desc.VendorId, desc.DeviceId);
-            }
-        }
+        pFactory->EnumAdapters((UINT)g_selectedAdapterIndex, &pSelectedAdapter);
     }
 
     HRESULT hr = E_FAIL;
@@ -3823,7 +4014,6 @@ bool InitD3D11HostDevice() {
     }
 
     if (FAILED(hr) || !g_d3dDevice || !g_d3dCtx || !g_swapChain) {
-        LogPrintf("[D3D11] ERROR: D3D11CreateDeviceAndSwapChain failed hr=0x%08X", hr);
         return false;
     }
 
@@ -3862,9 +4052,7 @@ bool InitD3D11HostDevice() {
     ID3DBlob* errBlob = nullptr;
 
     hr = D3DCompile(kGhostHLSL, strlen(kGhostHLSL), "GhostVS", nullptr, nullptr, "VSMain", "vs_4_0", 0, 0, &vsBlob, &errBlob);
-    if (FAILED(hr)) {
-        LogPrintf("[D3D11] VS compile error: %s", errBlob ? (const char*)errBlob->GetBufferPointer() : "unknown");
-    } else {
+    if (SUCCEEDED(hr) && vsBlob) {
         g_d3dDevice->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &g_vs);
         D3D11_INPUT_ELEMENT_DESC ied[] = {
             { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
@@ -3881,9 +4069,7 @@ bool InitD3D11HostDevice() {
     if (errBlob) { errBlob->Release(); errBlob = nullptr; }
 
     hr = D3DCompile(kGhostHLSL, strlen(kGhostHLSL), "GhostPS", nullptr, nullptr, "PSMain", "ps_4_0", 0, 0, &psBlob, &errBlob);
-    if (FAILED(hr)) {
-        LogPrintf("[D3D11] PS compile error: %s", errBlob ? (const char*)errBlob->GetBufferPointer() : "unknown");
-    } else {
+    if (SUCCEEDED(hr) && psBlob) {
         g_d3dDevice->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &g_ps);
         psBlob->Release();
     }
@@ -3896,7 +4082,6 @@ bool InitD3D11HostDevice() {
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     g_d3dDevice->CreateBuffer(&cbd, nullptr, &g_cbPerDraw);
 
-    LogPrintf("[D3D11] Hardware Device & SwapChain (640x480, FL=0x%X) initialized successfully!", (uint32_t)flOut);
     return true;
 }
 
@@ -3905,7 +4090,6 @@ static HRESULT __stdcall Bridge_Direct3D_CreateDevice(
     void* pPresentationParameters, void** ppReturnedDeviceInterface)
 {
     (void)Adapter; (void)DeviceType; (void)hFocusWindow; (void)BehaviorFlags;
-    LogPrintf("[D3D11] _Direct3D_CreateDevice called (pParams=0x%08X)", (uint32_t)pPresentationParameters);
 
     InitD3D11HostDevice();
 
@@ -3956,7 +4140,6 @@ static HRESULT __stdcall Bridge_Direct3D_CreateDevice(
     fnInitState();
     Bridge_D3DDevice_MakeSpace();
 
-    LogPrintf("[D3D11] Xbox CDevice & D3D11 pipeline ready.");
     return S_OK;
 }
 
@@ -4106,6 +4289,4 @@ void InitXboxD3D8() {
     InstallBridge(0x006B05B0, &Bridge_D3DDevice_GetVisibilityTestResult,"_D3DDevice_GetVisibilityTestResult@12");
     PatchRet(0x006B05A0, 4, 0, false); // _D3DDevice_BlockOnFence@4
     PatchRet(0x006B0700, 0, 1, true);  // _D3DDevice_InsertFence@0
-
-    LogPrintf("[Init] Xbox D3D8-to-D3D11 hardware backend bridges installed.");
 }

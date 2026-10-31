@@ -52,11 +52,6 @@ struct XBOX_XMEDIAINFO {
     uint32_t dwMaxLookahead;
 };
 
-struct XBOX_DSVOICEPROPS {
-    uint32_t dwMixBinCount;
-    uint8_t  MixBins[64];
-};
-
 struct XBOX_DSMIXBINVOLUMEPAIR {
     uint32_t dwMixBin;
     int32_t  lVolume;
@@ -66,6 +61,18 @@ struct XBOX_DSMIXBINS {
     uint32_t                       dwMixBinCount;
     const XBOX_DSMIXBINVOLUMEPAIR* lpMixBinVolumePairs;
 };
+
+struct XBOX_DSVOICEPROPS {
+    uint32_t                dwMixBinCount;        // +0x00
+    XBOX_DSMIXBINVOLUMEPAIR MixBinVolumePairs[8]; // +0x04 (64 bytes)
+    int32_t                 lPitch;               // +0x44
+    int32_t                 l3DDistanceVolume;    // +0x48
+    int32_t                 l3DConeVolume;        // +0x4C
+    int32_t                 l3DDopplerPitch;      // +0x50
+    int32_t                 lI3DL2DirectVolume;   // +0x54
+    int32_t                 lI3DL2RoomVolume;     // +0x58
+};
+static_assert(sizeof(XBOX_DSVOICEPROPS) == 0x5C, "XBOX_DSVOICEPROPS must be 0x5C bytes");
 #pragma pack(pop)
 
 // ============================================================================
@@ -2116,6 +2123,4 @@ void InitXboxAudio() {
     // 6. cDivxVideo (.vid Movie Player) wall-clock frame pacing bridges
     InstallBridge(kAddrDivxVideoFrameMove, &Bridge_cDivxVideo_FrameMove,  "?FrameMove@cDivxVideo@@QAEJXZ");
     InstallBridge(kAddrDivxVideoRender,    &Bridge_cDivxVideo_Render,     "?Render@cDivxVideo@@QAEJXZ");
-
-    LogPrintf("[Init] Xbox DirectSound / XACT audio bridges installed.");
 }

@@ -5,54 +5,8 @@
 #include <sys/stat.h>
 
 // ============================================================================
-// Logging & Patching Utilities
+// Patching Utilities
 // ============================================================================
-
-static FILE* g_logFile = nullptr;
-static CRITICAL_SECTION g_logCs;
-static bool g_logCsInit = false;
-
-void LogInit(const char* logFilePath) {
-    if (!g_logCsInit) {
-        InitializeCriticalSection(&g_logCs);
-        g_logCsInit = true;
-    }
-    if (g_logFile) {
-        fclose(g_logFile);
-        g_logFile = nullptr;
-    }
-    g_logFile = fopen(logFilePath, "w");
-    if (g_logFile) {
-        fprintf(g_logFile, "=== StarCraft: Ghost Windows 11 Compatibility Runtime Log ===\n");
-        fflush(g_logFile);
-    }
-}
-
-void LogClose() {
-    if (g_logFile) {
-        fclose(g_logFile);
-        g_logFile = nullptr;
-    }
-}
-
-void LogPrintf(const char* fmt, ...) {
-    if (!g_logCsInit) return;
-    EnterCriticalSection(&g_logCs);
-    char buf[2048];
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(buf, sizeof(buf) - 1, fmt, args);
-    va_end(args);
-    buf[sizeof(buf) - 1] = '\0';
-
-    if (g_logFile) {
-        fprintf(g_logFile, "[%08u] %s\n", (unsigned)GetTickCount(), buf);
-        fflush(g_logFile);
-    }
-    OutputDebugStringA(buf);
-    OutputDebugStringA("\n");
-    LeaveCriticalSection(&g_logCs);
-}
 
 void InstallBridge(uint32_t xboxVA, const void* hostFn, const char* name) {
     uint8_t* p = reinterpret_cast<uint8_t*>(xboxVA);
@@ -341,7 +295,6 @@ static void __stdcall Bridge_RtlLeaveCriticalSection(XBOX_CRITICAL_SECTION* cs) 
 // ============================================================================
 
 volatile uint32_t g_keTickCount = 0;
-FILETIME g_keSystemTime = { 0, 0 };
 
 static uint8_t  g_launchDataPage[0x1000] = { 0 };
 static uint8_t  g_xboxEEPROMKey[16]      = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 };
@@ -389,7 +342,6 @@ static uint8_t g_xePublicKeyData[284] = { 0 };
 
 void UpdateXboxKernelTick() {
     g_keTickCount = GetTickCount();
-    GetSystemTimeAsFileTime(&g_keSystemTime);
 }
 
 static int32_t __stdcall Krnl_ExQueryNonVolatileSetting(
@@ -412,7 +364,6 @@ static int32_t __stdcall Krnl_ExQueryNonVolatileSetting(
 }
 
 static void __stdcall Krnl_DbgBreakPoint() {
-    LogPrintf("[KRNL] DbgBreakPoint ignored");
 }
 
 static int __cdecl Krnl_DbgPrint(const char* fmt, ...) {
@@ -427,7 +378,6 @@ static int __cdecl Krnl_DbgPrint(const char* fmt, ...) {
     while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
         buf[--len] = '\0';
     }
-    LogPrintf("[DbgPrint] %s", buf);
     return (int)len;
 }
 
@@ -813,9 +763,6 @@ static HANDLE __stdcall Bridge_CreateFileA(
                     dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
             }
         }
-        if (h == INVALID_HANDLE_VALUE) {
-            LogPrintf("[File] CreateFileA FAILED: '%s' -> '%s' (err=%u)", lpFileName ? lpFileName : "null", winPath, GetLastError());
-        }
     }
     return h;
 }
@@ -1061,7 +1008,6 @@ static DWORD __stdcall Bridge_XCreateSaveGame(
         strncpy(lpPathBuffer, xboxSaveDir, uSize - 1);
         lpPathBuffer[uSize - 1] = '\0';
     }
-    LogPrintf("[SaveGame] XCreateSaveGame(disp=%u): '%s' -> '%s'", dwCreationDisposition, xboxSaveDir, winSaveDir);
     return ERROR_SUCCESS;
 }
 
@@ -1091,7 +1037,6 @@ static DWORD __stdcall Bridge_XDeleteSaveGame(const char* lpRootPathName, const 
         FindClose(hFind);
     }
     RemoveDirectoryA(winSaveDir);
-    LogPrintf("[SaveGame] XDeleteSaveGame: '%s' -> '%s'", xboxSaveDir, winSaveDir);
     return ERROR_SUCCESS;
 }
 
@@ -1257,7 +1202,6 @@ static HANDLE __stdcall Bridge_XGetSectionHandleA(const char* pSectionName) {
             return (HANDLE)(uintptr_t)(i + 1);
         }
     }
-    LogPrintf("[Section] XGetSectionHandleA('%s') not found", pSectionName);
     return INVALID_HANDLE_VALUE;
 }
 
@@ -1480,9 +1424,6 @@ static HANDLE __stdcall Bridge_CreateThread(
     DWORD tid = 0;
     HANDLE h = CreateThread(lpThreadAttributes, dwStackSize, lpStartAddress, lpParameter, dwCreationFlags, &tid);
     if (lpThreadId) *lpThreadId = tid;
-    if (h) {
-        LogPrintf("[Thread] Created thread: TID=%u Start=0x%08X", tid, (uint32_t)lpStartAddress);
-    }
     return h;
 }
 
@@ -1503,9 +1444,7 @@ static void __stdcall Bridge_SetLastError(DWORD dwErrCode) {
 }
 
 static void __stdcall Bridge_OutputDebugStringA(LPCSTR lpOutputString) {
-    if (lpOutputString) {
-        LogPrintf("[ODS] %s", lpOutputString);
-    }
+    (void)lpOutputString;
 }
 
 static void __stdcall Bridge_GlobalMemoryStatus(LPMEMORYSTATUS lpBuffer) {
@@ -1537,8 +1476,7 @@ static DWORD __stdcall Bridge_XGetLaunchInfo(PDWORD pdwLaunchDataType, void* pLa
 }
 
 static DWORD __stdcall Bridge_XLaunchNewImageA(LPCSTR lpTitlePath, void* pLaunchData) {
-    LogPrintf("[Launch] XLaunchNewImageA('%s') ignored on Windows 11", lpTitlePath ? lpTitlePath : "dashboard");
-    (void)pLaunchData;
+    (void)lpTitlePath; (void)pLaunchData;
     return ERROR_SUCCESS;
 }
 
@@ -1895,6 +1833,4 @@ void InitXboxKernelAndXapi() {
     PatchRet(kAddrXNetSend,        16, kXboxSocketError,    true); // _send@16 -> SOCKET_ERROR
     PatchRet(kAddrWSAGetLastError, 0,  kXboxWsaErrorNetDown,true); // _WSAGetLastError@0 -> WSAENETDOWN
     PatchRet(kAddrWSAFDIsSet,      8,  0,                   true); // ___WSAFDIsSet@8 -> 0
-
-    LogPrintf("[Init] Xbox Kernel IAT (137 slots), XAPILIB & XNet (14 stubs) bridges installed.");
 }

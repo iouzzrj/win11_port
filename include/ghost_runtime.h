@@ -13,8 +13,6 @@
 #include <string.h>
 #include <malloc.h>
 
-#include "ghost_symbols.h"
-
 // Global handles and paths
 extern HWND g_hWnd;
 extern HINSTANCE g_hInstance;
@@ -22,13 +20,13 @@ extern char g_appRootDir[MAX_PATH];
 extern char g_gameRootDir[MAX_PATH];
 extern volatile bool g_appRunning;
 extern volatile uint32_t g_keTickCount;
-extern FILETIME g_keSystemTime;
-extern volatile uint32_t g_rendered3DFrames;
 extern volatile uint32_t g_swapFrameCount;
 
-// Pre-launch Win32 UI configuration
+// Pre-launch Win32 UI configuration & In-Game OSD state
 extern int g_selectedAdapterIndex;
 extern wchar_t g_selectedAdapterName[128];
+extern volatile bool g_osdShowFps;
+extern volatile float g_osdCurrentFps;
 
 struct GhostKeyBindings {
     int vkCrouch;      // L-Trigger (bAnalogButtons[6])
@@ -57,24 +55,8 @@ struct GhostKeyBindings {
 };
 
 extern GhostKeyBindings g_keyBindings;
-extern bool g_autoBotEnabled;
-extern bool g_cliAutoBotLaunch;
-extern bool g_cliAutoBotTrain;
 void ResetKeyBindingsToDefault(GhostKeyBindings* kb);
 bool ShowLauncherDialog(HINSTANCE hInst);
-
-// Generic D3D11 backbuffer pixel readback (640x480 BGRA8 top-down)
-bool ReadBackbufferBgra(void* outBgraBuf, uint32_t width, uint32_t height, uint32_t dstRowPitch);
-
-// Optional AI Auto-Play Bot hooks (implemented in xbox_autobot.cpp)
-void UpdateAutoBotTick();
-bool ApplyAutoBotInput(void* pXboxInputState);
-const char* GetAutoBotStatusText();
-
-// Logging API
-void LogInit(const char* logFilePath);
-void LogClose();
-void LogPrintf(const char* fmt, ...);
 
 // Hooking / Bridging API
 // Overwrites the first 5 bytes of an Xbox function at `xboxVA` with `JMP rel32` to `hostFn`.

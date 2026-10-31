@@ -35,11 +35,8 @@ add_executable(GhostWin11 WIN32
     src/xbox_d3d8.cpp
     src/xbox_audio.cpp
     src/xbox_input.cpp
-    src/xbox_autobot.cpp
     include/ghost_runtime.h
-    include/ghost_symbols.h
     include/xbox_d3d8_types.h
-    include/autobot_levels.h
 )
 
 target_include_directories(GhostWin11 PRIVATE
@@ -50,6 +47,7 @@ target_compile_definitions(GhostWin11 PRIVATE
     _CRT_SECURE_NO_WARNINGS
     WIN32_LEAN_AND_MEAN
     NOMINMAX
+    GHOST_PROJECT_NAME=${PROJECT_NAME}
 )
 
 if(MSVC)

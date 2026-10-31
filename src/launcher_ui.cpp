@@ -23,14 +23,12 @@ enum LauncherCtrlIds {
     IDC_EDIT_GAMEDIR  = 105,
     IDC_BTN_BROWSE    = 106,
     IDC_BTN_KEYCONFIG = 107,
-    IDC_CHK_AUTOBOT   = 108,
 };
 
 static std::vector<GpuAdapterInfo> s_gpuAdapters;
 static HWND    s_hComboGpu    = nullptr;
 static HWND    s_hStaticInfo  = nullptr;
 static HWND    s_hEditGameDir = nullptr;
-static HWND    s_hChkAutoBot  = nullptr;
 static HBRUSH  s_hDlgBrush    = nullptr;
 static bool    s_launcherOk   = false;
 static bool    s_launcherDone = false;
@@ -63,6 +61,13 @@ static void JoinPathW(wchar_t* outBuf, size_t maxCount, const wchar_t* baseDir, 
     swprintf(outBuf, maxCount, hasSlash ? L"%ls%ls" : L"%ls\\%ls", baseDir, subPath);
 }
 
+#define GHOST_WIDEN_IMPL(x) L#x
+#define GHOST_WIDEN(x)      GHOST_WIDEN_IMPL(x)
+#ifndef GHOST_PROJECT_NAME
+#define GHOST_PROJECT_NAME  GhostWin11
+#endif
+static constexpr const wchar_t* kAppDataFolderNameW = GHOST_WIDEN(GHOST_PROJECT_NAME);
+
 static void GetExeDirW(wchar_t* outDirW, size_t maxCount) {
     if (!outDirW || maxCount == 0) return;
     outDirW[0] = L'\0';
@@ -70,6 +75,21 @@ static void GetExeDirW(wchar_t* outDirW, size_t maxCount) {
     wchar_t* lastSlashW = wcsrchr(outDirW, L'\\');
     if (lastSlashW) *lastSlashW = L'\0';
     TrimTrailingSlashesW(outDirW);
+}
+
+static void GetAppDataAndIniPathsW(wchar_t* outDataDirW, size_t dataDirMax, wchar_t* outIniPathW, size_t iniPathMax) {
+    wchar_t exeDirW[MAX_PATH] = {};
+    wchar_t dataDirW[MAX_PATH] = {};
+    GetExeDirW(exeDirW, MAX_PATH);
+    JoinPathW(dataDirW, MAX_PATH, exeDirW, kAppDataFolderNameW);
+
+    if (outDataDirW && dataDirMax > 0) {
+        wcsncpy(outDataDirW, dataDirW, dataDirMax - 1);
+        outDataDirW[dataDirMax - 1] = L'\0';
+    }
+    if (outIniPathW && iniPathMax > 0) {
+        JoinPathW(outIniPathW, iniPathMax, dataDirW, L"config.ini");
+    }
 }
 
 static bool IsValidGameDirW(const wchar_t* dirW) {
@@ -291,36 +311,18 @@ static void PersistAndInitUserDataDir(const wchar_t* gameDirW) {
     if (!IsValidGameDirW(gameDirW)) return;
     WideCharToMultiByte(CP_ACP, 0, gameDirW, -1, g_gameRootDir, MAX_PATH, nullptr, nullptr);
 
-    wchar_t exeDirW[MAX_PATH] = {};
     wchar_t userDataDirW[MAX_PATH] = {};
     wchar_t iniPathW[MAX_PATH] = {};
-    GetExeDirW(exeDirW, MAX_PATH);
-    JoinPathW(userDataDirW, MAX_PATH, exeDirW, L"GhostWin11");
+    GetAppDataAndIniPathsW(userDataDirW, MAX_PATH, iniPathW, MAX_PATH);
     CreateDirectoryW(userDataDirW, nullptr);
     WideCharToMultiByte(CP_ACP, 0, userDataDirW, -1, g_appRootDir, sizeof(g_appRootDir), nullptr, nullptr);
 
-    if (g_appRootDir[0]) {
-        char logPath[MAX_PATH] = {};
-        snprintf(logPath, sizeof(logPath), "%s\\runtime.log", g_appRootDir);
-        LogInit(logPath);
-        LogPrintf("[Main] User Data Directory: '%s'", g_appRootDir);
-        for (const GpuAdapterInfo& info : s_gpuAdapters) {
-            LogPrintf("[Launcher] Detected GPU #%u: %ls (Dedicated VRAM=%u MB, Shared=%u MB, Vendor=0x%04X, Device=0x%04X)",
-                info.index, info.description, (unsigned)info.dedicatedVramMB, (unsigned)info.sharedVramMB,
-                info.vendorId, info.deviceId);
-        }
-    }
-
-    JoinPathW(iniPathW, MAX_PATH, userDataDirW, L"config.ini");
     wchar_t numBuf[32];
     swprintf(numBuf, 32, L"%d", g_selectedAdapterIndex);
 
     WritePrivateProfileStringW(L"Paths", L"GameDir", gameDirW, iniPathW);
     WritePrivateProfileStringW(L"Graphics", L"AdapterIndex", numBuf, iniPathW);
     WritePrivateProfileStringW(L"Graphics", L"AdapterName", g_selectedAdapterName, iniPathW);
-    if (!g_cliAutoBotLaunch) {
-        WritePrivateProfileStringW(L"AutoBot", L"Enabled", g_autoBotEnabled ? L"1" : L"0", iniPathW);
-    }
     SaveKeyBindingsToIniW(iniPathW);
 }
 
@@ -729,13 +731,10 @@ static void ShowKeyboardConfigDialog(HWND hParent, HINSTANCE hInst) {
     SetForegroundWindow(hParent);
 
     if (s_keyDlgSaved) {
-        wchar_t exeDirW[MAX_PATH] = {};
         wchar_t userDataDirW[MAX_PATH] = {};
         wchar_t iniPathW[MAX_PATH] = {};
-        GetExeDirW(exeDirW, MAX_PATH);
-        JoinPathW(userDataDirW, MAX_PATH, exeDirW, L"GhostWin11");
+        GetAppDataAndIniPathsW(userDataDirW, MAX_PATH, iniPathW, MAX_PATH);
         CreateDirectoryW(userDataDirW, nullptr);
-        JoinPathW(iniPathW, MAX_PATH, userDataDirW, L"config.ini");
         SaveKeyBindingsToIniW(iniPathW);
     }
 }
@@ -853,9 +852,6 @@ static LRESULT CALLBACK LauncherWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
                     wcsncpy(g_selectedAdapterName, s_gpuAdapters[gpuSel].description, 127);
                     g_selectedAdapterName[127] = L'\0';
                 }
-                if (s_hChkAutoBot) {
-                    g_autoBotEnabled = (SendMessageW(s_hChkAutoBot, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                }
                 s_launcherOk   = true;
                 s_launcherDone = true;
                 DestroyWindow(hWnd);
@@ -910,15 +906,10 @@ bool ShowLauncherDialog(HINSTANCE hInst) {
         pFactory->Release();
     }
 
-    // Determine GhostWin11.exe directory
-    wchar_t exeDirW[MAX_PATH] = {};
-    GetExeDirW(exeDirW, MAX_PATH);
-
-    // 1. Locate config.ini in <exeDir>\GhostWin11\config.ini
+    // 1. Locate config.ini in <exeDir>\<exeBaseName>\config.ini
     wchar_t exeDataDirW[MAX_PATH] = {};
     wchar_t exeIniPathW[MAX_PATH] = {};
-    JoinPathW(exeDataDirW, MAX_PATH, exeDirW, L"GhostWin11");
-    JoinPathW(exeIniPathW, MAX_PATH, exeDataDirW, L"config.ini");
+    GetAppDataAndIniPathsW(exeDataDirW, MAX_PATH, exeIniPathW, MAX_PATH);
 
     s_selectedGameDirW[0] = L'\0';
     if (GetFileAttributesW(exeIniPathW) != INVALID_FILE_ATTRIBUTES) {
@@ -933,28 +924,11 @@ bool ShowLauncherDialog(HINSTANCE hInst) {
 
     LoadKeyBindingsFromIniW(exeIniPathW);
 
-    if (GetFileAttributesW(exeIniPathW) != INVALID_FILE_ATTRIBUTES) {
-        g_autoBotEnabled = (GetPrivateProfileIntW(L"AutoBot", L"Enabled", 0, exeIniPathW) != 0);
-    }
-
     int initialGpuComboSel = ResolveGpuComboSelectionFromIniW(exeIniPathW);
     if (!s_gpuAdapters.empty()) {
         g_selectedAdapterIndex = (int)s_gpuAdapters[initialGpuComboSel].index;
         wcsncpy(g_selectedAdapterName, s_gpuAdapters[initialGpuComboSel].description, 127);
         g_selectedAdapterName[127] = L'\0';
-    }
-
-    const char* cmdLineA = GetCommandLineA();
-    if (cmdLineA && strstr(cmdLineA, "--autobot") != nullptr) {
-        g_cliAutoBotLaunch = true;
-        g_cliAutoBotTrain  = (strstr(cmdLineA, "--autobot-train") != nullptr);
-        g_autoBotEnabled   = true;
-        if (IsValidGameDirW(s_selectedGameDirW)) {
-            PersistAndInitUserDataDir(s_selectedGameDirW);
-            LogPrintf("[Launcher] Headless --autobot launch: GameDir='%s', GPU=#%d (%ls)",
-                g_gameRootDir, g_selectedAdapterIndex, g_selectedAdapterName);
-            return true;
-        }
     }
 
     WNDCLASSEXW wc = {};
@@ -970,7 +944,7 @@ bool ShowLauncherDialog(HINSTANCE hInst) {
     RegisterClassExW(&wc);
 
     const int clientW = 580;
-    const int clientH = 335;
+    const int clientH = 308;
     RECT rc = { 0, 0, clientW, clientH };
     DWORD dlgStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&rc, dlgStyle, FALSE);
@@ -1066,28 +1040,20 @@ bool ShowLauncherDialog(HINSTANCE hInst) {
     SendMessageW(s_hStaticInfo, WM_SETFONT, (WPARAM)hFontSmall, TRUE);
     UpdateAdapterDetailLabel();
 
-    // AI Auto-Play Bot Checkbox
-    s_hChkAutoBot = CreateWindowExW(0, L"BUTTON",
-        L"Enable AI Auto-Play Bot (F5 in-game: State Machine + Waypoint Nav + Auto-Aim)",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-        22, 254, 536, 22, hDlg, (HMENU)(uintptr_t)IDC_CHK_AUTOBOT, hInst, nullptr);
-    SendMessageW(s_hChkAutoBot, WM_SETFONT, (WPARAM)hFontUI, TRUE);
-    SendMessageW(s_hChkAutoBot, BM_SETCHECK, g_autoBotEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
-
     // Keyboard Config, Launch & Exit Buttons
     HWND hBtnKeys = CreateWindowExW(0, L"BUTTON", L"Keyboard Config...",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        18, 286, 155, 34, hDlg, (HMENU)(uintptr_t)IDC_BTN_KEYCONFIG, hInst, nullptr);
+        18, 258, 155, 34, hDlg, (HMENU)(uintptr_t)IDC_BTN_KEYCONFIG, hInst, nullptr);
     SendMessageW(hBtnKeys, WM_SETFONT, (WPARAM)hFontUI, TRUE);
 
     HWND hBtnOk = CreateWindowExW(0, L"BUTTON", L"Launch Game",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-        322, 286, 125, 34, hDlg, (HMENU)(uintptr_t)IDOK, hInst, nullptr);
+        322, 258, 125, 34, hDlg, (HMENU)(uintptr_t)IDOK, hInst, nullptr);
     SendMessageW(hBtnOk, WM_SETFONT, (WPARAM)hFontBold, TRUE);
 
     HWND hBtnCancel = CreateWindowExW(0, L"BUTTON", L"Exit",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        457, 286, 105, 34, hDlg, (HMENU)(uintptr_t)IDCANCEL, hInst, nullptr);
+        457, 258, 105, 34, hDlg, (HMENU)(uintptr_t)IDCANCEL, hInst, nullptr);
     SendMessageW(hBtnCancel, WM_SETFONT, (WPARAM)hFontUI, TRUE);
 
     s_launcherOk   = false;
@@ -1123,8 +1089,7 @@ bool ShowLauncherDialog(HINSTANCE hInst) {
         return false;
     }
 
-    // Persist selected GameDir & GPU to <exeDir>\GhostWin11\config.ini and initialize runtime.log
+    // Persist selected GameDir & GPU to <exeDir>\GhostWin11\config.ini
     PersistAndInitUserDataDir(s_selectedGameDirW);
-    LogPrintf("[Launcher] Confirmed GameDir='%s', GPU=#%d (%ls)", g_gameRootDir, g_selectedAdapterIndex, g_selectedAdapterName);
     return true;
 }
