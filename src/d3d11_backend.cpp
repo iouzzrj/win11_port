@@ -395,18 +395,42 @@ struct XboxVisibilityQuerySlot {
 
 static XboxVisibilityQuerySlot g_visQuerySlots[kMaxXboxVisibilityQueries] = {};
 static ID3D11Query*            g_activeVisQuery = nullptr;
+static ID3D11Query*            g_visQueryFreePool[kMaxXboxVisibilityQueries * 2] = {};
+static uint32_t                g_visQueryFreeCount = 0;
+
+static ID3D11Query* AcquireVisibilityQueryObject() {
+    if (g_visQueryFreeCount > 0) {
+        return g_visQueryFreePool[--g_visQueryFreeCount];
+    }
+    if (!g_d3dDevice) return nullptr;
+    D3D11_QUERY_DESC qd = {};
+    qd.Query = D3D11_QUERY_OCCLUSION;
+    qd.MiscFlags = 0;
+    ID3D11Query* q = nullptr;
+    if (SUCCEEDED(g_d3dDevice->CreateQuery(&qd, &q))) {
+        return q;
+    }
+    return nullptr;
+}
+
+static void RecycleVisibilityQueryObject(ID3D11Query* q) {
+    if (!q) return;
+    if (g_visQueryFreeCount < (kMaxXboxVisibilityQueries * 2)) {
+        g_visQueryFreePool[g_visQueryFreeCount++] = q;
+    } else {
+        q->Release();
+    }
+}
 
 static HRESULT __stdcall Bridge_D3DDevice_BeginVisibilityTest() {
     if (!g_d3dDevice || !g_d3dCtx) return S_OK;
     if (g_activeVisQuery) {
         g_d3dCtx->End(g_activeVisQuery);
-        g_activeVisQuery->Release();
+        RecycleVisibilityQueryObject(g_activeVisQuery);
         g_activeVisQuery = nullptr;
     }
-    D3D11_QUERY_DESC qd = {};
-    qd.Query = D3D11_QUERY_OCCLUSION;
-    qd.MiscFlags = 0;
-    if (SUCCEEDED(g_d3dDevice->CreateQuery(&qd, &g_activeVisQuery)) && g_activeVisQuery) {
+    g_activeVisQuery = AcquireVisibilityQueryObject();
+    if (g_activeVisQuery) {
         g_d3dCtx->Begin(g_activeVisQuery);
     }
     return S_OK;
@@ -421,9 +445,9 @@ static HRESULT __stdcall Bridge_D3DDevice_EndVisibilityTest(DWORD Index) {
     if (slot.query) {
         uint64_t passed = 0;
         if (g_d3dCtx->GetData(slot.query, &passed, sizeof(passed), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK) {
-            slot.lastPixelsPassed = (UINT)passed;
+            slot.lastPixelsPassed = (passed > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : static_cast<UINT>(passed);
         }
-        slot.query->Release();
+        RecycleVisibilityQueryObject(slot.query);
     }
     slot.query   = g_activeVisQuery;
     slot.pending = true;
@@ -447,7 +471,8 @@ static HRESULT __stdcall Bridge_D3DDevice_GetVisibilityTestResult(
 
     if (slot.pending) {
         uint64_t passed = 0;
-        HRESULT hr = g_d3dCtx->GetData(slot.query, &passed, sizeof(passed), 0);
+        UINT getDataFlags = waitForResult ? 0u : D3D11_ASYNC_GETDATA_DONOTFLUSH;
+        HRESULT hr = g_d3dCtx->GetData(slot.query, &passed, sizeof(passed), getDataFlags);
         if (hr == S_FALSE && waitForResult) {
             for (int spin = 0; spin < 5000 && hr == S_FALSE; ++spin) {
                 SwitchToThread();
@@ -898,7 +923,7 @@ bool InitD3D11HostDevice() {
     ID3DBlob* psBlob = nullptr;
     ID3DBlob* errBlob = nullptr;
 
-    hr = D3DCompile(kGhostHLSL, strlen(kGhostHLSL), "GhostVS", nullptr, nullptr, "VSMain", "vs_4_0", 0, 0, &vsBlob, &errBlob);
+    hr = D3DCompile(kGhostHLSL, strlen(kGhostHLSL), "GhostVS", nullptr, nullptr, "VSMain", "vs_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsBlob, &errBlob);
     if (SUCCEEDED(hr) && vsBlob) {
         g_d3dDevice->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &g_vs);
         D3D11_INPUT_ELEMENT_DESC ied[] = {
@@ -915,7 +940,7 @@ bool InitD3D11HostDevice() {
     }
     if (errBlob) { errBlob->Release(); errBlob = nullptr; }
 
-    hr = D3DCompile(kGhostHLSL, strlen(kGhostHLSL), "GhostPS", nullptr, nullptr, "PSMain", "ps_4_0", 0, 0, &psBlob, &errBlob);
+    hr = D3DCompile(kGhostHLSL, strlen(kGhostHLSL), "GhostPS", nullptr, nullptr, "PSMain", "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &errBlob);
     if (SUCCEEDED(hr) && psBlob) {
         g_d3dDevice->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &g_ps);
         psBlob->Release();

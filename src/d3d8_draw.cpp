@@ -248,7 +248,56 @@ static void DecodeVerticesToUnified(
     Mat44 worldView = MulMat44(g_matWorld, g_matView);
     Mat44 wvp       = MulMat44(worldView, g_matProj);
 
+    // Precompute active lights and per-draw invariant directional/spotlight parameters
+    struct ActiveLightPrecomp {
+        const XboxLight8* lt;
+        float dirX, dirY, dirZ;
+        float cosHalfPhi;
+        float cosHalfTheta;
+    };
+    ActiveLightPrecomp activeLights[16];
+    int numActiveLights = 0;
+    for (int l = 0; l < 16; ++l) {
+        if (!g_lightEnabled[l]) continue;
+        const XboxLight8& lt = g_lights[l];
+        ActiveLightPrecomp& al = activeLights[numActiveLights++];
+        al.lt = &lt;
+        al.dirX = 0.0f; al.dirY = 0.0f; al.dirZ = 0.0f;
+        al.cosHalfPhi = 0.0f; al.cosHalfTheta = 0.0f;
+        if (lt.Type == 3) { // D3DLIGHT_DIRECTIONAL
+            float lx = -lt.Direction[0], ly = -lt.Direction[1], lz = -lt.Direction[2];
+            float lLen = sqrtf(lx * lx + ly * ly + lz * lz);
+            if (lLen > 0.0001f) { lx /= lLen; ly /= lLen; lz /= lLen; }
+            al.dirX = lx; al.dirY = ly; al.dirZ = lz;
+        } else if (lt.Type == 2) { // D3DLIGHT_SPOT
+            float sdx = lt.Direction[0], sdy = lt.Direction[1], sdz = lt.Direction[2];
+            float sdLen = sqrtf(sdx * sdx + sdy * sdy + sdz * sdz);
+            if (sdLen > 0.0001f) { sdx /= sdLen; sdy /= sdLen; sdz /= sdLen; }
+            al.dirX = sdx; al.dirY = sdy; al.dirZ = sdz;
+            al.cosHalfPhi   = cosf(lt.Phi * 0.5f);
+            al.cosHalfTheta = cosf(lt.Theta * 0.5f);
+        }
+    }
+
+    // Intra-draw Post-T&L vertex cache (simulates Xbox NV2A hardware indexed vertex cache)
+    uint32_t postTnLTag[1024];
+    uint32_t postTnLOutIdx[1024];
+    const bool usePostTnLCache = (optIndices != nullptr && vertexCount > 3);
+    if (usePostTnLCache) {
+        memset(postTnLTag, 0xFF, sizeof(postTnLTag));
+    }
+
     for (uint32_t i = 0; i < vertexCount; ++i) {
+        if (usePostTnLCache) {
+            uint32_t rawIdx = (uint32_t)optIndices[i];
+            uint32_t slot   = rawIdx & 1023u;
+            if (postTnLTag[slot] == rawIdx) {
+                outVerts[i] = outVerts[postTnLOutIdx[slot]];
+                continue;
+            }
+            postTnLTag[slot]    = rawIdx;
+            postTnLOutIdx[slot] = i;
+        }
         uint32_t vIdx = optIndices ? ((uint32_t)optIndices[i] + baseVertexIndex) : (i + baseVertexIndex);
         const uint8_t* vPtr = srcData + vIdx * stride;
         UnifiedVertex& dst = outVerts[i];
@@ -285,14 +334,12 @@ static void DecodeVerticesToUnified(
         }
 
         auto evalDynamicLights = [&](float matDiffR, float matDiffG, float matDiffB, float matAmbR, float matAmbG, float matAmbB, float& totR, float& totG, float& totB) {
-            for (int l = 0; l < 16; ++l) {
-                if (!g_lightEnabled[l]) continue;
-                const XboxLight8& lt = g_lights[l];
+            for (int alIdx = 0; alIdx < numActiveLights; ++alIdx) {
+                const ActiveLightPrecomp& al = activeLights[alIdx];
+                const XboxLight8& lt = *al.lt;
                 float lx = 0.0f, ly = 0.0f, lz = 0.0f, atten = 1.0f;
                 if (lt.Type == 3) { // D3DLIGHT_DIRECTIONAL
-                    lx = -lt.Direction[0]; ly = -lt.Direction[1]; lz = -lt.Direction[2];
-                    float lLen = sqrtf(lx * lx + ly * ly + lz * lz);
-                    if (lLen > 0.0001f) { lx /= lLen; ly /= lLen; lz /= lLen; }
+                    lx = al.dirX; ly = al.dirY; lz = al.dirZ;
                 } else if (lt.Type == 1 || lt.Type == 2) { // POINT or SPOT
                     lx = lt.Position[0] - wpx;
                     ly = lt.Position[1] - wpy;
@@ -303,15 +350,10 @@ static void DecodeVerticesToUnified(
                     float denom = lt.Attenuation0 + lt.Attenuation1 * dist + lt.Attenuation2 * dist * dist;
                     if (denom > 0.0001f) atten = 1.0f / denom;
                     if (lt.Type == 2) { // SPOT
-                        float sdx = lt.Direction[0], sdy = lt.Direction[1], sdz = lt.Direction[2];
-                        float sdLen = sqrtf(sdx * sdx + sdy * sdy + sdz * sdz);
-                        if (sdLen > 0.0001f) { sdx /= sdLen; sdy /= sdLen; sdz /= sdLen; }
-                        float cosAlpha = -(lx * sdx + ly * sdy + lz * sdz);
-                        float cosHalfPhi = cosf(lt.Phi * 0.5f);
-                        float cosHalfTheta = cosf(lt.Theta * 0.5f);
-                        if (cosAlpha <= cosHalfPhi) continue;
-                        if (cosAlpha < cosHalfTheta && (cosHalfTheta - cosHalfPhi) > 0.0001f) {
-                            atten *= powf((cosAlpha - cosHalfPhi) / (cosHalfTheta - cosHalfPhi), lt.Falloff > 0.0f ? lt.Falloff : 1.0f);
+                        float cosAlpha = -(lx * al.dirX + ly * al.dirY + lz * al.dirZ);
+                        if (cosAlpha <= al.cosHalfPhi) continue;
+                        if (cosAlpha < al.cosHalfTheta && (al.cosHalfTheta - al.cosHalfPhi) > 0.0001f) {
+                            atten *= powf((cosAlpha - al.cosHalfPhi) / (al.cosHalfTheta - al.cosHalfPhi), lt.Falloff > 0.0f ? lt.Falloff : 1.0f);
                         }
                     }
                 } else {
@@ -573,17 +615,16 @@ static void DecodeVerticesToUnified(
                 computeWorldTangentBasis(twx, twy, twz, bwx, bwy, bwz);
 
                 float lx = 0.57735f, ly = 0.57735f, lz = 0.57735f;
-                for (int l = 0; l < 16; ++l) {
-                    if (!g_lightEnabled[l]) continue;
-                    const XboxLight8& lt = g_lights[l];
+                if (numActiveLights > 0) {
+                    const ActiveLightPrecomp& al = activeLights[0];
+                    const XboxLight8& lt = *al.lt;
                     if (lt.Type == 3) {
-                        lx = -lt.Direction[0]; ly = -lt.Direction[1]; lz = -lt.Direction[2];
+                        lx = al.dirX; ly = al.dirY; lz = al.dirZ;
                     } else {
                         lx = lt.Position[0] - wpx; ly = lt.Position[1] - wpy; lz = lt.Position[2] - wpz;
+                        float lLen = sqrtf(lx * lx + ly * ly + lz * lz);
+                        if (lLen > 0.0001f) { lx /= lLen; ly /= lLen; lz /= lLen; }
                     }
-                    float lLen = sqrtf(lx * lx + ly * ly + lz * lz);
-                    if (lLen > 0.0001f) { lx /= lLen; ly /= lLen; lz /= lLen; }
-                    break;
                 }
                 float ltX = lx * twx + ly * twy + lz * twz;
                 float ltY = lx * bwx + ly * bwy + lz * bwz;
@@ -625,17 +666,17 @@ static void DecodeVerticesToUnified(
                 float specExp = (g_specularScale >= 1.0f) ? g_specularScale : 16.0f;
                 float specScale = (g_specularScale > 0.0f && g_specularScale < 1.0f) ? g_specularScale : 1.0f;
                 float specR = 0.0f, specG = 0.0f, specB = 0.0f;
-                for (int l = 0; l < 16; ++l) {
-                    if (!g_lightEnabled[l]) continue;
-                    const XboxLight8& lt = g_lights[l];
+                for (int alIdx = 0; alIdx < numActiveLights; ++alIdx) {
+                    const ActiveLightPrecomp& al = activeLights[alIdx];
+                    const XboxLight8& lt = *al.lt;
                     float lx = 0.0f, ly = 0.0f, lz = 0.0f;
                     if (lt.Type == 3) {
-                        lx = -lt.Direction[0]; ly = -lt.Direction[1]; lz = -lt.Direction[2];
+                        lx = al.dirX; ly = al.dirY; lz = al.dirZ;
                     } else {
                         lx = lt.Position[0] - wpx; ly = lt.Position[1] - wpy; lz = lt.Position[2] - wpz;
+                        float lLen = sqrtf(lx * lx + ly * ly + lz * lz);
+                        if (lLen > 0.0001f) { lx /= lLen; ly /= lLen; lz /= lLen; }
                     }
-                    float lLen = sqrtf(lx * lx + ly * ly + lz * lz);
-                    if (lLen > 0.0001f) { lx /= lLen; ly /= lLen; lz /= lLen; }
                     float hx = lx + vx, hy = ly + vy, hz = lz + vz;
                     float hLen = sqrtf(hx * hx + hy * hy + hz * hz);
                     if (hLen > 0.0001f) { hx /= hLen; hy /= hLen; hz /= hLen; }
