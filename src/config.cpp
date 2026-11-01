@@ -1,7 +1,7 @@
 #include "ghost_runtime.h"
 
 // ============================================================================
-// Path & Config INI Helpers (<exeDir>\GhostWin11\config.ini)
+// Path & Config INI Helpers (<exeDir>\GhostWin11_Data\config.ini)
 // ============================================================================
 
 GhostKeyBindings g_editKeyBindings = {};
@@ -60,7 +60,7 @@ void JoinPathW(wchar_t* outBuf, size_t maxCount, const wchar_t* baseDir, const w
 #ifndef GHOST_PROJECT_NAME
 #define GHOST_PROJECT_NAME  GhostWin11
 #endif
-static constexpr const wchar_t* kAppDataFolderNameW = GHOST_WIDEN(GHOST_PROJECT_NAME);
+static constexpr const wchar_t* kAppDataFolderNameW = GHOST_WIDEN(GHOST_PROJECT_NAME) L"_Data";
 
 void GetExeDirW(wchar_t* outDirW, size_t maxCount) {
     if (!outDirW || maxCount == 0) return;
