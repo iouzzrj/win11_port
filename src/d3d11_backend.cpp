@@ -242,6 +242,7 @@ ID3D11RasterizerState* GetRastState(uint32_t cullMode, uint32_t fillMode, uint32
     }
     desc.FrontCounterClockwise = FALSE;
     desc.DepthBias = -((INT)(int32_t)zBias) * 16;
+    desc.SlopeScaledDepthBias = -((float)(int32_t)zBias) * 0.25f;
     desc.DepthClipEnable = TRUE;
     desc.ScissorEnable = scissor ? TRUE : FALSE;
 
@@ -759,7 +760,8 @@ void DrawOsdOverlayOnBackbuffer() {
 
     g_d3dCtx->VSSetShader(g_vs, nullptr, 0);
     g_d3dCtx->VSSetConstantBuffers(0, 1, &g_cbPerDraw);
-    g_d3dCtx->PSSetShader(g_ps, nullptr, 0);
+    ID3D11PixelShader* osdPS = GetPixelShaderPermutation(0u);
+    g_d3dCtx->PSSetShader(osdPS ? osdPS : g_ps, nullptr, 0);
     g_d3dCtx->PSSetConstantBuffers(0, 1, &g_cbPerDraw);
 
     ID3D11ShaderResourceView* srvs[4] = { g_osdSRV, nullptr, nullptr, nullptr };
@@ -821,6 +823,38 @@ static void __stdcall Bridge_D3DDevice_SetGammaRamp(DWORD Flags, const uint8_t* 
 // ============================================================================
 // Device Creation (_Direct3D_CreateDevice@24 at 0x006BCD20)
 // ============================================================================
+
+static constexpr uint32_t kNumPsPermutations = 29u; // 0 = fixed-function, 1..28 = aPixelShaders[0..27]
+static ID3D11PixelShader* g_psPermutations[kNumPsPermutations] = {};
+
+ID3D11PixelShader* GetPixelShaderPermutation(uint32_t psMode) {
+    if (!g_d3dDevice || psMode >= kNumPsPermutations) return g_ps;
+    if (g_psPermutations[psMode]) return g_psPermutations[psMode];
+
+    char modeBuf[16];
+    snprintf(modeBuf, sizeof(modeBuf), "%uu", psMode);
+    const D3D_SHADER_MACRO macros[] = {
+        { "FIXED_PS_MODE", modeBuf },
+        { nullptr, nullptr }
+    };
+    ID3DBlob* psBlob  = nullptr;
+    ID3DBlob* errBlob = nullptr;
+    HRESULT hr = D3DCompile(
+        kGhostHLSL, strlen(kGhostHLSL), "GhostPSPerm",
+        macros, nullptr, "PSMain", "ps_4_0",
+        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &errBlob);
+    if (SUCCEEDED(hr) && psBlob) {
+        g_d3dDevice->CreatePixelShader(
+            psBlob->GetBufferPointer(), psBlob->GetBufferSize(),
+            nullptr, &g_psPermutations[psMode]);
+        psBlob->Release();
+    }
+    if (errBlob) errBlob->Release();
+    if (!g_psPermutations[psMode]) {
+        g_psPermutations[psMode] = g_ps;
+    }
+    return g_psPermutations[psMode];
+}
 
 static void* __stdcall Bridge_Direct3DCreate8(UINT SDKVersion) {
     (void)SDKVersion;
@@ -946,6 +980,9 @@ bool InitD3D11HostDevice() {
         psBlob->Release();
     }
     if (errBlob) { errBlob->Release(); errBlob = nullptr; }
+
+    // Pre-compile fixed-function pixel shader permutation (mode 0)
+    GetPixelShaderPermutation(0u);
 
     D3D11_BUFFER_DESC cbd = {};
     cbd.ByteWidth = sizeof(PerDrawCBData);

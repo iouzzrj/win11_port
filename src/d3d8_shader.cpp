@@ -44,6 +44,9 @@ static HRESULT __stdcall Bridge_D3DDevice_CreatePixelShader(const void* pShaderD
     if (hAddr >= ADDR_PIXEL_SHADERS_TABLE && hAddr < ADDR_PIXEL_SHADERS_TABLE + 28 * 8) {
         obj->engineType = (int32_t)((hAddr - ADDR_PIXEL_SHADERS_TABLE) / 8);
     }
+    if (obj->engineType >= 0 && obj->engineType < 28) {
+        GetPixelShaderPermutation((uint32_t)(obj->engineType + 1));
+    }
     *pHandle = reinterpret_cast<DWORD>(obj);
     return S_OK;
 }

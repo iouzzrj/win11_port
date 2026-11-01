@@ -402,6 +402,17 @@ struct alignas(16) PerDrawCBData {
     float    psConst5[4];   // c5
     float    psConst6[4];   // c6
     float    psConst7[4];   // c7
+    float    worldRow0[4];  // g_matWorld row 0
+    float    worldRow1[4];  // g_matWorld row 1
+    float    worldRow2[4];  // g_matWorld row 2
+    float    worldRow3[4];  // g_matWorld row 3
+    uint32_t lightCount[4]; // x=numLights (0..8), y=gpuLightEnable (0/1), z=0, w=0
+    float    lightPosType[8][4];    // xyz=Position (Point/Spot) or -Direction (Dir), w=Type (1=Point,2=Spot,3=Dir)
+    float    lightDirRange[8][4];   // xyz=Direction (Spot), w=Range
+    float    lightAttenSpot[8][4];  // x=Atten0, y=Atten1, z=Atten2, w=cos(Phi*0.5)
+    float    lightSpotParams[8][4]; // x=1/(cosHalfTheta-cosHalfPhi), y=Falloff, z=0, w=0
+    float    lightDiffuse[8][4];    // rgb=Light.Diffuse * Mat.Diffuse
+    float    lightAmbient[8][4];    // rgb=Light.Ambient * Mat.Ambient
 };
 #pragma pack(pop)
 
@@ -477,6 +488,7 @@ ID3D11DepthStencilState* GetDepthState(
     uint32_t stencilFunc, uint32_t stencilReadMask, uint32_t stencilWriteMask);
 ID3D11RasterizerState* GetRastState(uint32_t cullMode, uint32_t fillMode, uint32_t zBias, bool scissor);
 ID3D11SamplerState* GetSamplerState(uint32_t addrU, uint32_t addrV, uint32_t magFilter, uint32_t borderColor);
+ID3D11PixelShader* GetPixelShaderPermutation(uint32_t psMode);
 void DrawOsdOverlayOnBackbuffer();
 
 // d3d8_texture.cpp

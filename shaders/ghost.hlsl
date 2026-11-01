@@ -35,6 +35,17 @@ cbuffer PerDrawCB : register(b0) {
     float4 uPsConst5;
     float4 uPsConst6;
     float4 uPsConst7;
+    float4 uWorldRow0;
+    float4 uWorldRow1;
+    float4 uWorldRow2;
+    float4 uWorldRow3;
+    uint4  uLightCount;
+    float4 uLightPosType[8];
+    float4 uLightDirRange[8];
+    float4 uLightAttenSpot[8];
+    float4 uLightSpotParams[8];
+    float4 uLightDiffuse[8];
+    float4 uLightAmbient[8];
 };
 
 Texture2D    tex0 : register(t0);
@@ -63,7 +74,7 @@ struct PSIn {
     float2 uv1    : TEXCOORD1;
     float2 uv2    : TEXCOORD2;
     float2 uv3    : TEXCOORD3;
-    float  eyeDist: TEXCOORD4;
+    float2 eyeDist: TEXCOORD4;
     float3 norm   : TEXCOORD5;
 };
 
@@ -75,16 +86,61 @@ PSIn VSMain(VSIn input) {
         float ndcX = ((input.pos.x - uViewport.x) / vpW) * 2.0f - 1.0f;
         float ndcY = 1.0f - ((input.pos.y - uViewport.y) / vpH) * 2.0f;
         o.pos = float4(ndcX, ndcY, saturate(input.pos.z), 1.0f);
-        o.eyeDist = 0.0f;
+        o.eyeDist = float2(0.0f, 1.0f);
     } else {
         float4 clipPos = input.pos.x * uWvpRow0 +
                          input.pos.y * uWvpRow1 +
                          input.pos.z * uWvpRow2 +
                          uWvpRow3;
         o.pos = clipPos;
-        o.eyeDist = max(clipPos.w, 0.0f);
+        o.eyeDist = float2(max(clipPos.w, 0.0f), input.pos.w);
     }
-    o.color = input.color;
+    if (uLightCount.y != 0u && uFlags.x == 0u) {
+        float3 wPos = input.pos.x * uWorldRow0.xyz +
+                      input.pos.y * uWorldRow1.xyz +
+                      input.pos.z * uWorldRow2.xyz +
+                      uWorldRow3.xyz;
+        float3 wNorm = input.norm.x * uWorldRow0.xyz +
+                       input.norm.y * uWorldRow1.xyz +
+                       input.norm.z * uWorldRow2.xyz;
+        float nLen = length(wNorm);
+        if (nLen > 0.0001f) wNorm /= nLen;
+
+        float3 totRgb = input.color.rgb;
+        uint numLights = min(uLightCount.x, 8u);
+        for (uint l = 0u; l < numLights; ++l) {
+            float4 posType = uLightPosType[l];
+            float lType = posType.w;
+            float3 L = float3(0.0f, 0.0f, 0.0f);
+            float atten = 1.0f;
+            if (lType > 2.5f) { // D3DLIGHT_DIRECTIONAL (3)
+                L = posType.xyz;
+            } else { // POINT (1) or SPOT (2)
+                float3 toLight = posType.xyz - wPos;
+                float dist = length(toLight);
+                float range = uLightDirRange[l].w;
+                if (range > 0.0f && dist > range) continue;
+                if (dist > 0.0001f) L = toLight / dist;
+                float4 attSpot = uLightAttenSpot[l];
+                float denom = attSpot.x + attSpot.y * dist + attSpot.z * dist * dist;
+                if (denom > 0.0001f) atten = 1.0f / denom;
+                if (lType > 1.5f) { // D3DLIGHT_SPOT (2)
+                    float cosAlpha = -dot(L, uLightDirRange[l].xyz);
+                    float cosHalfPhi = attSpot.w;
+                    if (cosAlpha <= cosHalfPhi) continue;
+                    float cosHalfTheta = uLightSpotParams[l].x;
+                    if (cosAlpha < cosHalfTheta && (cosHalfTheta - cosHalfPhi) > 0.0001f) {
+                        atten *= pow(max((cosAlpha - cosHalfPhi) / (cosHalfTheta - cosHalfPhi), 0.0f), uLightSpotParams[l].y);
+                    }
+                }
+            }
+            float ndotl = max(dot(wNorm, L), 0.0f);
+            totRgb += atten * (uLightAmbient[l].rgb + ndotl * uLightDiffuse[l].rgb);
+        }
+        o.color = float4(saturate(totRgb), input.color.a);
+    } else {
+        o.color = input.color;
+    }
     o.uv0   = input.uv0 * uUvScale01.xy;
     o.uv1   = input.uv1 * uUvScale01.zw;
     o.uv2   = input.uv2 * uUvScale23.xy;
@@ -212,12 +268,18 @@ float4 PSMain(PSIn input) : SV_TARGET {
     float4 current = diffuse;
     uint texMask  = uFlags.y & 0x0Fu;
     uint cubeMask = (uFlags.y >> 4u) & 0x0Fu;
+    uint projMask = (uFlags.y >> 8u) & 0x0Fu;
+#ifdef FIXED_PS_MODE
+    const uint psMode = (uint)FIXED_PS_MODE;
+#else
     uint psMode   = uFlags.w;
+#endif
 
-    float2 uv0 = input.uv0;
-    float2 uv1 = input.uv1;
-    float2 uv2 = input.uv2;
-    float2 uv3 = input.uv3;
+    float invProjQ = (projMask != 0u && abs(input.eyeDist.y) > 0.0001f) ? (1.0f / input.eyeDist.y) : 1.0f;
+    float2 uv0 = ((projMask & 1u) != 0u) ? (input.uv0 * invProjQ) : input.uv0;
+    float2 uv1 = ((projMask & 2u) != 0u) ? (input.uv1 * invProjQ) : input.uv1;
+    float2 uv2 = ((projMask & 4u) != 0u) ? (input.uv2 * invProjQ) : input.uv2;
+    float2 uv3 = ((projMask & 8u) != 0u) ? (input.uv3 * invProjQ) : input.uv3;
 
     float4 t0 = ((texMask & 1u) != 0u) ? SampleStage2D(tex0, smp0, uv0, (cubeMask & 1u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);
     float4 t1 = ((texMask & 2u) != 0u) ? SampleStage2D(tex1, smp1, uv1, (cubeMask & 2u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);
@@ -410,7 +472,7 @@ float4 PSMain(PSIn input) : SV_TARGET {
     // Hardware Distance & Atmospheric Fog (3D geometry only)
     if (uFogParams.x > 0.5f && uFlags.x == 0u) {
         float fogMode = uFogParams.x;
-        float d = input.eyeDist;
+        float d = input.eyeDist.x;
         float fogFactor = 1.0f;
         if (fogMode > 2.5f) { // D3DFOG_LINEAR (3)
             float span = max(uFogParams.z - uFogParams.y, 0.001f);

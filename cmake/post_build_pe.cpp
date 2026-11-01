@@ -103,6 +103,57 @@ int main(int argc, char* argv[]) {
         ntHdr->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].Size           = 0;
     }
 
+    // Strip the 5.5 MB raw zero padding of '.xbox' on disk so it becomes a pure virtual RWE reservation
+    DWORD strippedBytes = 0;
+    if (firstSec->SizeOfRawData > 0 &&
+        firstSec->PointerToRawData > 0 &&
+        static_cast<size_t>(firstSec->PointerToRawData) + firstSec->SizeOfRawData <= data.size()) {
+        DWORD rawOff  = firstSec->PointerToRawData;
+        DWORD rawSize = firstSec->SizeOfRawData;
+        WORD  numSecs = ntHdr->FileHeader.NumberOfSections;
+
+        // Adjust IMAGE_DEBUG_DIRECTORY::PointerToRawData before shifting section raw offsets
+        if (ntHdr->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_DEBUG) {
+            DWORD dbgRva  = ntHdr->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress;
+            DWORD dbgSize = ntHdr->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size;
+            if (dbgRva != 0 && dbgSize >= sizeof(IMAGE_DEBUG_DIRECTORY)) {
+                for (WORD i = 1; i < numSecs; ++i) {
+                    const IMAGE_SECTION_HEADER& s = firstSec[i];
+                    if (dbgRva >= s.VirtualAddress && dbgRva + dbgSize <= s.VirtualAddress + s.SizeOfRawData) {
+                        size_t dbgFileOff = static_cast<size_t>(s.PointerToRawData) + (dbgRva - s.VirtualAddress);
+                        if (dbgFileOff + dbgSize <= data.size()) {
+                            auto* dbgDirs = reinterpret_cast<IMAGE_DEBUG_DIRECTORY*>(data.data() + dbgFileOff);
+                            DWORD count   = dbgSize / sizeof(IMAGE_DEBUG_DIRECTORY);
+                            for (DWORD d = 0; d < count; ++d) {
+                                if (dbgDirs[d].PointerToRawData >= rawOff + rawSize) {
+                                    dbgDirs[d].PointerToRawData -= rawSize;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Shift subsequent sections' file offsets down by rawSize
+        for (WORD i = 1; i < numSecs; ++i) {
+            if (firstSec[i].PointerToRawData >= rawOff + rawSize) {
+                firstSec[i].PointerToRawData -= rawSize;
+            }
+        }
+
+        firstSec->PointerToRawData = 0;
+        firstSec->SizeOfRawData    = 0;
+        firstSec->Characteristics  = IMAGE_SCN_CNT_UNINITIALIZED_DATA |
+                                     IMAGE_SCN_MEM_READ |
+                                     IMAGE_SCN_MEM_WRITE |
+                                     IMAGE_SCN_MEM_EXECUTE;
+
+        data.erase(data.begin() + rawOff, data.begin() + rawOff + rawSize);
+        strippedBytes = rawSize;
+    }
+
     fp = std::fopen(exePath, "wb");
     if (!fp) {
         std::fprintf(stderr, "[PostBuild] Failed to open file for writing: %s\n", exePath);
@@ -116,10 +167,12 @@ int main(int argc, char* argv[]) {
     std::fclose(fp);
 
     std::printf(
-        "[PostBuild] Verified %s: ImageBase=0x%08lX, .xbox=0x%08lX..0x%08lX, LoadConfig cleared.\n",
+        "[PostBuild] Verified %s: ImageBase=0x%08lX, .xbox=0x%08lX..0x%08lX (stripped %lu KB raw padding, final size %lu KB), LoadConfig cleared.\n",
         exePath,
         static_cast<unsigned long>(imageBase),
         static_cast<unsigned long>(imageBase + firstSecRva),
-        static_cast<unsigned long>(imageBase + firstSecRva + firstSecVSize));
+        static_cast<unsigned long>(imageBase + firstSecRva + firstSecVSize),
+        static_cast<unsigned long>(strippedBytes / 1024u),
+        static_cast<unsigned long>(data.size() / 1024u));
     return 0;
 }

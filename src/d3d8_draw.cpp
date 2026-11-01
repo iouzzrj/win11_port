@@ -180,11 +180,16 @@ void UnpackD3DColor(uint32_t c, float* r, float* g, float* b, float* a) {
     *b = (c         & 0xFFu) * (1.0f / 255.0f);
 }
 
+static uint32_t g_lastProjMask = 0;
+static uint32_t g_gpuLightMode = 0; // 0 = off, 1 = defaultWorldLit (unit material), 2 = g_material lighting
+
 static void DecodeVerticesToUnified(
     const uint8_t* srcData, uint32_t stride, uint32_t vertexCount,
     const uint16_t* optIndices, uint32_t baseVertexIndex,
     std::vector<UnifiedVertex>& outVerts, bool* outIsRhw)
 {
+    g_lastProjMask = 0;
+    g_gpuLightMode = 0;
     XboxShaderDeclInfo decl = {};
     decl.vsType = -1;
     GetXboxVertexShaderDecl(g_currentVsHandle, &decl);
@@ -287,6 +292,19 @@ static void DecodeVerticesToUnified(
         memset(postTnLTag, 0xFF, sizeof(postTnLTag));
     }
 
+    const bool isCustom3DVS = !decl.hasRhw && (
+        g_activeCustomVS != 0 ||
+        (decl.vsType >= 0x0Bu && decl.vsType <= 0x32u) ||
+        (decl.vsType >= 0x38u && decl.vsType <= 0x41u));
+
+    const bool isCustomNormalOverride = !decl.hasRhw && (
+        ((g_activeCustomVS == kCustomVsBumpEnv || (decl.vsType >= 0x13 && decl.vsType <= 0x16)) && g_currentPsHandle != 0 && g_currentPsType == 6) ||
+        ((g_activeCustomVS == kCustomVsBump || (decl.vsType >= 0x10 && decl.vsType <= 0x12)) && g_activeCustomVS != kCustomVsBumpEmboss) ||
+        (g_activeCustomVS == kCustomVsSpecular || (decl.vsType >= 0x3Fu && decl.vsType <= 0x41u)));
+
+    const bool offloadLightsToGpu = (numActiveLights > 0 && !isCustomNormalOverride);
+    const bool needCpuWorldTransform = !decl.hasRhw && (isCustom3DVS || (numActiveLights > 0 && !offloadLightsToGpu));
+
     for (uint32_t i = 0; i < vertexCount; ++i) {
         if (usePostTnLCache) {
             uint32_t rawIdx = (uint32_t)optIndices[i];
@@ -320,7 +338,7 @@ static void DecodeVerticesToUnified(
 
         float wx = 0.0f, wy = 1.0f, wz = 0.0f;
         float wpx = dst.x, wpy = dst.y, wpz = dst.z;
-        if (!decl.hasRhw) {
+        if (needCpuWorldTransform) {
             wpx = dst.x * g_matWorld.m[0][0] + dst.y * g_matWorld.m[1][0] + dst.z * g_matWorld.m[2][0] + g_matWorld.m[3][0];
             wpy = dst.x * g_matWorld.m[0][1] + dst.y * g_matWorld.m[1][1] + dst.z * g_matWorld.m[2][1] + g_matWorld.m[3][1];
             wpz = dst.x * g_matWorld.m[0][2] + dst.y * g_matWorld.m[1][2] + dst.z * g_matWorld.m[2][2] + g_matWorld.m[3][2];
@@ -374,10 +392,17 @@ static void DecodeVerticesToUnified(
                 float totR = dst.r + ambR;
                 float totG = dst.g + ambG;
                 float totB = dst.b + ambB;
-                evalDynamicLights(1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, totR, totG, totB);
-                dst.r = totR < 0.0f ? 0.0f : (totR > 1.0f ? 1.0f : totR);
-                dst.g = totG < 0.0f ? 0.0f : (totG > 1.0f ? 1.0f : totG);
-                dst.b = totB < 0.0f ? 0.0f : (totB > 1.0f ? 1.0f : totB);
+                if (offloadLightsToGpu) {
+                    g_gpuLightMode = 1u;
+                    dst.r = totR;
+                    dst.g = totG;
+                    dst.b = totB;
+                } else {
+                    evalDynamicLights(1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, totR, totG, totB);
+                    dst.r = totR < 0.0f ? 0.0f : (totR > 1.0f ? 1.0f : totR);
+                    dst.g = totG < 0.0f ? 0.0f : (totG > 1.0f ? 1.0f : totG);
+                    dst.b = totB < 0.0f ? 0.0f : (totB > 1.0f ? 1.0f : totB);
+                }
             }
         } else if (decl.hasNorm && !decl.hasRhw) {
             if (lightingMode != 0 && (lightingEnabled || g_curPrelitColors != nullptr)) {
@@ -401,13 +426,19 @@ static void DecodeVerticesToUnified(
                     totB += preB;
                 }
 
-                if (!prelitOnlyMode && lightingEnabled) {
-                    evalDynamicLights(matDiffR, matDiffG, matDiffB, matAmbR, matAmbG, matAmbB, totR, totG, totB);
+                if (!prelitOnlyMode && lightingEnabled && offloadLightsToGpu) {
+                    g_gpuLightMode = 2u;
+                    dst.r = totR;
+                    dst.g = totG;
+                    dst.b = totB;
+                } else {
+                    if (!prelitOnlyMode && lightingEnabled) {
+                        evalDynamicLights(matDiffR, matDiffG, matDiffB, matAmbR, matAmbG, matAmbB, totR, totG, totB);
+                    }
+                    dst.r = totR < 0.0f ? 0.0f : (totR > 1.0f ? 1.0f : totR);
+                    dst.g = totG < 0.0f ? 0.0f : (totG > 1.0f ? 1.0f : totG);
+                    dst.b = totB < 0.0f ? 0.0f : (totB > 1.0f ? 1.0f : totB);
                 }
-
-                dst.r = totR < 0.0f ? 0.0f : (totR > 1.0f ? 1.0f : totR);
-                dst.g = totG < 0.0f ? 0.0f : (totG > 1.0f ? 1.0f : totG);
-                dst.b = totB < 0.0f ? 0.0f : (totB > 1.0f ? 1.0f : totB);
                 dst.a = (ambA > 0.001f && ambA <= 1.0f) ? ambA : 1.0f;
             } else {
                 dst.r = 1.0f; dst.g = 1.0f; dst.b = 1.0f;
@@ -710,32 +741,31 @@ static void DecodeVerticesToUnified(
                        (decl.vsType >= 0x3Du && decl.vsType <= 0x3Eu)) { // cLightProjectShader (ProjLight*.xvu)
                 // ProjLightSkinned0.xvu transforms world position r6 = (wpx, wpy, wpz, 1):
                 // oT0.xy = dp4(r6, c[126..127]) (non-projective distance ramp),
-                // oT1.xy = dp4(r6, c[122..123]) / dp4(r6, c[124]) (projective light cookie).
+                // oT1.xy = dp4(r6, c[122..123]), q = dp4(r6, c[124]) (per-pixel projective light cookie).
+                float pu = 0.0f, pv = 0.0f, pz = 1.0f;
                 if (g_activeCustomVS == kCustomVsLightProject) {
                     const Mat44& m0 = g_lightProjMat0;
                     const Mat44& m1 = g_lightProjMat1;
                     dst.u0 = wpx * m0.m[0][0] + wpy * m0.m[1][0] + wpz * m0.m[2][0] + m0.m[3][0];
                     dst.v0 = wpx * m0.m[0][1] + wpy * m0.m[1][1] + wpz * m0.m[2][1] + m0.m[3][1];
-                    float pu = wpx * m1.m[0][0] + wpy * m1.m[1][0] + wpz * m1.m[2][0] + m1.m[3][0];
-                    float pv = wpx * m1.m[0][1] + wpy * m1.m[1][1] + wpz * m1.m[2][1] + m1.m[3][1];
-                    float pz = wpx * m1.m[0][2] + wpy * m1.m[1][2] + wpz * m1.m[2][2] + m1.m[3][2];
+                    pu = wpx * m1.m[0][0] + wpy * m1.m[1][0] + wpz * m1.m[2][0] + m1.m[3][0];
+                    pv = wpx * m1.m[0][1] + wpy * m1.m[1][1] + wpz * m1.m[2][1] + m1.m[3][1];
+                    pz = wpx * m1.m[0][2] + wpy * m1.m[1][2] + wpz * m1.m[2][2] + m1.m[3][2];
                     if (fabsf(pz) <= 0.0001f) {
                         pz = wpx * m1.m[0][3] + wpy * m1.m[1][3] + wpz * m1.m[2][3] + m1.m[3][3];
                     }
-                    if (fabsf(pz) > 0.0001f) { pu /= pz; pv /= pz; }
-                    dst.u1 = pu;
-                    dst.v1 = pv;
                 } else {
                     const float* vsC122 = reinterpret_cast<const float*>(ADDR_D3D_VS_CONSTANTS + 122 * 16);
                     dst.u0 = wpx * vsC126[0 * 4 + 0] + wpy * vsC126[0 * 4 + 1] + wpz * vsC126[0 * 4 + 2] + vsC126[0 * 4 + 3];
                     dst.v0 = wpx * vsC126[1 * 4 + 0] + wpy * vsC126[1 * 4 + 1] + wpz * vsC126[1 * 4 + 2] + vsC126[1 * 4 + 3];
-                    float pu = wpx * vsC122[0 * 4 + 0] + wpy * vsC122[0 * 4 + 1] + wpz * vsC122[0 * 4 + 2] + vsC122[0 * 4 + 3];
-                    float pv = wpx * vsC122[1 * 4 + 0] + wpy * vsC122[1 * 4 + 1] + wpz * vsC122[1 * 4 + 2] + vsC122[1 * 4 + 3];
-                    float pz = wpx * vsC122[2 * 4 + 0] + wpy * vsC122[2 * 4 + 1] + wpz * vsC122[2 * 4 + 2] + vsC122[2 * 4 + 3];
-                    if (fabsf(pz) > 0.0001f) { pu /= pz; pv /= pz; }
-                    dst.u1 = pu;
-                    dst.v1 = pv;
+                    pu = wpx * vsC122[0 * 4 + 0] + wpy * vsC122[0 * 4 + 1] + wpz * vsC122[0 * 4 + 2] + vsC122[0 * 4 + 3];
+                    pv = wpx * vsC122[1 * 4 + 0] + wpy * vsC122[1 * 4 + 1] + wpz * vsC122[1 * 4 + 2] + vsC122[1 * 4 + 3];
+                    pz = wpx * vsC122[2 * 4 + 0] + wpy * vsC122[2 * 4 + 1] + wpz * vsC122[2 * 4 + 2] + vsC122[2 * 4 + 3];
                 }
+                dst.u1 = pu;
+                dst.v1 = pv;
+                dst.w  = (fabsf(pz) > 0.0001f) ? pz : 0.0001f;
+                g_lastProjMask |= (1u << 1);
                 dst.u2 = rawU[0]; dst.v2 = rawV[0];
                 dst.u3 = rawU[0]; dst.v3 = rawV[0];
                 continue;
@@ -845,14 +875,12 @@ static void DecodeVerticesToUnified(
                 float outV = tu * tm.m[0][1] + tv * tm.m[1][1] + inZ * tm.m[2][1] + inW * tm.m[3][1];
                 float outZ = tu * tm.m[0][2] + tv * tm.m[1][2] + inZ * tm.m[2][2] + inW * tm.m[3][2];
                 float outW = tu * tm.m[0][3] + tv * tm.m[1][3] + inZ * tm.m[2][3] + inW * tm.m[3][3];
-                if ((ttf & kXboxTtffProjectedFlag) != 0u) { // D3DTTFF_PROJECTED
+                if ((ttf & kXboxTtffProjectedFlag) != 0u) { // D3DTTFF_PROJECTED (per-pixel division in PSMain)
                     float denom = (dimCount == 3u) ? outZ : outW;
-                    if (fabsf(denom) > 0.0001f) {
-                        outU /= denom;
-                        outV /= denom;
-                    }
                     tu = outU;
                     tv = outV;
+                    dst.w = (fabsf(denom) > 0.0001f) ? denom : 1.0f;
+                    g_lastProjMask |= (1u << s);
                 } else if (is3DCoord) {
                     // Non-projected 3D reflection/normal vector (e.g. SetUVReflection D3DTTFF_COUNT3):
                     // normalize direction and map [-1, +1] -> [0, 1] UV space
@@ -1141,7 +1169,7 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
     }
 
     cb.flags[0] = isRhw ? 1u : 0u;
-    cb.flags[1] = texMask | (cubeMask << 4);
+    cb.flags[1] = texMask | (cubeMask << 4) | ((g_lastProjMask & 0x0Fu) << 8);
     cb.flags[2] = xboxRS[XBOX_D3DRS_ALPHATESTENABLE] ? 1u : 0u;
     cb.flags[3] = (g_currentPsHandle != 0 && g_currentPsType >= 0) ? (uint32_t)(g_currentPsType + 1) : 0u;
 
@@ -1187,6 +1215,66 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
     memcpy(cb.psConst5, g_psConstants[5], 16);
     memcpy(cb.psConst6, g_psConstants[6], 16);
     memcpy(cb.psConst7, g_psConstants[7], 16);
+
+    if (g_gpuLightMode != 0u && !isRhw) {
+        for (int i = 0; i < 4; ++i) {
+            cb.worldRow0[i] = g_matWorld.m[0][i];
+            cb.worldRow1[i] = g_matWorld.m[1][i];
+            cb.worldRow2[i] = g_matWorld.m[2][i];
+            cb.worldRow3[i] = g_matWorld.m[3][i];
+        }
+        float matDiffR = (g_gpuLightMode == 2u && g_hasMaterial) ? g_material.Diffuse[0] : 1.0f;
+        float matDiffG = (g_gpuLightMode == 2u && g_hasMaterial) ? g_material.Diffuse[1] : 1.0f;
+        float matDiffB = (g_gpuLightMode == 2u && g_hasMaterial) ? g_material.Diffuse[2] : 1.0f;
+        float matAmbR  = (g_gpuLightMode == 2u && g_hasMaterial) ? g_material.Ambient[0] : 1.0f;
+        float matAmbG  = (g_gpuLightMode == 2u && g_hasMaterial) ? g_material.Ambient[1] : 1.0f;
+        float matAmbB  = (g_gpuLightMode == 2u && g_hasMaterial) ? g_material.Ambient[2] : 1.0f;
+
+        uint32_t numGpuLights = 0u;
+        for (int l = 0; l < 16 && numGpuLights < 8u; ++l) {
+            if (!g_lightEnabled[l]) continue;
+            const XboxLight8& lt = g_lights[l];
+            if (lt.Type < 1u || lt.Type > 3u) continue;
+            uint32_t idx = numGpuLights++;
+            if (lt.Type == 3u) { // D3DLIGHT_DIRECTIONAL
+                float lx = -lt.Direction[0], ly = -lt.Direction[1], lz = -lt.Direction[2];
+                float lLen = sqrtf(lx * lx + ly * ly + lz * lz);
+                if (lLen > 0.0001f) { lx /= lLen; ly /= lLen; lz /= lLen; }
+                cb.lightPosType[idx][0] = lx;
+                cb.lightPosType[idx][1] = ly;
+                cb.lightPosType[idx][2] = lz;
+                cb.lightPosType[idx][3] = 3.0f;
+            } else { // POINT (1) or SPOT (2)
+                cb.lightPosType[idx][0]  = lt.Position[0];
+                cb.lightPosType[idx][1]  = lt.Position[1];
+                cb.lightPosType[idx][2]  = lt.Position[2];
+                cb.lightPosType[idx][3]  = (float)lt.Type;
+                cb.lightDirRange[idx][3] = lt.Range;
+                cb.lightAttenSpot[idx][0] = lt.Attenuation0;
+                cb.lightAttenSpot[idx][1] = lt.Attenuation1;
+                cb.lightAttenSpot[idx][2] = lt.Attenuation2;
+                if (lt.Type == 2u) {
+                    float sdx = lt.Direction[0], sdy = lt.Direction[1], sdz = lt.Direction[2];
+                    float sdLen = sqrtf(sdx * sdx + sdy * sdy + sdz * sdz);
+                    if (sdLen > 0.0001f) { sdx /= sdLen; sdy /= sdLen; sdz /= sdLen; }
+                    cb.lightDirRange[idx][0]   = sdx;
+                    cb.lightDirRange[idx][1]   = sdy;
+                    cb.lightDirRange[idx][2]   = sdz;
+                    cb.lightAttenSpot[idx][3]  = cosf(lt.Phi * 0.5f);
+                    cb.lightSpotParams[idx][0] = cosf(lt.Theta * 0.5f);
+                    cb.lightSpotParams[idx][1] = (lt.Falloff > 0.0f) ? lt.Falloff : 1.0f;
+                }
+            }
+            cb.lightDiffuse[idx][0] = lt.Diffuse[0] * matDiffR;
+            cb.lightDiffuse[idx][1] = lt.Diffuse[1] * matDiffG;
+            cb.lightDiffuse[idx][2] = lt.Diffuse[2] * matDiffB;
+            cb.lightAmbient[idx][0] = lt.Ambient[0] * matAmbR;
+            cb.lightAmbient[idx][1] = lt.Ambient[1] * matAmbG;
+            cb.lightAmbient[idx][2] = lt.Ambient[2] * matAmbB;
+        }
+        cb.lightCount[0] = numGpuLights;
+        cb.lightCount[1] = (numGpuLights > 0u) ? 1u : 0u;
+    }
 
     D3D11_MAPPED_SUBRESOURCE mappedCB = {};
     if (SUCCEEDED(g_d3dCtx->Map(g_cbPerDraw, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedCB))) {
@@ -1255,7 +1343,8 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
 
     g_d3dCtx->VSSetShader(g_vs, nullptr, 0);
     g_d3dCtx->VSSetConstantBuffers(0, 1, &g_cbPerDraw);
-    g_d3dCtx->PSSetShader(g_ps, nullptr, 0);
+    ID3D11PixelShader* activePS = GetPixelShaderPermutation(cb.flags[3]);
+    g_d3dCtx->PSSetShader(activePS ? activePS : g_ps, nullptr, 0);
     g_d3dCtx->PSSetConstantBuffers(0, 1, &g_cbPerDraw);
 
     g_d3dCtx->PSSetShaderResources(0, 4, srvs);
@@ -1467,6 +1556,8 @@ static void __stdcall Bridge_D3DDevice_SetVertexDataColor(int Register, DWORD Co
 
 static void __stdcall Bridge_D3DDevice_End() {
     if (g_immVerts.empty()) return;
+    g_lastProjMask = 0;
+    g_gpuLightMode = 0;
     bool isRhw = ((g_currentVsHandle & 0x00010001u) == 0) && ((g_currentVsHandle & 0x004u) != 0);
 
     // Route Stage 0..3 UVs according to D3DTSS_TEXCOORDINDEX and D3DTSS_TEXTURETRANSFORMFLAGS
@@ -1495,10 +1586,8 @@ static void __stdcall Bridge_D3DDevice_End() {
                 float outW = tu * tm.m[0][3] + tv * tm.m[1][3] + tm.m[2][3] + tm.m[3][3];
                 if (ttf & kXboxTtffProjected) {
                     float denom = (dimCount == 3) ? outZ : outW;
-                    if (fabsf(denom) > 0.0001f) {
-                        outU /= denom;
-                        outV /= denom;
-                    }
+                    v.w = (fabsf(denom) > 0.0001f) ? denom : 1.0f;
+                    g_lastProjMask |= (1u << s);
                 }
                 tu = outU;
                 tv = outV;
