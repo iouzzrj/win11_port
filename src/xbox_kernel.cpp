@@ -1,6 +1,5 @@
 #include "ghost_runtime.h"
 #include "ghost_addresses.h"
-#include <stdarg.h>
 
 // ============================================================================
 // LIBCMT Thread-Local Storage (__getptd / __freeptd / __mtinit)
@@ -190,18 +189,8 @@ void __stdcall Krnl_DbgBreakPoint() {
 }
 
 static int __cdecl Krnl_DbgPrint(const char* fmt, ...) {
-    if (!fmt) return 0;
-    char buf[1024];
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(buf, sizeof(buf) - 1, fmt, args);
-    va_end(args);
-    buf[sizeof(buf) - 1] = '\0';
-    size_t len = strlen(buf);
-    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
-        buf[--len] = '\0';
-    }
-    return (int)len;
+    (void)fmt;
+    return 0;
 }
 
 static uint64_t __stdcall Krnl_KeQueryPerformanceCounter() {
@@ -521,13 +510,13 @@ static void __stdcall Bridge_XACTEngineDoWork() {
     typedef void (__thiscall *PFN_CEngineDoWork)(void* thisPtr);
 
     int entered = reinterpret_cast<PFN_XACTEnterCS>(0x006FE3E0)();
-    void* pEngine = *reinterpret_cast<void**>(0x00708F74); // _g_pXACTEngine
+    void* pEngine = *reinterpret_cast<void**>(ADDR_XACT_ENGINE_PTR); // _g_pXACTEngine
     if (pEngine) {
         reinterpret_cast<PFN_DSDoWork>(0x006E1A58)();             // _DirectSoundDoWork@0
         reinterpret_cast<PFN_CEngineDoWork>(0x00700056)(pEngine); // ?DoWork@CEngine@XACT@@QAEXXZ
     }
     if (entered) {
-        Bridge_RtlLeaveCriticalSection(reinterpret_cast<XBOX_CRITICAL_SECTION*>(0x00708F58));
+        Bridge_RtlLeaveCriticalSection(reinterpret_cast<XBOX_CRITICAL_SECTION*>(ADDR_XACT_CRITICAL_SECTION));
     }
     if (g_activeXactTimer && g_activeXactTimer->Dpc && g_activeXactTimer->Dpc->DeferredRoutine) {
         XBOX_KDPC* dpc = g_activeXactTimer->Dpc;
@@ -699,10 +688,10 @@ void InitXboxKernel() {
 
     // 4. Bridge LIBCMT Thread-Local Storage (__getptd, __freeptd, __mtinit)
     Bridge_crt_mtinit();
-    InstallBridge(0x00695311, &Bridge_crt_getptd,   "__getptd");
-    InstallBridge(0x0069545C, &Bridge_crt_freeptd,  "__freeptd");
-    InstallBridge(0x006954AE, &Bridge_crt_mtinit,   "__mtinit");
+    InstallBridge(0x00695311, &Bridge_crt_getptd);        // __getptd
+    InstallBridge(0x0069545C, &Bridge_crt_freeptd);       // __freeptd
+    InstallBridge(0x006954AE, &Bridge_crt_mtinit);        // __mtinit
 
     // 5. XACT DoWork hook to drive XACT's DPC sequencer
-    InstallBridge(0x0070010F, &Bridge_XACTEngineDoWork, "_XACTEngineDoWork@0");
+    InstallBridge(0x0070010F, &Bridge_XACTEngineDoWork);  // _XACTEngineDoWork@0
 }

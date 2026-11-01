@@ -28,9 +28,7 @@ bool GetXboxVertexShaderDecl(uint32_t handle, XboxShaderDeclInfo* outDecl) {
 }
 
 struct XboxPixelShaderObject {
-    uint32_t refCount;
     int32_t  engineType; // 0..27 if from aPixelShaders[0..27] at 0x007D1214, else 0
-    void*    pDef;
     uint8_t  defBytes[240];
 };
 
@@ -38,9 +36,7 @@ static HRESULT __stdcall Bridge_D3DDevice_CreatePixelShader(const void* pShaderD
     if (!pHandle) return E_INVALIDARG;
     XboxPixelShaderObject* obj = reinterpret_cast<XboxPixelShaderObject*>(calloc(1, sizeof(XboxPixelShaderObject)));
     if (!obj) return E_OUTOFMEMORY;
-    obj->refCount = 1;
     obj->engineType = 0;
-    obj->pDef = obj->defBytes;
     if (pShaderDef) {
         memcpy(obj->defBytes, pShaderDef, 240);
     }
@@ -122,8 +118,7 @@ static HRESULT __stdcall Bridge_D3DDevice_CreateVertexShader(
     if (!pHandle) return E_INVALIDARG;
 
     XboxShaderDeclInfo info = {};
-    info.isValid = true;
-    info.vsType  = -1;
+    info.vsType = -1;
 
     uintptr_t hAddr = reinterpret_cast<uintptr_t>(pHandle);
     if (hAddr >= ADDR_VERTEX_SHADERS_TABLE && hAddr < ADDR_VERTEX_SHADERS_TABLE + 66 * 24) {
@@ -161,7 +156,6 @@ static HRESULT __stdcall Bridge_D3DDevice_CreateVertexShader(
                         default: break;
                     }
                     curOffset += (uint16_t)byteSize;
-                    info.stride = curOffset;
                 }
             }
         }
@@ -341,18 +335,44 @@ static uint32_t Host_RenderSetupWeightedSkin(uint8_t* pMeshGroup, uint8_t* pMode
     return 0;
 }
 
-const uint32_t* g_curPrelitColors     = nullptr;
-uint32_t        g_curPrelitBaseVertex = 0;
-float           g_cloakDistort        = 16.0f;
-float           g_cloakC35[4]         = { 1.0f, 0.0f, 0.0f, 0.5f };
-float           g_shieldC35x          = 1.0f;
-float           g_teleportC32[2]      = { 1.0f / 640.0f, 1.0f / 480.0f };
-float           g_teleportC33x        = 0.0f;
-float           g_motionBlurVec[4]    = { 0.0f, 0.0f, 0.0f, 1.0f };
+const uint32_t* g_curPrelitColors      = nullptr;
+uint32_t        g_curPrelitBaseVertex  = 0;
+const float*    g_curTangentBasis      = nullptr;
+uint32_t        g_curTangentBaseVertex = 0;
+float           g_cloakDistort         = 16.0f;
+float           g_cloakC35[4]          = { 1.0f, 0.0f, 0.0f, 0.5f };
+float           g_shieldC35x           = 1.0f;
+float           g_teleportC32[2]       = { 1.0f / 640.0f, 1.0f / 480.0f };
+float           g_teleportC33x         = 0.0f;
+float           g_motionBlurVec[4]     = { 0.0f, 0.0f, 0.0f, 1.0f };
+float           g_embossScale          = 0.015f;
+float           g_specularScale        = 1.0f;
+float           g_detailUvScale[2]     = { 1.0f, 1.0f };
+Mat44           g_lightProjMat0        = { {{1,0,0,0}, {0,1,0,0}, {0,0,1,0}, {0,0,0,1}} };
+Mat44           g_lightProjMat1        = { {{1,0,0,0}, {0,1,0,0}, {0,0,1,0}, {0,0,0,1}} };
+
+static void SetupTangentStreamForMesh(const uint8_t* pMeshGroup, bool bindStream1) {
+    g_curTangentBasis      = nullptr;
+    g_curTangentBaseVertex = 0;
+    if (!pMeshGroup) return;
+    uint8_t lodIdx = pMeshGroup[0x50];
+    if (lodIdx >= 3) return;
+    const uint8_t* pModel = *reinterpret_cast<const uint8_t* const*>(pMeshGroup + 0x04);
+    if (!pModel) return;
+    XboxVertexBuffer* tangentVB = *reinterpret_cast<XboxVertexBuffer* const*>(pModel + lodIdx * 0x18 + 0x20);
+    if (tangentVB && tangentVB->Data) {
+        if (bindStream1) {
+            Bridge_D3DDevice_SetStreamSource(1, tangentVB, 0x24);
+        }
+        g_curTangentBasis      = reinterpret_cast<const float*>(tangentVB->Data);
+        g_curTangentBaseVertex = *reinterpret_cast<const uint32_t*>(pMeshGroup + 0x48);
+    }
+}
 
 static void SetupPrelitStreamForMesh(const uint8_t* pMeshGroup, const uint8_t* pModelInst) {
     g_curPrelitColors     = nullptr;
     g_curPrelitBaseVertex = 0;
+    SetupTangentStreamForMesh(pMeshGroup, false);
     if (pMeshGroup && pModelInst && (pModelInst[0x14] & 1) != 0) {
         uint8_t lodIdx = pMeshGroup[0x50];
         if (lodIdx < 3) {
@@ -376,6 +396,7 @@ static int __fastcall Bridge_Shader_VertexSetup(void* pShader, void* edxUnused, 
     g_activeCustomVS = 0;
     if (!pMeshGroup) {
         g_curPrelitColors = nullptr;
+        g_curTangentBasis = nullptr;
         return -1;
     }
 
@@ -510,15 +531,67 @@ static int __fastcall Bridge_MotionBlur_VertexSetup(uint8_t* pShader, void* edxU
     return rc;
 }
 
+static int __fastcall Bridge_BumpShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
+    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
+    SetupTangentStreamForMesh(pMeshGroup, true);
+    g_activeCustomVS = kCustomVsBump;
+    return rc;
+}
+
 static int __fastcall Bridge_BumpEnvShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
     int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
+    SetupTangentStreamForMesh(pMeshGroup, true);
     g_activeCustomVS = kCustomVsBumpEnv;
+    return rc;
+}
+
+static int __fastcall Bridge_BumpEmbossShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
+    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
+    SetupTangentStreamForMesh(pMeshGroup, true);
+    g_activeCustomVS = kCustomVsBumpEmboss;
+    if (pShader) {
+        float s = *reinterpret_cast<const float*>(pShader + 0x58);
+        g_embossScale = (fabsf(s) > 0.0001f) ? (s * 0.05f) : 0.015f;
+    }
     return rc;
 }
 
 static int __fastcall Bridge_EnvmapShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
     int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
     g_activeCustomVS = kCustomVsEnvmap;
+    return rc;
+}
+
+static int __fastcall Bridge_SpecularShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
+    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
+    g_activeCustomVS = kCustomVsSpecular;
+    if (pShader) {
+        float s = *reinterpret_cast<const float*>(pShader + 0x58);
+        g_specularScale = (fabsf(s) > 0.0001f) ? s : 1.0f;
+    }
+    return rc;
+}
+
+static int __fastcall Bridge_GlossEnvmapDetailShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
+    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
+    g_activeCustomVS = kCustomVsGlossEnvmapDetail;
+    if (pShader) {
+        // cGlossEnvmapDetailShader is 0x5C bytes (NewInstance at 0x005FEDF0); +0x58 holds scalar detailScale
+        float s = *reinterpret_cast<const float*>(pShader + 0x58);
+        float val = (fabsf(s) > 0.0001f) ? s : 1.0f;
+        g_detailUvScale[0] = val;
+        g_detailUvScale[1] = val;
+    }
+    return rc;
+}
+
+static int __fastcall Bridge_LightProjectShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
+    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
+    g_activeCustomVS = kCustomVsLightProject;
+    if (pShader) {
+        memcpy(&g_lightProjMat0, pShader + 0xE0, sizeof(Mat44));
+        memcpy(&g_lightProjMat1, pShader + 0x120, sizeof(Mat44));
+    }
     return rc;
 }
 
@@ -530,6 +603,12 @@ static int __fastcall Bridge_Shader_VertexSetupRigid(void* pShader, void* edxUnu
     return (int)g_fnRenderSetupRigid(pMeshGroup, pModelInst, lod);
 }
 
+static int __fastcall Bridge_Shader_VertexSetupRigidBump(void* pShader, void* edxUnused, uint8_t* pMeshGroup, uint32_t lod, int bSetVS) {
+    int rc = Bridge_Shader_VertexSetupRigid(pShader, edxUnused, pMeshGroup, lod, bSetVS);
+    SetupTangentStreamForMesh(pMeshGroup, true);
+    return rc;
+}
+
 static int __fastcall Bridge_Shader_VertexSetupWeightedSkin(void* pShader, void* edxUnused, uint8_t* pMeshGroup, uint32_t lod, int bSetVS) {
     (void)pShader; (void)edxUnused; (void)bSetVS;
     g_activeCustomVS = 0;
@@ -538,12 +617,24 @@ static int __fastcall Bridge_Shader_VertexSetupWeightedSkin(void* pShader, void*
     return (int)Host_RenderSetupWeightedSkin(pMeshGroup, pModelInst, lod, false);
 }
 
+static int __fastcall Bridge_Shader_VertexSetupWeightedSkinBump(void* pShader, void* edxUnused, uint8_t* pMeshGroup, uint32_t lod, int bSetVS) {
+    int rc = Bridge_Shader_VertexSetupWeightedSkin(pShader, edxUnused, pMeshGroup, lod, bSetVS);
+    SetupTangentStreamForMesh(pMeshGroup, true);
+    return rc;
+}
+
 static int __fastcall Bridge_Shader_VertexSetupSkinned(void* pShader, void* edxUnused, uint8_t* pMeshGroup, uint32_t lod, int bSetVS) {
     (void)pShader; (void)edxUnused; (void)bSetVS;
     g_activeCustomVS = 0;
     uint8_t* pModelInst = *reinterpret_cast<uint8_t**>(ADDR_CUR_MODEL_INST_PTR);
     SetupPrelitStreamForMesh(pMeshGroup, pModelInst);
     return (int)g_fnRenderSetupSkinned(pMeshGroup, pModelInst, lod);
+}
+
+static int __fastcall Bridge_Shader_VertexSetupSkinnedBump(void* pShader, void* edxUnused, uint8_t* pMeshGroup, uint32_t lod, int bSetVS) {
+    int rc = Bridge_Shader_VertexSetupSkinned(pShader, edxUnused, pMeshGroup, lod, bSetVS);
+    SetupTangentStreamForMesh(pMeshGroup, true);
+    return rc;
 }
 
 static int __fastcall Bridge_Shader_VertexSetupPrelit2(void* pShader, void* edxUnused, void* pMeshGroup, void* pModelInst) {
@@ -558,45 +649,45 @@ static int __fastcall Bridge_Shader_VertexSetupPrelit4(void* pShader, void* edxU
 
 void InitXboxD3D8ShaderBridges() {
     // 1. Bridge Vertex Shaders & Constants
-    InstallBridge(0x006B27F0, &Bridge_D3DDevice_CreateVertexShader,               "_D3DDevice_CreateVertexShader@16");
-    InstallBridge(0x006B2F40, &Bridge_D3DDevice_SetVertexShader,                  "_D3DDevice_SetVertexShader@4");
-    InstallBridge(0x006B2930, &Bridge_D3DDevice_SetVertexShaderConstant1,         "@D3DDevice_SetVertexShaderConstant1@8");
-    InstallBridge(0x006B2990, &Bridge_D3DDevice_SetVertexShaderConstant4,         "@D3DDevice_SetVertexShaderConstant4@8");
-    InstallBridge(0x006B2A40, &Bridge_D3DDevice_SetVertexShaderConstantNotInline, "@D3DDevice_SetVertexShaderConstantNotInlineFast@12");
-    InstallBridge(0x006B2B20, &Bridge_D3DDevice_SetVertexShaderConstantNotInline, "@D3DDevice_SetVertexShaderConstantNotInline@12");
+    InstallBridge(0x006B27F0, &Bridge_D3DDevice_CreateVertexShader);               // _D3DDevice_CreateVertexShader@16
+    InstallBridge(0x006B2F40, &Bridge_D3DDevice_SetVertexShader);                  // _D3DDevice_SetVertexShader@4
+    InstallBridge(0x006B2930, &Bridge_D3DDevice_SetVertexShaderConstant1);         // @D3DDevice_SetVertexShaderConstant1@8
+    InstallBridge(0x006B2990, &Bridge_D3DDevice_SetVertexShaderConstant4);         // @D3DDevice_SetVertexShaderConstant4@8
+    InstallBridge(0x006B2A40, &Bridge_D3DDevice_SetVertexShaderConstantNotInline); // @D3DDevice_SetVertexShaderConstantNotInlineFast@12
+    InstallBridge(0x006B2B20, &Bridge_D3DDevice_SetVertexShaderConstantNotInline); // @D3DDevice_SetVertexShaderConstantNotInline@12
 
     // 2. Bridge Pixel Shaders & Constants
-    InstallBridge(0x006B3C60, &Bridge_D3DDevice_CreatePixelShader,                "_D3DDevice_CreatePixelShader@8");
-    InstallBridge(0x006B3CB0, &Bridge_D3DDevice_SetPixelShaderProgram,            "_D3DDevice_SetPixelShaderProgram@4");
-    InstallBridge(0x006B3CF0, &Bridge_D3DDevice_SetPixelShader,                   "_D3DDevice_SetPixelShader@4");
-    InstallBridge(0x006B3EF0, &Bridge_D3DDevice_SetPixelShaderConstant,           "_D3DDevice_SetPixelShaderConstant@12");
+    InstallBridge(0x006B3C60, &Bridge_D3DDevice_CreatePixelShader);                // _D3DDevice_CreatePixelShader@8
+    InstallBridge(0x006B3CB0, &Bridge_D3DDevice_SetPixelShaderProgram);            // _D3DDevice_SetPixelShaderProgram@4
+    InstallBridge(0x006B3CF0, &Bridge_D3DDevice_SetPixelShader);                   // _D3DDevice_SetPixelShader@4
+    InstallBridge(0x006B3EF0, &Bridge_D3DDevice_SetPixelShaderConstant);           // _D3DDevice_SetPixelShaderConstant@12
 
     // 3. Bridge cShader::VertexSetup* to Ghost.exe's built-in CPU skinning (cMeshGroup::RenderSetup*)
-    InstallBridge(0x00607AB0, &Bridge_Shader_VertexSetup,                         "cShader::VertexSetup");
-    InstallBridge(0x00602FE0, &Bridge_Shader_VertexSetup,                         "cLightProjectShader::VertexSetup");
-    InstallBridge(0x006085B0, &Bridge_SightShader_VertexSetup,                    "cSightShader::VertexSetup");
-    InstallBridge(0x00608A20, &Bridge_ShieldShader_VertexSetup,                   "cShieldShader::VertexSetup");
-    InstallBridge(0x00608C50, &Bridge_TeleportShader_VertexSetup,                 "cTeleportShader::VertexSetup");
-    InstallBridge(0x00609560, &Bridge_GhostSuitShader_VertexSetup,                "cGhostSuitShader::VertexSetup");
-    InstallBridge(0x00609620, &Bridge_ScreenEffectShader_VertexSetup,             "cScreenEffectShader::VertexSetup");
-    InstallBridge(0x00609830, &Bridge_CloakShader_VertexSetup,                    "cCloakShader::VertexSetup");
-    InstallBridge(0x00609E20, &Bridge_MembraneShader_VertexSetup,                 "cMembraneShader::VertexSetup");
-    InstallBridge(0x00609FE0, &Bridge_MotionBlur_VertexSetup,                     "cMotionBlur::VertexSetup");
-    InstallBridge(0x006127D0, &Bridge_Shader_VertexSetup,                         "cBumpShader::VertexSetup");
-    InstallBridge(0x00612920, &Bridge_BumpEnvShader_VertexSetup,                  "cBumpEnvShader::VertexSetup");
-    InstallBridge(0x00612A70, &Bridge_Shader_VertexSetup,                         "cBumpEmbossShader::VertexSetup");
-    InstallBridge(0x00616450, &Bridge_EnvmapShader_VertexSetup,                   "cEnvmapShader::VertexSetup");
-    InstallBridge(0x006165B0, &Bridge_EnvmapShader_VertexSetup,                   "cMetalEnvmapShader::VertexSetup");
-    InstallBridge(0x00616860, &Bridge_Shader_VertexSetup,                         "cGlossEnvmapDetailShader::VertexSetup");
-    InstallBridge(0x00616AD0, &Bridge_Shader_VertexSetup,                         "cSpecularShader::VertexSetup");
+    InstallBridge(0x00607AB0, &Bridge_Shader_VertexSetup);                         // cShader::VertexSetup
+    InstallBridge(0x00602FE0, &Bridge_LightProjectShader_VertexSetup);             // cLightProjectShader::VertexSetup
+    InstallBridge(0x006085B0, &Bridge_SightShader_VertexSetup);                    // cSightShader::VertexSetup
+    InstallBridge(0x00608A20, &Bridge_ShieldShader_VertexSetup);                   // cShieldShader::VertexSetup
+    InstallBridge(0x00608C50, &Bridge_TeleportShader_VertexSetup);                 // cTeleportShader::VertexSetup
+    InstallBridge(0x00609560, &Bridge_GhostSuitShader_VertexSetup);                // cGhostSuitShader::VertexSetup
+    InstallBridge(0x00609620, &Bridge_ScreenEffectShader_VertexSetup);             // cScreenEffectShader::VertexSetup
+    InstallBridge(0x00609830, &Bridge_CloakShader_VertexSetup);                    // cCloakShader::VertexSetup
+    InstallBridge(0x00609E20, &Bridge_MembraneShader_VertexSetup);                 // cMembraneShader::VertexSetup
+    InstallBridge(0x00609FE0, &Bridge_MotionBlur_VertexSetup);                     // cMotionBlur::VertexSetup
+    InstallBridge(0x006127D0, &Bridge_BumpShader_VertexSetup);                     // cBumpShader::VertexSetup
+    InstallBridge(0x00612920, &Bridge_BumpEnvShader_VertexSetup);                  // cBumpEnvShader::VertexSetup
+    InstallBridge(0x00612A70, &Bridge_BumpEmbossShader_VertexSetup);               // cBumpEmbossShader::VertexSetup
+    InstallBridge(0x00616450, &Bridge_EnvmapShader_VertexSetup);                   // cEnvmapShader::VertexSetup
+    InstallBridge(0x006165B0, &Bridge_EnvmapShader_VertexSetup);                   // cMetalEnvmapShader::VertexSetup
+    InstallBridge(0x00616860, &Bridge_GlossEnvmapDetailShader_VertexSetup);        // cGlossEnvmapDetailShader::VertexSetup
+    InstallBridge(0x00616AD0, &Bridge_SpecularShader_VertexSetup);                 // cSpecularShader::VertexSetup
 
-    InstallBridge(0x00605750, &Bridge_Shader_VertexSetupRigid,                    "cShader::VertexSetupRigid");
-    InstallBridge(0x00605950, &Bridge_Shader_VertexSetupRigid,                    "cShader::VertexSetupRigidBump");
-    InstallBridge(0x00605B50, &Bridge_Shader_VertexSetupPrelit2,                  "cShader::VertexSetupPrelitRigid");
-    InstallBridge(0x00605CD0, &Bridge_Shader_VertexSetupWeightedSkin,             "cShader::VertexSetupWeightedSkin");
-    InstallBridge(0x00607880, &Bridge_Shader_VertexSetupWeightedSkin,             "cShader::VertexSetupWeightedSkinBump");
-    InstallBridge(0x00605EC0, &Bridge_Shader_VertexSetupPrelit4,                  "cShader::VertexSetupPrelitWeightedSkin");
-    InstallBridge(0x006060D0, &Bridge_Shader_VertexSetupSkinned,                  "cShader::VertexSetupSkinned");
-    InstallBridge(0x006062D0, &Bridge_Shader_VertexSetupSkinned,                  "cShader::VertexSetupSkinnedBump");
-    InstallBridge(0x006064F0, &Bridge_Shader_VertexSetupPrelit4,                  "cShader::VertexSetupPrelitSkinned");
+    InstallBridge(0x00605750, &Bridge_Shader_VertexSetupRigid);                    // cShader::VertexSetupRigid
+    InstallBridge(0x00605950, &Bridge_Shader_VertexSetupRigidBump);                // cShader::VertexSetupRigidBump
+    InstallBridge(0x00605B50, &Bridge_Shader_VertexSetupPrelit2);                  // cShader::VertexSetupPrelitRigid
+    InstallBridge(0x00605CD0, &Bridge_Shader_VertexSetupWeightedSkin);             // cShader::VertexSetupWeightedSkin
+    InstallBridge(0x00607880, &Bridge_Shader_VertexSetupWeightedSkinBump);         // cShader::VertexSetupWeightedSkinBump
+    InstallBridge(0x00605EC0, &Bridge_Shader_VertexSetupPrelit4);                  // cShader::VertexSetupPrelitWeightedSkin
+    InstallBridge(0x006060D0, &Bridge_Shader_VertexSetupSkinned);                  // cShader::VertexSetupSkinned
+    InstallBridge(0x006062D0, &Bridge_Shader_VertexSetupSkinnedBump);              // cShader::VertexSetupSkinnedBump
+    InstallBridge(0x006064F0, &Bridge_Shader_VertexSetupPrelit4);                  // cShader::VertexSetupPrelitSkinned
 }

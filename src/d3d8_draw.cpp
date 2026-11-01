@@ -41,6 +41,12 @@ void __stdcall Bridge_D3DDevice_SetStreamSource(uint32_t StreamNumber, XboxVerte
         g_streams[StreamNumber].stride = Stride;
         *reinterpret_cast<uint32_t*>(ADDR_D3D_STREAM + StreamNumber * 12 + 0) = Stride;
         *reinterpret_cast<XboxVertexBuffer**>(ADDR_D3D_STREAM + StreamNumber * 12 + 8) = pStreamData;
+        if (StreamNumber == 1) {
+            g_curTangentBasis = (pStreamData && pStreamData->Data && Stride == 0x24)
+                ? reinterpret_cast<const float*>(pStreamData->Data)
+                : nullptr;
+            g_curTangentBaseVertex = 0;
+        }
     }
 }
 
@@ -233,7 +239,8 @@ static void DecodeVerticesToUnified(
     // cRenderState::m_lightingMode is at 0x008AA460 (0=unlit, 1=dyn+prelit, 2=prelit, 3=prelit+dyn, 4=pure-dyn)
     uint32_t lightingMode = *reinterpret_cast<const uint32_t*>(ADDR_LIGHTING_MODE);
     bool lightingEnabled  = (xboxRS[102] != 0);
-    bool pureDynamicMode  = (lightingEnabled && xboxRS[111] == 0 && xboxRS[113] == 0); // SetLighting(4)
+    bool pureDynamicMode  = (lightingMode == 4) || (lightingEnabled && xboxRS[111] == 0 && xboxRS[113] == 0); // SetLighting(4)
+    bool prelitOnlyMode   = (lightingMode == 2 && g_curPrelitColors != nullptr);
     float ambR = 0.0f, ambG = 0.0f, ambB = 0.0f, ambA = 1.0f;
     UnpackD3DColor(xboxRS[115], &ambR, &ambG, &ambB, &ambA);
     if (ambA <= 0.001f) ambA = 1.0f;
@@ -242,7 +249,7 @@ static void DecodeVerticesToUnified(
     Mat44 wvp       = MulMat44(worldView, g_matProj);
 
     for (uint32_t i = 0; i < vertexCount; ++i) {
-        uint32_t vIdx = optIndices ? ((uint32_t)optIndices[i] + baseVertexIndex) : i;
+        uint32_t vIdx = optIndices ? ((uint32_t)optIndices[i] + baseVertexIndex) : (i + baseVertexIndex);
         const uint8_t* vPtr = srcData + vIdx * stride;
         UnifiedVertex& dst = outVerts[i];
 
@@ -321,7 +328,7 @@ static void DecodeVerticesToUnified(
         if (decl.hasDiff && !pureDynamicMode) {
             uint32_t c = *reinterpret_cast<const uint32_t*>(vPtr + decl.offDiff);
             UnpackD3DColor(c, &dst.r, &dst.g, &dst.b, &dst.a);
-            if (!decl.hasRhw && decl.hasNorm && decl.vsType == 1) { // defaultWorldLit0..3.xvu
+            if (!decl.hasRhw && decl.hasNorm && decl.vsType == 1 && !prelitOnlyMode && lightingMode != 0) { // defaultWorldLit0..3.xvu
                 float totR = dst.r + ambR;
                 float totG = dst.g + ambG;
                 float totB = dst.b + ambB;
@@ -339,9 +346,9 @@ static void DecodeVerticesToUnified(
                 float matAmbG  = g_hasMaterial ? g_material.Ambient[1] : 1.0f;
                 float matAmbB  = g_hasMaterial ? g_material.Ambient[2] : 1.0f;
 
-                float totR = lightingEnabled ? (ambR * matAmbR + (g_hasMaterial ? g_material.Emissive[0] : 0.0f)) : 0.0f;
-                float totG = lightingEnabled ? (ambG * matAmbG + (g_hasMaterial ? g_material.Emissive[1] : 0.0f)) : 0.0f;
-                float totB = lightingEnabled ? (ambB * matAmbB + (g_hasMaterial ? g_material.Emissive[2] : 0.0f)) : 0.0f;
+                float totR = (!prelitOnlyMode && lightingEnabled) ? (ambR * matAmbR + (g_hasMaterial ? g_material.Emissive[0] : 0.0f)) : (g_hasMaterial ? g_material.Emissive[0] : 0.0f);
+                float totG = (!prelitOnlyMode && lightingEnabled) ? (ambG * matAmbG + (g_hasMaterial ? g_material.Emissive[1] : 0.0f)) : (g_hasMaterial ? g_material.Emissive[1] : 0.0f);
+                float totB = (!prelitOnlyMode && lightingEnabled) ? (ambB * matAmbB + (g_hasMaterial ? g_material.Emissive[2] : 0.0f)) : (g_hasMaterial ? g_material.Emissive[2] : 0.0f);
 
                 if (!pureDynamicMode && g_curPrelitColors != nullptr) {
                     uint32_t preIdx = g_curPrelitBaseVertex + (optIndices ? (uint32_t)optIndices[i] : i);
@@ -352,7 +359,7 @@ static void DecodeVerticesToUnified(
                     totB += preB;
                 }
 
-                if (lightingEnabled) {
+                if (!prelitOnlyMode && lightingEnabled) {
                     evalDynamicLights(matDiffR, matDiffG, matDiffB, matAmbR, matAmbG, matAmbB, totR, totG, totB);
                 }
 
@@ -394,8 +401,11 @@ static void DecodeVerticesToUnified(
             rawU[3] = rawU[0]; rawV[3] = rawV[0];
         }
 
-        // Custom 3D Programmable Vertex Shaders (.xvu 0x13..0x32 and specialized c*Shader::VertexSetup bridges)
-        if (!decl.hasRhw && (g_activeCustomVS != 0 || (decl.vsType >= 0x13 && decl.vsType <= 0x32))) {
+        // Custom 3D Programmable Vertex Shaders (.xvu 0x0C..0x32, 0x3D..0x41 and specialized c*Shader::VertexSetup bridges)
+        if (!decl.hasRhw && (g_activeCustomVS != 0 ||
+            (decl.vsType >= 0x0Cu && decl.vsType <= 0x32u) ||
+            (decl.vsType >= 0x3Du && decl.vsType <= 0x41u)))
+        {
             const uint8_t* pCam = *reinterpret_cast<const uint8_t* const*>(ADDR_ACTIVE_CAMERA_PTR);
             const float* camPos = pCam ? reinterpret_cast<const float*>(pCam + 0x30) : reinterpret_cast<const float*>(0x008ACC38);
             float vx = camPos[0] - wpx, vy = camPos[1] - wpy, vz = camPos[2] - wpz;
@@ -403,6 +413,36 @@ static void DecodeVerticesToUnified(
             if (vLen > 0.0001f) { vx /= vLen; vy /= vLen; vz /= vLen; }
             float ndotv = vx * wx + vy * wy + vz * wz;
             if (ndotv < 0.0f) ndotv = 0.0f; else if (ndotv > 1.0f) ndotv = 1.0f;
+
+            auto computeWorldTangentBasis = [&](float& twx, float& twy, float& twz, float& bwx, float& bwy, float& bwz) {
+                if (g_curTangentBasis != nullptr) {
+                    uint32_t tbIdx = g_curTangentBaseVertex + (optIndices ? (uint32_t)optIndices[i] : i);
+                    const float* tb = g_curTangentBasis + tbIdx * 9;
+                    twx = tb[0] * g_matWorld.m[0][0] + tb[1] * g_matWorld.m[1][0] + tb[2] * g_matWorld.m[2][0];
+                    twy = tb[0] * g_matWorld.m[0][1] + tb[1] * g_matWorld.m[1][1] + tb[2] * g_matWorld.m[2][1];
+                    twz = tb[0] * g_matWorld.m[0][2] + tb[1] * g_matWorld.m[1][2] + tb[2] * g_matWorld.m[2][2];
+                    float tLen = sqrtf(twx * twx + twy * twy + twz * twz);
+                    if (tLen > 0.0001f) { twx /= tLen; twy /= tLen; twz /= tLen; }
+
+                    bwx = tb[3] * g_matWorld.m[0][0] + tb[4] * g_matWorld.m[1][0] + tb[5] * g_matWorld.m[2][0];
+                    bwy = tb[3] * g_matWorld.m[0][1] + tb[4] * g_matWorld.m[1][1] + tb[5] * g_matWorld.m[2][1];
+                    bwz = tb[3] * g_matWorld.m[0][2] + tb[4] * g_matWorld.m[1][2] + tb[5] * g_matWorld.m[2][2];
+                    float bLen = sqrtf(bwx * bwx + bwy * bwy + bwz * bwz);
+                    if (bLen > 0.0001f) { bwx /= bLen; bwy /= bLen; bwz /= bLen; }
+                } else {
+                    float upX = (fabsf(wy) < 0.99f) ? 0.0f : 1.0f;
+                    float upY = (fabsf(wy) < 0.99f) ? 1.0f : 0.0f;
+                    float upZ = 0.0f;
+                    twx = upY * wz - upZ * wy;
+                    twy = upZ * wx - upX * wz;
+                    twz = upX * wy - upY * wx;
+                    float tLen = sqrtf(twx * twx + twy * twy + twz * twz);
+                    if (tLen > 0.0001f) { twx /= tLen; twy /= tLen; twz /= tLen; }
+                    bwx = wy * twz - wz * twy;
+                    bwy = wz * twx - wx * twz;
+                    bwz = wx * twy - wy * twx;
+                }
+            };
 
             if (g_activeCustomVS == 1 || (decl.vsType >= 0x1C && decl.vsType <= 0x1E)) { // cCloakShader (cloak*.xvu)
                 float clipX = dst.x * wvp.m[0][0] + dst.y * wvp.m[1][0] + dst.z * wvp.m[2][0] + wvp.m[3][0];
@@ -507,13 +547,156 @@ static void DecodeVerticesToUnified(
                 dst.u2 = rawU[0]; dst.v2 = rawV[0];
                 dst.u3 = rawU[0]; dst.v3 = rawV[0];
                 continue;
-            } else if (g_activeCustomVS == 8 || (decl.vsType >= 0x13 && decl.vsType <= 0x16)) { // cBumpEnvShader (BumpReflection*.xvu)
+            } else if (g_activeCustomVS == kCustomVsBumpEnv || (decl.vsType >= 0x13 && decl.vsType <= 0x16)) { // cBumpEnvShader (BumpReflection*.xvu)
+                if (g_currentPsHandle != 0 && g_currentPsType == 6) { // bumpreflect.xpu (index 6 in aPixelShaders: texm3x3pad / texm3x3vspec)
+                    float twx = 1.0f, twy = 0.0f, twz = 0.0f;
+                    float bwx = 0.0f, bwy = 1.0f, bwz = 0.0f;
+                    computeWorldTangentBasis(twx, twy, twz, bwx, bwy, bwz);
+                    dst.u0 = rawU[0]; dst.v0 = rawV[0];
+                    dst.u1 = twx;     dst.v1 = twy;
+                    dst.u2 = twz;     dst.v2 = bwx;
+                    dst.u3 = bwy;     dst.v3 = bwz;
+                    dst.nx = vx;      dst.ny = vy;      dst.nz = vz;
+                } else {
+                    float rx = 2.0f * ndotv * wx - vx;
+                    float ry = 2.0f * ndotv * wy - vy;
+                    dst.u0 = rawU[0];          dst.v0 = rawV[0];
+                    dst.u1 = rx * 0.5f + 0.5f; dst.v1 = 0.5f - ry * 0.5f;
+                    dst.u2 = rawU[0];          dst.v2 = rawV[0];
+                    dst.u3 = rx * 0.5f + 0.5f; dst.v3 = 0.5f - ry * 0.5f;
+                }
+                continue;
+            } else if (g_activeCustomVS == kCustomVsBump || g_activeCustomVS == kCustomVsBumpEmboss ||
+                       (decl.vsType >= 0x10 && decl.vsType <= 0x12)) { // cBumpShader / cBumpEmbossShader (BumpDiffuse*.xvu)
+                float twx = 1.0f, twy = 0.0f, twz = 0.0f;
+                float bwx = 0.0f, bwy = 1.0f, bwz = 0.0f;
+                computeWorldTangentBasis(twx, twy, twz, bwx, bwy, bwz);
+
+                float lx = 0.57735f, ly = 0.57735f, lz = 0.57735f;
+                for (int l = 0; l < 16; ++l) {
+                    if (!g_lightEnabled[l]) continue;
+                    const XboxLight8& lt = g_lights[l];
+                    if (lt.Type == 3) {
+                        lx = -lt.Direction[0]; ly = -lt.Direction[1]; lz = -lt.Direction[2];
+                    } else {
+                        lx = lt.Position[0] - wpx; ly = lt.Position[1] - wpy; lz = lt.Position[2] - wpz;
+                    }
+                    float lLen = sqrtf(lx * lx + ly * ly + lz * lz);
+                    if (lLen > 0.0001f) { lx /= lLen; ly /= lLen; lz /= lLen; }
+                    break;
+                }
+                float ltX = lx * twx + ly * twy + lz * twz;
+                float ltY = lx * bwx + ly * bwy + lz * bwz;
+                float ltZ = lx * wx  + ly * wy  + lz * wz;
+
+                if (g_activeCustomVS == kCustomVsBumpEmboss) {
+                    dst.u0 = rawU[0];                        dst.v0 = rawV[0];
+                    dst.u1 = rawU[0] + ltX * g_embossScale;  dst.v1 = rawV[0] + ltY * g_embossScale;
+                    dst.u2 = rawU[0];                        dst.v2 = rawV[0];
+                    dst.u3 = rawU[0];                        dst.v3 = rawV[0];
+                } else {
+                    // BumpRigid0..3.xvu outputs biased tangent-space light vector in oD1 (SPECULAR = dst.nx..nz)
+                    // while preserving vertex lighting in oD0 (DIFFUSE = dst.r..b) for SetMacroMode(0x39).
+                    float biasedX = ltX * 0.5f + 0.5f;
+                    float biasedY = ltY * 0.5f + 0.5f;
+                    float biasedZ = ltZ * 0.5f + 0.5f;
+                    dst.nx = biasedX;
+                    dst.ny = biasedY;
+                    dst.nz = biasedZ;
+                    for (int s = 0; s < 4; ++s) {
+                        uint32_t cop = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLOROP];
+                        uint32_t ca2 = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORARG2] & 0x0Fu;
+                        if (cop == 25u && ca2 == 0u) {
+                            dst.r = biasedX;
+                            dst.g = biasedY;
+                            dst.b = biasedZ;
+                            break;
+                        }
+                    }
+                    dst.u0 = rawU[0]; dst.v0 = rawV[0];
+                    dst.u1 = rawU[0]; dst.v1 = rawV[0];
+                    dst.u2 = rawU[0]; dst.v2 = rawV[0];
+                    dst.u3 = rawU[0]; dst.v3 = rawV[0];
+                }
+                continue;
+            } else if (g_activeCustomVS == kCustomVsSpecular || (decl.vsType >= 0x3Fu && decl.vsType <= 0x41u)) { // cSpecularShader (specular*.xvu)
+                // specularRigid1.xvu computes H = normalize(L + V), spec = pow(max(dot(N, H), 0), c[131].w) * lightColor,
+                // writes spec to oD1 (SPECULAR = dst.nx..nz), and writes base UV v3 to oT0, oT1, oT2 for SetMacroMode(0x3A).
+                float specExp = (g_specularScale >= 1.0f) ? g_specularScale : 16.0f;
+                float specScale = (g_specularScale > 0.0f && g_specularScale < 1.0f) ? g_specularScale : 1.0f;
+                float specR = 0.0f, specG = 0.0f, specB = 0.0f;
+                for (int l = 0; l < 16; ++l) {
+                    if (!g_lightEnabled[l]) continue;
+                    const XboxLight8& lt = g_lights[l];
+                    float lx = 0.0f, ly = 0.0f, lz = 0.0f;
+                    if (lt.Type == 3) {
+                        lx = -lt.Direction[0]; ly = -lt.Direction[1]; lz = -lt.Direction[2];
+                    } else {
+                        lx = lt.Position[0] - wpx; ly = lt.Position[1] - wpy; lz = lt.Position[2] - wpz;
+                    }
+                    float lLen = sqrtf(lx * lx + ly * ly + lz * lz);
+                    if (lLen > 0.0001f) { lx /= lLen; ly /= lLen; lz /= lLen; }
+                    float hx = lx + vx, hy = ly + vy, hz = lz + vz;
+                    float hLen = sqrtf(hx * hx + hy * hy + hz * hz);
+                    if (hLen > 0.0001f) { hx /= hLen; hy /= hLen; hz /= hLen; }
+                    float ndoth = wx * hx + wy * hy + wz * hz;
+                    if (ndoth > 0.0f) {
+                        float sp = powf(ndoth, specExp) * specScale;
+                        specR += sp * lt.Diffuse[0];
+                        specG += sp * lt.Diffuse[1];
+                        specB += sp * lt.Diffuse[2];
+                    }
+                }
+                dst.nx = (specR > 1.0f) ? 1.0f : specR;
+                dst.ny = (specG > 1.0f) ? 1.0f : specG;
+                dst.nz = (specB > 1.0f) ? 1.0f : specB;
+                dst.u0 = rawU[0]; dst.v0 = rawV[0];
+                dst.u1 = rawU[0]; dst.v1 = rawV[0];
+                dst.u2 = rawU[0]; dst.v2 = rawV[0];
+                dst.u3 = rawU[0]; dst.v3 = rawV[0];
+                continue;
+            } else if (g_activeCustomVS == kCustomVsGlossEnvmapDetail ||
+                       (decl.vsType >= 0x0Cu && decl.vsType <= 0x0Fu)) { // cGlossEnvmapDetailShader (EnvmapSkinned*.xvu, SetMacroMode(0x41))
+                // Stage 0 = envmap (reflection UV), Stage 1 = base diffuse+gloss (rawU[0]), Stage 2 = detail map (rawU[0] * scale)
                 float rx = 2.0f * ndotv * wx - vx;
                 float ry = 2.0f * ndotv * wy - vy;
-                dst.u0 = rawU[0];             dst.v0 = rawV[0];
-                dst.u1 = rawU[0];             dst.v1 = rawV[0];
-                dst.u2 = rawU[0];             dst.v2 = rawV[0];
-                dst.u3 = rx * 0.5f + 0.5f;    dst.v3 = 0.5f - ry * 0.5f;
+                dst.u0 = rx * 0.5f + 0.5f;               dst.v0 = 0.5f - ry * 0.5f;
+                dst.u1 = rawU[0];                        dst.v1 = rawV[0];
+                dst.u2 = rawU[0] * g_detailUvScale[0];   dst.v2 = rawV[0] * g_detailUvScale[1];
+                dst.u3 = rawU[0];                        dst.v3 = rawV[0];
+                continue;
+            } else if (g_activeCustomVS == kCustomVsLightProject ||
+                       (decl.vsType >= 0x3Du && decl.vsType <= 0x3Eu)) { // cLightProjectShader (ProjLight*.xvu)
+                // ProjLightSkinned0.xvu transforms world position r6 = (wpx, wpy, wpz, 1):
+                // oT0.xy = dp4(r6, c[126..127]) (non-projective distance ramp),
+                // oT1.xy = dp4(r6, c[122..123]) / dp4(r6, c[124]) (projective light cookie).
+                if (g_activeCustomVS == kCustomVsLightProject) {
+                    const Mat44& m0 = g_lightProjMat0;
+                    const Mat44& m1 = g_lightProjMat1;
+                    dst.u0 = wpx * m0.m[0][0] + wpy * m0.m[1][0] + wpz * m0.m[2][0] + m0.m[3][0];
+                    dst.v0 = wpx * m0.m[0][1] + wpy * m0.m[1][1] + wpz * m0.m[2][1] + m0.m[3][1];
+                    float pu = wpx * m1.m[0][0] + wpy * m1.m[1][0] + wpz * m1.m[2][0] + m1.m[3][0];
+                    float pv = wpx * m1.m[0][1] + wpy * m1.m[1][1] + wpz * m1.m[2][1] + m1.m[3][1];
+                    float pz = wpx * m1.m[0][2] + wpy * m1.m[1][2] + wpz * m1.m[2][2] + m1.m[3][2];
+                    if (fabsf(pz) <= 0.0001f) {
+                        pz = wpx * m1.m[0][3] + wpy * m1.m[1][3] + wpz * m1.m[2][3] + m1.m[3][3];
+                    }
+                    if (fabsf(pz) > 0.0001f) { pu /= pz; pv /= pz; }
+                    dst.u1 = pu;
+                    dst.v1 = pv;
+                } else {
+                    const float* vsC122 = reinterpret_cast<const float*>(ADDR_D3D_VS_CONSTANTS + 122 * 16);
+                    dst.u0 = wpx * vsC126[0 * 4 + 0] + wpy * vsC126[0 * 4 + 1] + wpz * vsC126[0 * 4 + 2] + vsC126[0 * 4 + 3];
+                    dst.v0 = wpx * vsC126[1 * 4 + 0] + wpy * vsC126[1 * 4 + 1] + wpz * vsC126[1 * 4 + 2] + vsC126[1 * 4 + 3];
+                    float pu = wpx * vsC122[0 * 4 + 0] + wpy * vsC122[0 * 4 + 1] + wpz * vsC122[0 * 4 + 2] + vsC122[0 * 4 + 3];
+                    float pv = wpx * vsC122[1 * 4 + 0] + wpy * vsC122[1 * 4 + 1] + wpz * vsC122[1 * 4 + 2] + vsC122[1 * 4 + 3];
+                    float pz = wpx * vsC122[2 * 4 + 0] + wpy * vsC122[2 * 4 + 1] + wpz * vsC122[2 * 4 + 2] + vsC122[2 * 4 + 3];
+                    if (fabsf(pz) > 0.0001f) { pu /= pz; pv /= pz; }
+                    dst.u1 = pu;
+                    dst.v1 = pv;
+                }
+                dst.u2 = rawU[0]; dst.v2 = rawV[0];
+                dst.u3 = rawU[0]; dst.v3 = rawV[0];
                 continue;
             }
         }
@@ -688,6 +871,9 @@ static void DecodeVerticesToUnified(
 static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVertex>& verts, bool isRhw) {
     if (!g_d3dDevice || !g_d3dCtx || !g_vs || !g_ps || verts.empty()) return;
 
+    const uint32_t* xboxRS  = reinterpret_cast<const uint32_t*>(ADDR_D3D_RENDERSTATE);
+    const uint32_t* xboxTSS = reinterpret_cast<const uint32_t*>(ADDR_D3D_TEXTURESTATE);
+
     D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     static std::vector<UnifiedVertex> expanded;
     expanded.clear();
@@ -695,9 +881,88 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
     uint32_t drawCount = (uint32_t)verts.size();
 
     switch (xboxPrim) {
-        case 1: // POINTLIST
-            topo = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;
+        case 1: { // POINTLIST
+            float pointSize = 1.0f, pointMin = 0.0f, pointMax = 64.0f;
+            memcpy(&pointSize, &xboxRS[XBOX_D3DRS_POINTSIZE], 4);
+            memcpy(&pointMin,  &xboxRS[XBOX_D3DRS_POINTSIZE_MIN], 4);
+            memcpy(&pointMax,  &xboxRS[XBOX_D3DRS_POINTSIZE_MAX], 4);
+            bool pointSprite = (xboxRS[XBOX_D3DRS_POINTSPRITEENABLE] != 0);
+            bool pointScale  = (xboxRS[XBOX_D3DRS_POINTSCALEENABLE] != 0);
+
+            if (pointSize > 1.0f || pointSprite || pointScale) {
+                float vpW = (float)(g_viewport.Width  ? g_viewport.Width  : 640);
+                float vpH = (float)(g_viewport.Height ? g_viewport.Height : 480);
+                float scaleA = 1.0f, scaleB = 0.0f, scaleC = 0.0f;
+                memcpy(&scaleA, &xboxRS[XBOX_D3DRS_POINTSCALE_A], 4);
+                memcpy(&scaleB, &xboxRS[XBOX_D3DRS_POINTSCALE_B], 4);
+                memcpy(&scaleC, &xboxRS[XBOX_D3DRS_POINTSCALE_C], 4);
+
+                Mat44 wv  = MulMat44(g_matWorld, g_matView);
+                Mat44 wvp = MulMat44(wv, g_matProj);
+                float rx = wv.m[0][0], ry = wv.m[1][0], rz = wv.m[2][0];
+                float ux = wv.m[0][1], uy = wv.m[1][1], uz = wv.m[2][1];
+                float rLenSq = rx * rx + ry * ry + rz * rz;
+                float uLenSq = ux * ux + uy * uy + uz * uz;
+                if (rLenSq > 0.0001f) { rx /= rLenSq; ry /= rLenSq; rz /= rLenSq; }
+                if (uLenSq > 0.0001f) { ux /= uLenSq; uy /= uLenSq; uz /= uLenSq; }
+                float projX = (fabsf(g_matProj.m[0][0]) > 0.0001f) ? fabsf(g_matProj.m[0][0]) : 1.0f;
+                float projY = (fabsf(g_matProj.m[1][1]) > 0.0001f) ? fabsf(g_matProj.m[1][1]) : 1.0f;
+
+                expanded.resize(drawCount * 6);
+                for (uint32_t p = 0; p < drawCount; ++p) {
+                    const UnifiedVertex& v = verts[p];
+                    float sz = pointSize;
+                    if (!isRhw && pointScale) {
+                        float ex = v.x * wv.m[0][0] + v.y * wv.m[1][0] + v.z * wv.m[2][0] + wv.m[3][0];
+                        float ey = v.x * wv.m[0][1] + v.y * wv.m[1][1] + v.z * wv.m[2][1] + wv.m[3][1];
+                        float ez = v.x * wv.m[0][2] + v.y * wv.m[1][2] + v.z * wv.m[2][2] + wv.m[3][2];
+                        float de = sqrtf(ex * ex + ey * ey + ez * ez);
+                        float denom = scaleA + scaleB * de + scaleC * de * de;
+                        if (denom > 0.0001f) sz = vpH * pointSize * sqrtf(1.0f / denom);
+                    }
+                    float maxLim = (pointMax > pointMin && pointMax > 0.0f) ? pointMax : 64.0f;
+                    if (sz < pointMin) sz = pointMin;
+                    if (sz > maxLim)   sz = maxLim;
+                    if (sz < 1.0f)     sz = 1.0f;
+
+                    UnifiedVertex c[4] = { v, v, v, v };
+                    if (isRhw) {
+                        float half = sz * 0.5f;
+                        c[0].x = v.x - half; c[0].y = v.y - half;
+                        c[1].x = v.x + half; c[1].y = v.y - half;
+                        c[2].x = v.x + half; c[2].y = v.y + half;
+                        c[3].x = v.x - half; c[3].y = v.y + half;
+                    } else {
+                        float clipW = v.x * wvp.m[0][3] + v.y * wvp.m[1][3] + v.z * wvp.m[2][3] + wvp.m[3][3];
+                        if (clipW < 0.01f) clipW = 0.01f;
+                        float dR = (sz / vpW) * clipW / projX;
+                        float dU = (sz / vpH) * clipW / projY;
+                        c[0].x = v.x - rx * dR + ux * dU; c[0].y = v.y - ry * dR + uy * dU; c[0].z = v.z - rz * dR + uz * dU;
+                        c[1].x = v.x + rx * dR + ux * dU; c[1].y = v.y + ry * dR + uy * dU; c[1].z = v.z + rz * dR + uz * dU;
+                        c[2].x = v.x + rx * dR - ux * dU; c[2].y = v.y + ry * dR - uy * dU; c[2].z = v.z + rz * dR - uz * dU;
+                        c[3].x = v.x - rx * dR - ux * dU; c[3].y = v.y - ry * dR - uy * dU; c[3].z = v.z - rz * dR - uz * dU;
+                    }
+                    if (pointSprite) {
+                        c[0].u0 = 0.0f; c[0].v0 = 0.0f;
+                        c[1].u0 = 1.0f; c[1].v0 = 0.0f;
+                        c[2].u0 = 1.0f; c[2].v0 = 1.0f;
+                        c[3].u0 = 0.0f; c[3].v0 = 1.0f;
+                    }
+                    expanded[p * 6 + 0] = c[0];
+                    expanded[p * 6 + 1] = c[1];
+                    expanded[p * 6 + 2] = c[2];
+                    expanded[p * 6 + 3] = c[0];
+                    expanded[p * 6 + 4] = c[2];
+                    expanded[p * 6 + 5] = c[3];
+                }
+                drawPtr = expanded.data();
+                drawCount = (uint32_t)expanded.size();
+                topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+            } else {
+                topo = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;
+            }
             break;
+        }
         case 2: // LINELIST
             topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST;
             break;
@@ -785,16 +1050,14 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
         s_dynVBOffset += drawCount;
     }
 
-    const uint32_t* xboxRS  = reinterpret_cast<const uint32_t*>(ADDR_D3D_RENDERSTATE);
-    const uint32_t* xboxTSS = reinterpret_cast<const uint32_t*>(ADDR_D3D_TEXTURESTATE);
-
     float uScale[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     float vScale[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    bool  isCube[4] = { false, false, false, false };
     ID3D11ShaderResourceView* srvs[4] = {
-        GetOrCreateD3D11SRV(g_boundTextures[0], &uScale[0], &vScale[0]),
-        GetOrCreateD3D11SRV(g_boundTextures[1], &uScale[1], &vScale[1]),
-        GetOrCreateD3D11SRV(g_boundTextures[2], &uScale[2], &vScale[2]),
-        GetOrCreateD3D11SRV(g_boundTextures[3], &uScale[3], &vScale[3])
+        GetOrCreateD3D11SRV(g_boundTextures[0], &uScale[0], &vScale[0], &isCube[0]),
+        GetOrCreateD3D11SRV(g_boundTextures[1], &uScale[1], &vScale[1], &isCube[1]),
+        GetOrCreateD3D11SRV(g_boundTextures[2], &uScale[2], &vScale[2], &isCube[2]),
+        GetOrCreateD3D11SRV(g_boundTextures[3], &uScale[3], &vScale[3], &isCube[3])
     };
 
     // Build PerDrawCB
@@ -827,13 +1090,17 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
         stageAlphaPtrs[s][3] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG0];
     }
 
-    uint32_t texMask = 0;
+    uint32_t texMask  = 0;
+    uint32_t cubeMask = 0;
     for (int s = 0; s < 4; ++s) {
-        if (srvs[s]) texMask |= (1u << s);
+        if (srvs[s]) {
+            texMask |= (1u << s);
+            if (isCube[s]) cubeMask |= (1u << s);
+        }
     }
 
     cb.flags[0] = isRhw ? 1u : 0u;
-    cb.flags[1] = texMask;
+    cb.flags[1] = texMask | (cubeMask << 4);
     cb.flags[2] = xboxRS[XBOX_D3DRS_ALPHATESTENABLE] ? 1u : 0u;
     cb.flags[3] = (g_currentPsHandle != 0 && g_currentPsType >= 0) ? (uint32_t)(g_currentPsType + 1) : 0u;
 
@@ -858,7 +1125,7 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
     }
 
     // Hardware Distance & Atmospheric Fog (xboxRS[92]=FOGENABLE, [93]=FOGTABLEMODE, [94]=FOGSTART, [95]=FOGEND, [96]=FOGDENSITY, [138]=FOGCOLOR)
-    if (xboxRS[XBOX_D3DRS_FOGENABLE] != 0 && g_curOffscreenRT == nullptr && !isRhw) {
+    if (xboxRS[XBOX_D3DRS_FOGENABLE] != 0 && !isRhw) {
         uint32_t fogMode = xboxRS[XBOX_D3DRS_FOGTABLEMODE];
         if (fogMode == 0) fogMode = 3; // Default to LINEAR if FOGENABLE is true
         cb.fogParams[0] = (float)fogMode;
@@ -875,6 +1142,10 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
     memcpy(cb.psConst1, g_psConstants[1], 16);
     memcpy(cb.psConst2, g_psConstants[2], 16);
     memcpy(cb.psConst3, g_psConstants[3], 16);
+    memcpy(cb.psConst4, g_psConstants[4], 16);
+    memcpy(cb.psConst5, g_psConstants[5], 16);
+    memcpy(cb.psConst6, g_psConstants[6], 16);
+    memcpy(cb.psConst7, g_psConstants[7], 16);
 
     D3D11_MAPPED_SUBRESOURCE mappedCB = {};
     if (SUCCEEDED(g_d3dCtx->Map(g_cbPerDraw, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedCB))) {
@@ -974,9 +1245,14 @@ static void __stdcall Bridge_D3DDevice_DrawVerticesUP(
 static void __stdcall Bridge_D3DDevice_DrawVertices(
     DWORD PrimitiveType, UINT StartVertex, UINT VertexCount)
 {
-    if (!g_streams[0].data || g_streams[0].stride == 0) return;
-    const uint8_t* basePtr = reinterpret_cast<const uint8_t*>(g_streams[0].data) + StartVertex * g_streams[0].stride;
-    Bridge_D3DDevice_DrawVerticesUP(PrimitiveType, VertexCount, basePtr, g_streams[0].stride);
+    if (!g_streams[0].data || g_streams[0].stride == 0 || VertexCount == 0) return;
+    static std::vector<UnifiedVertex> verts;
+    verts.clear();
+    bool isRhw = false;
+    DecodeVerticesToUnified(
+        reinterpret_cast<const uint8_t*>(g_streams[0].data),
+        g_streams[0].stride, VertexCount, nullptr, StartVertex, verts, &isRhw);
+    SubmitUnifiedVerticesD3D11(PrimitiveType, verts, isRhw);
 }
 
 static void __stdcall Bridge_D3DDevice_DrawIndexedVertices(
@@ -1201,28 +1477,28 @@ static void __stdcall Bridge_D3DDevice_End() {
 
 void InitXboxD3D8DrawBridges() {
     // 1. Bridge _D3DDevice_RunPushBuffer@8 (0x006BACD0) to execute recorded terrain/world pushbuffers
-    InstallBridge(0x006BACD0, &Bridge_D3DDevice_RunPushBuffer,                    "_D3DDevice_RunPushBuffer@8");
+    InstallBridge(0x006BACD0, &Bridge_D3DDevice_RunPushBuffer);      // _D3DDevice_RunPushBuffer@8
 
     // 2. Bridge Transforms, Viewport, Material, Lights, Scissors
-    InstallBridge(0x006B03E0, &Bridge_D3DDevice_SetTransform,                     "_D3DDevice_SetTransform@8");
-    InstallBridge(0x006B12B0, &Bridge_D3DDevice_SetViewport,                      "_D3DDevice_SetViewport@4");
-    InstallBridge(0x006B0500, &Bridge_D3DDevice_SetMaterial,                      "_D3DDevice_SetMaterial@4");
-    InstallBridge(0x006B14E0, &Bridge_D3DDevice_SetLight,                         "_D3DDevice_SetLight@8");
-    InstallBridge(0x006B17A0, &Bridge_D3DDevice_LightEnable,                      "_D3DDevice_LightEnable@8");
-    InstallBridge(0x006B1D50, &Bridge_D3DDevice_SetScissors,                      "_D3DDevice_SetScissors@12");
+    InstallBridge(0x006B03E0, &Bridge_D3DDevice_SetTransform);       // _D3DDevice_SetTransform@8
+    InstallBridge(0x006B12B0, &Bridge_D3DDevice_SetViewport);        // _D3DDevice_SetViewport@4
+    InstallBridge(0x006B0500, &Bridge_D3DDevice_SetMaterial);        // _D3DDevice_SetMaterial@4
+    InstallBridge(0x006B14E0, &Bridge_D3DDevice_SetLight);           // _D3DDevice_SetLight@8
+    InstallBridge(0x006B17A0, &Bridge_D3DDevice_LightEnable);        // _D3DDevice_LightEnable@8
+    InstallBridge(0x006B1D50, &Bridge_D3DDevice_SetScissors);        // _D3DDevice_SetScissors@12
 
     // 3. Bridge Streams, Indices & Draw Calls
-    InstallBridge(0x006B2B60, &Bridge_D3DDevice_SetStreamSource,                  "_D3DDevice_SetStreamSource@12");
-    InstallBridge(0x006B1AB0, &Bridge_D3DDevice_SetIndices,                       "_D3DDevice_SetIndices@8");
-    InstallBridge(0x006B3620, &Bridge_D3DDevice_DrawVerticesUP,                   "_D3DDevice_DrawVerticesUP@16");
-    InstallBridge(0x006B3790, &Bridge_D3DDevice_DrawVertices,                     "_D3DDevice_DrawVertices@12");
-    InstallBridge(0x006B3830, &Bridge_D3DDevice_DrawIndexedVertices,              "_D3DDevice_DrawIndexedVertices@12");
+    InstallBridge(0x006B2B60, &Bridge_D3DDevice_SetStreamSource);    // _D3DDevice_SetStreamSource@12
+    InstallBridge(0x006B1AB0, &Bridge_D3DDevice_SetIndices);         // _D3DDevice_SetIndices@8
+    InstallBridge(0x006B3620, &Bridge_D3DDevice_DrawVerticesUP);     // _D3DDevice_DrawVerticesUP@16
+    InstallBridge(0x006B3790, &Bridge_D3DDevice_DrawVertices);       // _D3DDevice_DrawVertices@12
+    InstallBridge(0x006B3830, &Bridge_D3DDevice_DrawIndexedVertices);// _D3DDevice_DrawIndexedVertices@12
 
     // 4. Bridge Immediate Mode (Begin / SetVertexData* / End)
-    InstallBridge(0x006B3BD0, &Bridge_D3DDevice_Begin,                            "_D3DDevice_Begin@4");
-    InstallBridge(0x006B3A90, &Bridge_D3DDevice_SetVertexData2f,                  "_D3DDevice_SetVertexData2f@12");
-    InstallBridge(0x006B3AD0, &Bridge_D3DDevice_SetVertexData4f,                  "_D3DDevice_SetVertexData4f@20");
-    InstallBridge(0x006B3B30, &Bridge_D3DDevice_SetVertexData4ub,                 "_D3DDevice_SetVertexData4ub@20");
-    InstallBridge(0x006B3B80, &Bridge_D3DDevice_SetVertexDataColor,               "_D3DDevice_SetVertexDataColor@8");
-    InstallBridge(0x006B3C10, &Bridge_D3DDevice_End,                              "_D3DDevice_End@0");
+    InstallBridge(0x006B3BD0, &Bridge_D3DDevice_Begin);              // _D3DDevice_Begin@4
+    InstallBridge(0x006B3A90, &Bridge_D3DDevice_SetVertexData2f);    // _D3DDevice_SetVertexData2f@12
+    InstallBridge(0x006B3AD0, &Bridge_D3DDevice_SetVertexData4f);    // _D3DDevice_SetVertexData4f@20
+    InstallBridge(0x006B3B30, &Bridge_D3DDevice_SetVertexData4ub);   // _D3DDevice_SetVertexData4ub@20
+    InstallBridge(0x006B3B80, &Bridge_D3DDevice_SetVertexDataColor); // _D3DDevice_SetVertexDataColor@8
+    InstallBridge(0x006B3C10, &Bridge_D3DDevice_End);                // _D3DDevice_End@0
 }

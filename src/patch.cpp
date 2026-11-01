@@ -5,12 +5,11 @@
 // Patching Utilities
 // ============================================================================
 
-void InstallBridge(uint32_t xboxVA, const void* hostFn, const char* name) {
+void InstallBridge(uint32_t xboxVA, const void* hostFn) {
     uint8_t* p = reinterpret_cast<uint8_t*>(xboxVA);
     uint32_t rel = reinterpret_cast<uintptr_t>(hostFn) - (xboxVA + 5);
     p[0] = 0xE9; // JMP rel32
     *reinterpret_cast<uint32_t*>(p + 1) = rel;
-    (void)name;
 }
 
 void PatchBytes(uint32_t xboxVA, const void* data, size_t len) {

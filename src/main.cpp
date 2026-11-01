@@ -1,4 +1,5 @@
 #include "ghost_runtime.h"
+#include "ghost_addresses.h"
 #include <vector>
 
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='x86' publicKeyToken='6595b64144ccf1df' language='*'\"")
@@ -194,12 +195,6 @@ static bool LoadGhostXboxPeImage(const char* ghostExePath) {
 
     // Make the entire reserved Xbox region (0x00400000..0x00950000) RWX
     // Note: Ghost.exe's .text starts at RVA 0x00000740 (0x00400740), which is above GhostWin11.exe's PE headers (0x00400000..0x00400300)
-    constexpr uint32_t kXboxPeImageBase      = 0x00400000u;
-    constexpr uint32_t kXboxReservedSize     = 0x00550000u;
-    constexpr uint32_t kXboxCodeScanStartVa  = 0x00400740u;
-    constexpr uint32_t kXboxCodeScanEndVa    = 0x0074FE80u;
-    constexpr uint32_t kXboxZeroImageSize    = 0x005228C0u;
-    constexpr uint32_t kAddrMuStaticCtorSlot = 0x007C2D9Cu;
     constexpr uint8_t  kFsPrefixOpcode       = 0x64u;
     constexpr uint8_t  kMovMoffs32EaxOpcode  = 0xA3u;
     constexpr uint8_t  kMovRm32RegOpcode     = 0x89u;

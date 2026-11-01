@@ -138,15 +138,10 @@ static HRESULT __fastcall Bridge_cDivxVideo_Render(uint8_t* thisPtr, int dummyEd
 // YUY2 Hardware Overlay Emulation for .vid Movies
 // ============================================================================
 
-static ID3D11Texture2D*          g_overlayTex     = nullptr;
-static ID3D11ShaderResourceView* g_overlaySRV     = nullptr;
-static uint32_t                  g_overlayW       = 0;
-static uint32_t                  g_overlayH       = 0;
-static bool                      g_overlayEnabled = false;
-static std::vector<uint32_t>     g_overlayPixels;
+static std::vector<uint32_t> g_overlayPixels;
 
 static void __stdcall Bridge_D3DDevice_EnableOverlay(BOOL bEnable) {
-    g_overlayEnabled = (bEnable != FALSE);
+    (void)bEnable;
 }
 
 static BOOL __stdcall Bridge_D3DDevice_GetOverlayUpdateStatus() {
@@ -209,33 +204,13 @@ static void __stdcall Bridge_D3DDevice_UpdateOverlay(
         }
     }
 
-    if (g_d3dDevice && g_d3dCtx && g_swapChain) {
-        if (!g_overlayTex || g_overlayW != w || g_overlayH != h) {
-            if (g_overlaySRV) { g_overlaySRV->Release(); g_overlaySRV = nullptr; }
-            if (g_overlayTex) { g_overlayTex->Release(); g_overlayTex = nullptr; }
-            g_overlayW = w;
-            g_overlayH = h;
-            D3D11_TEXTURE2D_DESC td = {};
-            td.Width = w;
-            td.Height = h;
-            td.MipLevels = 1;
-            td.ArraySize = 1;
-            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-            td.SampleDesc.Count = 1;
-            td.Usage = D3D11_USAGE_DEFAULT;
-            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-            if (SUCCEEDED(g_d3dDevice->CreateTexture2D(&td, nullptr, &g_overlayTex))) {
-                g_d3dDevice->CreateShaderResourceView(g_overlayTex, nullptr, &g_overlaySRV);
-            }
-        }
-        if (g_overlayTex && g_backBufferTex && w == 640 && h == 480) {
-            g_swapFrameCount++;
-            g_d3dCtx->UpdateSubresource(g_backBufferTex, 0, nullptr, g_overlayPixels.data(), w * 4, 0);
-            DrawOsdOverlayOnBackbuffer();
-            g_swapChain->Present(0, 0);
-            if (g_rtv && g_dsv) {
-                g_d3dCtx->OMSetRenderTargets(1, &g_rtv, g_dsv);
-            }
+    if (g_d3dDevice && g_d3dCtx && g_swapChain && g_backBufferTex && w == 640 && h == 480) {
+        g_swapFrameCount++;
+        g_d3dCtx->UpdateSubresource(g_backBufferTex, 0, nullptr, g_overlayPixels.data(), w * 4, 0);
+        DrawOsdOverlayOnBackbuffer();
+        g_swapChain->Present(0, 0);
+        if (g_rtv && g_dsv) {
+            g_d3dCtx->OMSetRenderTargets(1, &g_rtv, g_dsv);
         }
     }
     UpdateXboxKernelTick();
@@ -245,11 +220,11 @@ static void __stdcall Bridge_D3DDevice_UpdateOverlay(
 
 void InitXboxVideo() {
     // 1. cDivxVideo (.vid Movie Player) wall-clock frame pacing bridges
-    InstallBridge(kAddrDivxVideoFrameMove, &Bridge_cDivxVideo_FrameMove,          "?FrameMove@cDivxVideo@@QAEJXZ");
-    InstallBridge(kAddrDivxVideoRender,    &Bridge_cDivxVideo_Render,             "?Render@cDivxVideo@@QAEJXZ");
+    InstallBridge(kAddrDivxVideoFrameMove, &Bridge_cDivxVideo_FrameMove);    // ?FrameMove@cDivxVideo@@QAEJXZ
+    InstallBridge(kAddrDivxVideoRender,    &Bridge_cDivxVideo_Render);       // ?Render@cDivxVideo@@QAEJXZ
 
     // 2. D3DDevice YUY2 Hardware Overlay bridges
-    InstallBridge(0x006B3250, &Bridge_D3DDevice_EnableOverlay,                    "_D3DDevice_EnableOverlay@4");
-    InstallBridge(0x006B30B0, &Bridge_D3DDevice_GetOverlayUpdateStatus,           "_D3DDevice_GetOverlayUpdateStatus@0");
-    InstallBridge(0x006B30D0, &Bridge_D3DDevice_UpdateOverlay,                    "_D3DDevice_UpdateOverlay@20");
+    InstallBridge(0x006B3250, &Bridge_D3DDevice_EnableOverlay);              // _D3DDevice_EnableOverlay@4
+    InstallBridge(0x006B30B0, &Bridge_D3DDevice_GetOverlayUpdateStatus);     // _D3DDevice_GetOverlayUpdateStatus@0
+    InstallBridge(0x006B30D0, &Bridge_D3DDevice_UpdateOverlay);              // _D3DDevice_UpdateOverlay@20
 }

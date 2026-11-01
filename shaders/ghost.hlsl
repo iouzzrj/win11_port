@@ -31,6 +31,10 @@ cbuffer PerDrawCB : register(b0) {
     float4 uPsConst1;
     float4 uPsConst2;
     float4 uPsConst3;
+    float4 uPsConst4;
+    float4 uPsConst5;
+    float4 uPsConst6;
+    float4 uPsConst7;
 };
 
 Texture2D    tex0 : register(t0);
@@ -60,6 +64,7 @@ struct PSIn {
     float2 uv2    : TEXCOORD2;
     float2 uv3    : TEXCOORD3;
     float  eyeDist: TEXCOORD4;
+    float3 norm   : TEXCOORD5;
 };
 
 PSIn VSMain(VSIn input) {
@@ -80,27 +85,60 @@ PSIn VSMain(VSIn input) {
         o.eyeDist = max(clipPos.w, 0.0f);
     }
     o.color = input.color;
-    o.uv0 = input.uv0 * uUvScale01.xy;
-    o.uv1 = input.uv1 * uUvScale01.zw;
-    o.uv2 = input.uv2 * uUvScale23.xy;
-    o.uv3 = input.uv3 * uUvScale23.zw;
+    o.uv0   = input.uv0 * uUvScale01.xy;
+    o.uv1   = input.uv1 * uUvScale01.zw;
+    o.uv2   = input.uv2 * uUvScale23.xy;
+    o.uv3   = input.uv3 * uUvScale23.zw;
+    o.norm  = input.norm;
     return o;
 }
 
-float4 EvalArg(uint arg, float4 diffuse, float4 current, float4 tex, float4 tfactor) {
+float4 SampleCubeAtlas(Texture2D tex, SamplerState smp, float3 dir) {
+    float3 a = abs(dir);
+    float ma = max(a.x, max(a.y, a.z));
+    float face = 4.0f;
+    float sc = dir.x;
+    float tc = -dir.y;
+    if (a.x >= a.y && a.x >= a.z) {
+        ma = a.x;
+        if (dir.x >= 0.0f) { face = 0.0f; sc = -dir.z; tc = -dir.y; }
+        else               { face = 1.0f; sc =  dir.z; tc = -dir.y; }
+    } else if (a.y >= a.x && a.y >= a.z) {
+        ma = a.y;
+        if (dir.y >= 0.0f) { face = 2.0f; sc =  dir.x; tc =  dir.z; }
+        else               { face = 3.0f; sc =  dir.x; tc = -dir.z; }
+    } else {
+        ma = a.z;
+        if (dir.z >= 0.0f) { face = 4.0f; sc =  dir.x; tc = -dir.y; }
+        else               { face = 5.0f; sc = -dir.x; tc = -dir.y; }
+    }
+    float invMa = 1.0f / max(ma, 0.0001f);
+    float u = clamp(0.5f * (sc * invMa + 1.0f), 0.004f, 0.996f);
+    float v = clamp(0.5f * (tc * invMa + 1.0f), 0.004f, 0.996f);
+    return tex.Sample(smp, float2((face + u) * (1.0f / 6.0f), v));
+}
+
+float4 SampleStage2D(Texture2D tex, SamplerState smp, float2 uv, bool isCubeAtlas) {
+    float2 sampleUv = isCubeAtlas
+        ? float2(clamp(frac(uv.x), 0.004f, 0.996f) * (1.0f / 6.0f), clamp(frac(uv.y), 0.004f, 0.996f))
+        : uv;
+    return tex.Sample(smp, sampleUv);
+}
+
+float4 EvalArg(uint arg, float4 diffuse, float4 current, float4 tex, float4 tfactor, float4 spec) {
     uint src = arg & 0x0Fu;
     float4 v = current;
     if (src == 0u)      v = diffuse;
     else if (src == 1u) v = current;
     else if (src == 2u) v = tex;
     else if (src == 3u) v = tfactor;
-    else if (src == 4u) v = float4(0.0f, 0.0f, 0.0f, 1.0f);
+    else if (src == 4u) v = spec;
     if ((arg & 0x10u) != 0u) v = 1.0f - v;
     if ((arg & 0x20u) != 0u) v = v.aaaa;
     return v;
 }
 
-float3 EvalColorOp(uint op, float4 a1, float4 a2, float4 a0, float4 diffuse, float4 current, float4 tex, float4 tfactor) {
+float3 EvalColorOp(uint op, uint arg2Src, float4 a1, float4 a2, float4 a0, float4 diffuse, float4 current, float4 tex, float4 tfactor) {
     if (op == 2u)  return a1.rgb;
     if (op == 3u)  return a2.rgb;
     if (op == 4u)  return a1.rgb * a2.rgb;
@@ -121,7 +159,12 @@ float3 EvalColorOp(uint op, float4 a1, float4 a2, float4 a0, float4 diffuse, flo
     if (op == 19u) return saturate(a1.rgb * a2.rgb + a1.a);
     if (op == 20u) return saturate(a1.rgb * a2.rgb + (1.0f - a1.rgb) * a2.a);
     if (op == 21u) return saturate(a1.rgb * a2.rgb + (1.0f - a1.a) * a2.rgb);
-    if (op == 22u) return current.rgb;
+    if (op == 22u) {
+        if ((arg2Src & 0x0Fu) == 4u) {
+            return saturate(dot((a1.rgb - 0.5f) * 2.0f, (a2.rgb - 0.5f) * 2.0f)).xxx;
+        }
+        return current.rgb;
+    }
     if (op == 23u) return saturate(a0.rgb + a1.rgb * a2.rgb);
     if (op == 24u) return lerp(a2.rgb, a1.rgb, a0.rgb);
     if (op == 25u) return saturate(dot((a1.rgb - 0.5f) * 2.0f, (a2.rgb - 0.5f) * 2.0f)).xxx;
@@ -150,46 +193,48 @@ float EvalAlphaOp(uint op, float a1, float a2, float a0, float4 diffuse, float4 
     return a1 * a2;
 }
 
-void EvalStage(uint4 colorOps, uint4 alphaOps, float4 diffuse, inout float4 current, float4 tex, float4 tfactor) {
-    float4 c1 = EvalArg(colorOps.y, diffuse, current, tex, tfactor);
-    float4 c2 = EvalArg(colorOps.z, diffuse, current, tex, tfactor);
-    float4 c0 = EvalArg(colorOps.w, diffuse, current, tex, tfactor);
-    current.rgb = EvalColorOp(colorOps.x, c1, c2, c0, diffuse, current, tex, tfactor);
+void EvalStage(uint4 colorOps, uint4 alphaOps, float4 diffuse, inout float4 current, float4 tex, float4 tfactor, float4 spec) {
+    float4 c1 = EvalArg(colorOps.y, diffuse, current, tex, tfactor, spec);
+    float4 c2 = EvalArg(colorOps.z, diffuse, current, tex, tfactor, spec);
+    float4 c0 = EvalArg(colorOps.w, diffuse, current, tex, tfactor, spec);
+    current.rgb = EvalColorOp(colorOps.x, colorOps.z, c1, c2, c0, diffuse, current, tex, tfactor);
     if (alphaOps.x > 1u) {
-        float4 a1 = EvalArg(alphaOps.y, diffuse, current, tex, tfactor);
-        float4 a2 = EvalArg(alphaOps.z, diffuse, current, tex, tfactor);
-        float4 a0 = EvalArg(alphaOps.w, diffuse, current, tex, tfactor);
+        float4 a1 = EvalArg(alphaOps.y, diffuse, current, tex, tfactor, spec);
+        float4 a2 = EvalArg(alphaOps.z, diffuse, current, tex, tfactor, spec);
+        float4 a0 = EvalArg(alphaOps.w, diffuse, current, tex, tfactor, spec);
         current.a = EvalAlphaOp(alphaOps.x, a1.a, a2.a, a0.a, diffuse, current, tex, tfactor);
     }
 }
 
 float4 PSMain(PSIn input) : SV_TARGET {
     float4 diffuse = input.color;
+    float4 specCol = float4(input.norm, 1.0f);
     float4 current = diffuse;
-    uint texMask = uFlags.y;
-    uint psMode  = uFlags.w;
+    uint texMask  = uFlags.y & 0x0Fu;
+    uint cubeMask = (uFlags.y >> 4u) & 0x0Fu;
+    uint psMode   = uFlags.w;
 
     float2 uv0 = input.uv0;
     float2 uv1 = input.uv1;
     float2 uv2 = input.uv2;
     float2 uv3 = input.uv3;
 
-    float4 t0 = ((texMask & 1u) != 0u) ? tex0.Sample(smp0, uv0) : float4(1.0f, 1.0f, 1.0f, 1.0f);
-    float4 t1 = ((texMask & 2u) != 0u) ? tex1.Sample(smp1, uv1) : float4(1.0f, 1.0f, 1.0f, 1.0f);
+    float4 t0 = ((texMask & 1u) != 0u) ? SampleStage2D(tex0, smp0, uv0, (cubeMask & 1u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);
+    float4 t1 = ((texMask & 2u) != 0u) ? SampleStage2D(tex1, smp1, uv1, (cubeMask & 2u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);
 
-    // Apply BumpEnv UV offset if stage 0 / stage 1 uses BUMPENVMAP (22) or texbem t1, t0 pixel shaders (emBump=1, lava=2, heatShimmer=3)
-    if (uStage0Ops.x == 22u || psMode == 1u || psMode == 2u || psMode == 3u) {
+    // Apply BumpEnv UV offset if stage 0 / stage 1 uses BUMPENVMAP (22 without SPECULAR arg2) or texbem t1, t0 pixel shaders (emBump=1, lava=2, heatShimmer=3)
+    if ((uStage0Ops.x == 22u && (uStage0Ops.z & 0x0Fu) != 4u) || psMode == 1u || psMode == 2u || psMode == 3u) {
         float2 d = t0.rg * 2.0f - 1.0f;
         uv1 += float2(d.x * uBumpParams.x + d.y * uBumpParams.z, d.x * uBumpParams.y + d.y * uBumpParams.w);
-        if ((texMask & 2u) != 0u) t1 = tex1.Sample(smp1, uv1);
+        if ((texMask & 2u) != 0u) t1 = SampleStage2D(tex1, smp1, uv1, (cubeMask & 2u) != 0u);
     }
-    if (uStage1Ops.x == 22u) {
+    if (uStage1Ops.x == 22u && (uStage1Ops.z & 0x0Fu) != 4u) {
         float2 d = t1.rg * 2.0f - 1.0f;
         uv2 += float2(d.x * uBumpParams.x + d.y * uBumpParams.z, d.x * uBumpParams.y + d.y * uBumpParams.w);
     }
 
-    float4 t2 = ((texMask & 4u) != 0u) ? tex2.Sample(smp2, uv2) : float4(1.0f, 1.0f, 1.0f, 1.0f);
-    float4 t3 = ((texMask & 8u) != 0u) ? tex3.Sample(smp3, uv3) : float4(1.0f, 1.0f, 1.0f, 1.0f);
+    float4 t2 = ((texMask & 4u) != 0u) ? SampleStage2D(tex2, smp2, uv2, (cubeMask & 4u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);
+    float4 t3 = ((texMask & 8u) != 0u) ? SampleStage2D(tex3, smp3, uv3, (cubeMask & 8u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);
 
     if (psMode > 0u) {
         uint pt = psMode - 1u;
@@ -211,10 +256,21 @@ float4 PSMain(PSIn input) : SV_TARGET {
         } else if (pt == 5u) { // selfglow.xpu: mad r0, c0, t0.a, v0; mul r0, r0, t0
             float4 r0 = saturate(uPsConst0 * t0.a + diffuse);
             current = r0 * t0;
-        } else if (pt == 6u) { // bumpreflect.xpu: tex t0; texm3x3vspec t3; mul r0, t3, c0
-            float2 pert = (t0.rg * 2.0f - 1.0f) * 0.25f;
-            float4 refl = ((texMask & 8u) != 0u) ? tex3.Sample(smp3, uv3 + pert) : t3;
-            current = refl * uPsConst0;
+        } else if (pt == 6u) { // bumpreflect.xpu: tex t0; texm3x3pad t1, t0; texm3x3pad t2, t0; texm3x3vspec t3, t0; mov r0, t3
+            float3 nTs = t0.rgb * 2.0f - 1.0f;
+            float3 Tw  = float3(uv1.x, uv1.y, uv2.x);
+            float3 Bw  = float3(uv2.y, uv3.x, uv3.y);
+            float3 Nw  = cross(Tw, Bw);
+            float3 Np  = (dot(Nw, Nw) > 0.0001f) ? normalize(nTs.x * Tw + nTs.y * Bw + nTs.z * Nw) : normalize(nTs);
+            float3 Vw  = (dot(input.norm, input.norm) > 0.0001f) ? normalize(input.norm) : float3(0.0f, 0.0f, 1.0f);
+            float3 R   = reflect(-Vw, Np);
+            float4 refl = t3;
+            if ((texMask & 8u) != 0u) {
+                refl = ((cubeMask & 8u) != 0u)
+                    ? SampleCubeAtlas(tex3, smp3, R)
+                    : tex3.Sample(smp3, float2(R.x * 0.5f + 0.5f, 0.5f - R.y * 0.5f));
+            }
+            current = refl;
         } else if (pt == 7u) { // waterNM.xpu: add_d2 r0, t0, t1
             current = (t0 + t1) * 0.5f;
         } else if (pt == 8u) { // screenHaze.xpu: 7-stage register combiner (MUX: r0.a>=0.5 ? CD : AB)
@@ -325,13 +381,13 @@ float4 PSMain(PSIn input) : SV_TARGET {
             current = (r0a >= 0.5f) ? r1 : uPsConst2;
         }
     } else if (uStage0Ops.x > 1u) {
-        EvalStage(uStage0Ops, uStage0Alpha, diffuse, current, t0, uTFactor);
+        EvalStage(uStage0Ops, uStage0Alpha, diffuse, current, t0, uTFactor, specCol);
         if (uStage1Ops.x > 1u) {
-            EvalStage(uStage1Ops, uStage1Alpha, diffuse, current, t1, uTFactor);
+            EvalStage(uStage1Ops, uStage1Alpha, diffuse, current, t1, uTFactor, specCol);
             if (uStage2Ops.x > 1u) {
-                EvalStage(uStage2Ops, uStage2Alpha, diffuse, current, t2, uTFactor);
+                EvalStage(uStage2Ops, uStage2Alpha, diffuse, current, t2, uTFactor, specCol);
                 if (uStage3Ops.x > 1u) {
-                    EvalStage(uStage3Ops, uStage3Alpha, diffuse, current, t3, uTFactor);
+                    EvalStage(uStage3Ops, uStage3Alpha, diffuse, current, t3, uTFactor, specCol);
                 }
             }
         }

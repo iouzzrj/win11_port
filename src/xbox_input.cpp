@@ -52,10 +52,16 @@ struct WIN_XINPUT_STATE {
     DWORD              dwPacketNumber;
     WIN_XINPUT_GAMEPAD Gamepad;
 };
+struct WIN_XINPUT_VIBRATION {
+    WORD wLeftMotorSpeed;
+    WORD wRightMotorSpeed;
+};
 #pragma pack(pop)
 
 typedef DWORD (WINAPI *PFN_XInputGetState)(DWORD dwUserIndex, WIN_XINPUT_STATE* pState);
+typedef DWORD (WINAPI *PFN_XInputSetState)(DWORD dwUserIndex, WIN_XINPUT_VIBRATION* pVibration);
 static PFN_XInputGetState g_pfnXInputGetState = nullptr;
+static PFN_XInputSetState g_pfnXInputSetState = nullptr;
 
 static uint32_t g_packetCounter = 1;
 static bool     g_padReportedInsert[4] = { false, false, false, false };
@@ -263,7 +269,28 @@ static DWORD __stdcall Bridge_XInputGetState(HANDLE hDevice, XBOX_XINPUT_STATE* 
 }
 
 static DWORD __stdcall Bridge_XInputSetState(HANDLE hDevice, void* pFeedback) {
-    (void)hDevice; (void)pFeedback;
+    if (!pFeedback) return ERROR_INVALID_PARAMETER;
+    uintptr_t h = reinterpret_cast<uintptr_t>(hDevice);
+    DWORD port = (h >= 0x1001 && h <= 0x1004) ? (DWORD)(h - 0x1001) : 0;
+
+    uint8_t* fbBytes = reinterpret_cast<uint8_t*>(pFeedback);
+    // XINPUT_FEEDBACK layout:
+    // +0x00: DWORD dwStatus
+    // +0x04: HANDLE hEvent
+    // +0x12: WORD wLeftMotorSpeed
+    // +0x14: WORD wRightMotorSpeed
+    *reinterpret_cast<uint32_t*>(fbBytes + 0x00) = ERROR_SUCCESS;
+    HANDLE hEvent = *reinterpret_cast<HANDLE*>(fbBytes + 0x04);
+    if (hEvent) {
+        SetEvent(hEvent);
+    }
+
+    if (port == 0 && g_pfnXInputSetState) {
+        WIN_XINPUT_VIBRATION vib = {};
+        vib.wLeftMotorSpeed  = *reinterpret_cast<const uint16_t*>(fbBytes + 0x12);
+        vib.wRightMotorSpeed = *reinterpret_cast<const uint16_t*>(fbBytes + 0x14);
+        g_pfnXInputSetState(0, &vib);
+    }
     return ERROR_SUCCESS;
 }
 
@@ -299,20 +326,21 @@ void InitXboxInput() {
     if (!hXInput) hXInput = LoadLibraryA("xinput1_3.dll");
     if (hXInput) {
         g_pfnXInputGetState = reinterpret_cast<PFN_XInputGetState>(GetProcAddress(hXInput, "XInputGetState"));
+        g_pfnXInputSetState = reinterpret_cast<PFN_XInputSetState>(GetProcAddress(hXInput, "XInputSetState"));
     }
 
     // Bridge XInput & XPP functions
-    InstallBridge(0x007491A9, &Bridge_XInitDevices,                "_XInitDevices@8");
-    InstallBridge(0x007491AE, &Bridge_XGetDevices,                 "_XGetDevices@4");
-    InstallBridge(0x007491D0, &Bridge_XGetDeviceChanges,           "_XGetDeviceChanges@12");
-    InstallBridge(0x0074907F, &Bridge_XInputOpen,                  "_XInputOpen@16");
-    InstallBridge(0x007490D5, &Bridge_XInputClose,                 "_XInputClose@4");
-    InstallBridge(0x007490E1, &Bridge_XInputGetState,              "_XInputGetState@8");
-    InstallBridge(0x00749154, &Bridge_XInputSetState,              "_XInputSetState@8");
-    InstallBridge(0x0074923D, &Bridge_XMountMUA,                   "_XMountMUA@12");
-    InstallBridge(0x0074936F, &Bridge_XUnmountMU,                  "_XUnmountMU@8");
-    InstallBridge(0x0074FB64, &Bridge_XInputDebugInitKeyboardQueue,"_XInputDebugInitKeyboardQueue@4");
-    InstallBridge(0x0074F8A3, &Bridge_XInputDebugGetKeystroke,     "_XInputDebugGetKeystroke@4");
+    InstallBridge(0x007491A9, &Bridge_XInitDevices);                 // _XInitDevices@8
+    InstallBridge(0x007491AE, &Bridge_XGetDevices);                  // _XGetDevices@4
+    InstallBridge(0x007491D0, &Bridge_XGetDeviceChanges);            // _XGetDeviceChanges@12
+    InstallBridge(0x0074907F, &Bridge_XInputOpen);                   // _XInputOpen@16
+    InstallBridge(0x007490D5, &Bridge_XInputClose);                  // _XInputClose@4
+    InstallBridge(0x007490E1, &Bridge_XInputGetState);               // _XInputGetState@8
+    InstallBridge(0x00749154, &Bridge_XInputSetState);               // _XInputSetState@8
+    InstallBridge(0x0074923D, &Bridge_XMountMUA);                    // _XMountMUA@12
+    InstallBridge(0x0074936F, &Bridge_XUnmountMU);                   // _XUnmountMU@8
+    InstallBridge(0x0074FB64, &Bridge_XInputDebugInitKeyboardQueue); // _XInputDebugInitKeyboardQueue@4
+    InstallBridge(0x0074F8A3, &Bridge_XInputDebugGetKeystroke);      // _XInputDebugGetKeystroke@4
 
     // Stub cXBoxMemoryUnits::Startup (0x005AC2F0) to skip the 1.5s MU enumeration sleep
     PatchRet(0x005AC2F0, 0, 0, false);

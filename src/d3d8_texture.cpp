@@ -37,10 +37,11 @@ struct CachedTexture {
     size_t                    maxReadableBytes;
     bool                      dirty;
     bool                      isRenderTarget;
-    bool                      isLinear;
+    bool                      isCubeAtlas;
     uint32_t                  width;
     uint32_t                  height;
-    DXGI_FORMAT               dxgiFormat;
+    uint32_t                  texWidth;
+    uint32_t                  texHeight;
     ID3D11Texture2D*          tex2D;
     ID3D11ShaderResourceView* srv;
     ID3D11RenderTargetView*   rtv;
@@ -239,6 +240,142 @@ static void UnswizzleBoxSliceToLinear(
     }
 }
 
+static void DecodeSingleXboxSurfaceToBGRA8(
+    const uint8_t* srcData, uint32_t w, uint32_t h, uint32_t xboxFmt,
+    bool isSwizzled, uint32_t linearPitch, bool isVolumeSwizzled, uint32_t depth, uint32_t zSlice,
+    uint32_t* dstPixels)
+{
+    if (xboxFmt == 0x0C || xboxFmt == 0x0E || xboxFmt == 0x0F) {
+        uint32_t blockBytes = (xboxFmt == 0x0C) ? 8u : 16u;
+        uint32_t blocksW = (w + 3u) / 4u;
+        uint32_t blocksH = (h + 3u) / 4u;
+        for (uint32_t by = 0; by < blocksH; ++by) {
+            for (uint32_t bx = 0; bx < blocksW; ++bx) {
+                const uint8_t* blk = srcData + (by * blocksW + bx) * blockBytes;
+                DecodeDXTBlockToBGRA8(blk, xboxFmt, dstPixels, w, h, bx, by);
+            }
+        }
+        return;
+    }
+
+    uint32_t bpp = 4;
+    switch (xboxFmt) {
+        case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x2E: bpp = 1; break;
+        case 0x02: case 0x03: case 0x04: case 0x05: case 0x11: case 0x12:
+        case 0x1A: case 0x1B: case 0x1C: case 0x1D: case 0x20: case 0x24:
+        case 0x25: case 0x27: case 0x28: case 0x2D: bpp = 2; break;
+        default: bpp = 4; break;
+    }
+
+    std::vector<uint8_t> unswizzled;
+    const uint8_t* linearSrc = srcData;
+    uint32_t srcPitch = linearPitch ? linearPitch : (w * bpp);
+
+    if (isSwizzled) {
+        unswizzled.resize((size_t)w * h * bpp);
+        if (isVolumeSwizzled && depth > 1u) {
+            UnswizzleBoxSliceToLinear(srcData, w, h, depth, zSlice, bpp, unswizzled.data());
+        } else {
+            g_pfnXGUnswizzleRect(srcData, w, h, nullptr, unswizzled.data(), w * bpp, nullptr, bpp);
+        }
+        linearSrc = unswizzled.data();
+        srcPitch = w * bpp;
+    }
+
+    for (uint32_t y = 0; y < h; ++y) {
+        const uint8_t* sRow = linearSrc + (size_t)y * srcPitch;
+        uint32_t* dRow = &dstPixels[(size_t)y * w];
+        for (uint32_t x = 0; x < w; ++x) {
+            uint32_t argb = 0xFFFFFFFFu;
+            switch (xboxFmt) {
+                case 0x06: // Swizzled A8R8G8B8
+                case 0x1E: // Linear A8R8G8B8
+                    argb = reinterpret_cast<const uint32_t*>(sRow)[x];
+                    break;
+                case 0x07: // Swizzled X8R8G8B8
+                case 0x1F: // Linear X8R8G8B8
+                    argb = reinterpret_cast<const uint32_t*>(sRow)[x] | 0xFF000000u;
+                    break;
+                case 0x29: // A8B8G8R8
+                case 0x3F: {
+                    uint32_t v = reinterpret_cast<const uint32_t*>(sRow)[x];
+                    argb = (v & 0xFF00FF00u) | ((v & 0xFFu) << 16) | ((v >> 16) & 0xFFu);
+                    break;
+                }
+                case 0x2A: // B8G8R8A8
+                case 0x40: {
+                    uint32_t v = reinterpret_cast<const uint32_t*>(sRow)[x];
+                    argb = ((v & 0xFFu) << 24) | ((v >> 8) & 0xFFFFFFu);
+                    break;
+                }
+                case 0x02: // Swizzled A1R5G5B5
+                case 0x1C: { // Linear A1R5G5B5
+                    uint16_t v = reinterpret_cast<const uint16_t*>(sRow)[x];
+                    uint32_t a = (v & 0x8000) ? 0xFFu : 0x00u;
+                    uint32_t r = ((v >> 10) & 0x1F) * 255 / 31;
+                    uint32_t g = ((v >> 5)  & 0x1F) * 255 / 31;
+                    uint32_t b = (v         & 0x1F) * 255 / 31;
+                    argb = (a << 24) | (r << 16) | (g << 8) | b;
+                    break;
+                }
+                case 0x03: // Swizzled X1R5G5B5
+                case 0x1D: {
+                    uint16_t v = reinterpret_cast<const uint16_t*>(sRow)[x];
+                    uint32_t r = ((v >> 10) & 0x1F) * 255 / 31;
+                    uint32_t g = ((v >> 5)  & 0x1F) * 255 / 31;
+                    uint32_t b = (v         & 0x1F) * 255 / 31;
+                    argb = 0xFF000000u | (r << 16) | (g << 8) | b;
+                    break;
+                }
+                case 0x04: // Swizzled A4R4G4B4
+                case 0x1B: { // Linear A4R4G4B4
+                    uint16_t v = reinterpret_cast<const uint16_t*>(sRow)[x];
+                    uint32_t a = ((v >> 12) & 0x0F) * 17;
+                    uint32_t r = ((v >> 8)  & 0x0F) * 17;
+                    uint32_t g = ((v >> 4)  & 0x0F) * 17;
+                    uint32_t b = (v         & 0x0F) * 17;
+                    argb = (a << 24) | (r << 16) | (g << 8) | b;
+                    break;
+                }
+                case 0x05: // Swizzled R5G6B5
+                case 0x11: { // Linear R5G6B5
+                    uint16_t v = reinterpret_cast<const uint16_t*>(sRow)[x];
+                    uint32_t r = ((v >> 11) & 0x1F) * 255 / 31;
+                    uint32_t g = ((v >> 5)  & 0x3F) * 255 / 63;
+                    uint32_t b = (v         & 0x1F) * 255 / 31;
+                    argb = 0xFF000000u | (r << 16) | (g << 8) | b;
+                    break;
+                }
+                case 0x00: // L8
+                case 0x13: {
+                    uint32_t l = sRow[x];
+                    argb = 0xFF000000u | (l << 16) | (l << 8) | l;
+                    break;
+                }
+                case 0x01: // AL8
+                case 0x19: // A8
+                case 0x2F: {
+                    uint32_t a = sRow[x];
+                    argb = (a << 24) | 0x00FFFFFFu;
+                    break;
+                }
+                case 0x1A: // A8L8
+                case 0x20: {
+                    uint16_t v = reinterpret_cast<const uint16_t*>(sRow)[x];
+                    uint32_t l = v & 0xFF;
+                    uint32_t a = (v >> 8) & 0xFF;
+                    argb = (a << 24) | (l << 16) | (l << 8) | l;
+                    break;
+                }
+                default:
+                    if (bpp == 4) argb = reinterpret_cast<const uint32_t*>(sRow)[x];
+                    break;
+            }
+            dRow[x] = argb;
+        }
+    }
+}
+
 static void UploadXboxTextureToD3D11(CachedTexture& entry, const XboxPixelContainer* pTex) {
     if (!g_d3dDevice || !g_d3dCtx) return;
 
@@ -257,197 +394,101 @@ static void UploadXboxTextureToD3D11(CachedTexture& entry, const XboxPixelContai
     bool isCubeMap = (pTex->Format & kXboxTexFormatCubemapMask) != 0u;
     bool isVolume  = (((pTex->Format >> kXboxTexFormatDimShift) & kXboxTexFormatDimMask) == kXboxTexDimensionVolume);
     uint32_t depth = isVolume ? (1u << ((pTex->Format >> kXboxTexFormatDepthShift) & 0x0Fu)) : 1u;
-    (void)isCubeMap; (void)depth;
 
-    std::vector<uint32_t> bgraPixels(w * h, 0xFFFFFFFFu);
     const uint8_t* srcData = reinterpret_cast<const uint8_t*>(pTex->Data);
     size_t maxReadable = GetReadableBytesAt(srcData);
     if (maxReadable < 16) return;
 
-    if (xboxFmt == 0x0C || xboxFmt == 0x0E || xboxFmt == 0x0F) {
-        uint32_t blockBytes = (xboxFmt == 0x0C) ? 8 : 16;
-        uint32_t blocksW = (w + 3) / 4;
-        uint32_t blocksH = (h + 3) / 4;
-        size_t sliceBytes = (size_t)blocksW * blocksH * blockBytes;
-        if (sliceBytes > maxReadable) return;
-        if (isVolume && depth > 1u) {
-            uint32_t zSlice = depth / 2u;
-            if ((size_t)(zSlice + 1u) * sliceBytes <= maxReadable) {
-                srcData += (size_t)zSlice * sliceBytes;
+    bool isDxt = (xboxFmt == 0x0C || xboxFmt == 0x0E || xboxFmt == 0x0F);
+    uint32_t bpp = 4;
+    switch (xboxFmt) {
+        case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x2E: bpp = 1; break;
+        case 0x02: case 0x03: case 0x04: case 0x05: case 0x11: case 0x12:
+        case 0x1A: case 0x1B: case 0x1C: case 0x1D: case 0x20: case 0x24:
+        case 0x25: case 0x27: case 0x28: case 0x2D: bpp = 2; break;
+        default: bpp = 4; break;
+    }
+    uint32_t bitsPerPixel = isDxt ? ((xboxFmt == 0x0C) ? 4u : 8u) : (bpp * 8u);
+    size_t sliceBytes = isDxt
+        ? ((size_t)((w + 3u) / 4u) * ((h + 3u) / 4u) * ((xboxFmt == 0x0C) ? 8u : 16u))
+        : ((size_t)(linearPitch ? linearPitch : (w * bpp)) * h);
+    if (sliceBytes > maxReadable) return;
+
+    uint32_t atlasW = w;
+    uint32_t atlasH = h;
+    bool isCubeAtlas = false;
+    std::vector<uint32_t> bgraPixels;
+
+    if (isCubeMap && (w * kXboxCubemapFaceCount) <= 8192u) {
+        atlasW = w * kXboxCubemapFaceCount;
+        atlasH = h;
+        isCubeAtlas = true;
+        bgraPixels.assign((size_t)atlasW * atlasH, 0xFFFFFFFFu);
+
+        size_t faceStride = ComputeXboxCubemapFaceStride(pTex->Format, xboxFmt, levels, bitsPerPixel);
+        std::vector<uint32_t> facePixels[kXboxCubemapFaceCount];
+        bool faceNonZero[kXboxCubemapFaceCount] = {};
+        int firstNonZeroFace = -1;
+
+        for (uint32_t face = 0; face < kXboxCubemapFaceCount; ++face) {
+            facePixels[face].assign((size_t)w * h, 0u);
+            size_t faceOff = (size_t)face * faceStride;
+            if (faceOff + sliceBytes <= maxReadable) {
+                const uint8_t* faceSrc = srcData + faceOff;
+                for (size_t k = 0; k < sliceBytes; k += 4) {
+                    if (*reinterpret_cast<const uint32_t*>(faceSrc + k) != 0u) {
+                        faceNonZero[face] = true;
+                        break;
+                    }
+                }
+                if (faceNonZero[face]) {
+                    DecodeSingleXboxSurfaceToBGRA8(faceSrc, w, h, xboxFmt, isSwizzled, linearPitch, false, 1u, 0u, facePixels[face].data());
+                    if (firstNonZeroFace < 0) firstNonZeroFace = (int)face;
+                }
             }
         }
-        for (uint32_t by = 0; by < blocksH; ++by) {
-            for (uint32_t bx = 0; bx < blocksW; ++bx) {
-                const uint8_t* blk = srcData + (by * blocksW + bx) * blockBytes;
-                DecodeDXTBlockToBGRA8(blk, xboxFmt, bgraPixels.data(), w, h, bx, by);
+        if (firstNonZeroFace < 0) {
+            DecodeSingleXboxSurfaceToBGRA8(srcData, w, h, xboxFmt, isSwizzled, linearPitch, false, 1u, 0u, facePixels[0].data());
+            firstNonZeroFace = 0;
+            faceNonZero[0] = true;
+        }
+        for (uint32_t face = 0; face < kXboxCubemapFaceCount; ++face) {
+            const uint32_t* srcFace = faceNonZero[face] ? facePixels[face].data() : facePixels[firstNonZeroFace].data();
+            for (uint32_t y = 0; y < h; ++y) {
+                memcpy(&bgraPixels[(size_t)y * atlasW + (size_t)face * w], &srcFace[(size_t)y * w], (size_t)w * sizeof(uint32_t));
+            }
+        }
+    } else if (isVolume && depth > 1u && sliceBytes * depth <= maxReadable && (w * depth) <= 8192u) {
+        atlasW = w * depth;
+        atlasH = h;
+        bgraPixels.assign((size_t)atlasW * atlasH, 0xFFFFFFFFu);
+        std::vector<uint32_t> slicePixels((size_t)w * h, 0xFFFFFFFFu);
+        for (uint32_t z = 0; z < depth; ++z) {
+            const uint8_t* zSrc = (isDxt || !isSwizzled) ? (srcData + (size_t)z * sliceBytes) : srcData;
+            DecodeSingleXboxSurfaceToBGRA8(zSrc, w, h, xboxFmt, isSwizzled, linearPitch, !isDxt && isSwizzled, depth, z, slicePixels.data());
+            for (uint32_t y = 0; y < h; ++y) {
+                memcpy(&bgraPixels[(size_t)y * atlasW + (size_t)z * w], &slicePixels[(size_t)y * w], (size_t)w * sizeof(uint32_t));
             }
         }
     } else {
-        uint32_t bpp = 4;
-        switch (xboxFmt) {
-            case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x2E: bpp = 1; break;
-            case 0x02: case 0x03: case 0x04: case 0x05: case 0x11: case 0x12:
-            case 0x1A: case 0x1B: case 0x1C: case 0x1D: case 0x20: case 0x24:
-            case 0x25: case 0x27: case 0x28: case 0x2D: bpp = 2; break;
-            default: bpp = 4; break;
-        }
-        uint32_t srcPitchCheck = linearPitch ? linearPitch : (w * bpp);
-        size_t sliceBytes = (size_t)srcPitchCheck * h;
-        if (sliceBytes > maxReadable) return;
-
-        // If this is a cubemap whose Face 0 (+X) is all zeros (such as directShader_pSpecularCube
-        // created by cTexture::CreateFunctionTextures at 0x005EF040, which only populates Face 4 +Z),
-        // advance srcData to the first non-zero face using FindSurfaceWithinTexture's exact face stride.
-        if (isCubeMap) {
-            bool face0AllZero = true;
-            for (size_t k = 0; k < sliceBytes; k += 4) {
-                if (*reinterpret_cast<const uint32_t*>(srcData + k) != 0u) {
-                    face0AllZero = false;
-                    break;
-                }
-            }
-            if (face0AllZero) {
-                size_t faceStride = ComputeXboxCubemapFaceStride(pTex->Format, xboxFmt, levels, bpp * 8u);
-                for (uint32_t face = 1u; face < kXboxCubemapFaceCount; ++face) {
-                    size_t faceOff = (size_t)face * faceStride;
-                    if (faceOff + sliceBytes > maxReadable) break;
-                    const uint8_t* candFace = srcData + faceOff;
-                    bool hasNonZero = false;
-                    for (size_t k = 0; k < sliceBytes; k += 4) {
-                        if (*reinterpret_cast<const uint32_t*>(candFace + k) != 0u) {
-                            hasNonZero = true;
-                            break;
-                        }
-                    }
-                    if (hasNonZero) {
-                        srcData = candFace;
-                        break;
-                    }
-                }
-            }
-        }
-
-        std::vector<uint8_t> unswizzled;
-        const uint8_t* linearSrc = srcData;
-        uint32_t srcPitch = linearPitch ? linearPitch : (w * bpp);
-
-        if (isSwizzled) {
-            unswizzled.resize(w * h * bpp);
-            if (isVolume && depth > 1u && sliceBytes * depth <= maxReadable) {
-                UnswizzleBoxSliceToLinear(srcData, w, h, depth, depth / 2u, bpp, unswizzled.data());
-            } else {
-                g_pfnXGUnswizzleRect(srcData, w, h, nullptr, unswizzled.data(), w * bpp, nullptr, bpp);
-            }
-            linearSrc = unswizzled.data();
-            srcPitch = w * bpp;
-        }
-
-        for (uint32_t y = 0; y < h; ++y) {
-            const uint8_t* sRow = linearSrc + y * srcPitch;
-            uint32_t* dRow = &bgraPixels[y * w];
-            for (uint32_t x = 0; x < w; ++x) {
-                uint32_t argb = 0xFFFFFFFFu;
-                switch (xboxFmt) {
-                    case 0x06: // Swizzled A8R8G8B8
-                    case 0x1E: // Linear A8R8G8B8
-                        argb = reinterpret_cast<const uint32_t*>(sRow)[x];
-                        break;
-                    case 0x07: // Swizzled X8R8G8B8
-                    case 0x1F: // Linear X8R8G8B8
-                        argb = reinterpret_cast<const uint32_t*>(sRow)[x] | 0xFF000000u;
-                        break;
-                    case 0x29: // A8B8G8R8
-                    case 0x3F: {
-                        uint32_t v = reinterpret_cast<const uint32_t*>(sRow)[x];
-                        argb = (v & 0xFF00FF00u) | ((v & 0xFFu) << 16) | ((v >> 16) & 0xFFu);
-                        break;
-                    }
-                    case 0x2A: // B8G8R8A8
-                    case 0x40: {
-                        uint32_t v = reinterpret_cast<const uint32_t*>(sRow)[x];
-                        argb = ((v & 0xFFu) << 24) | ((v >> 8) & 0xFFFFFFu);
-                        break;
-                    }
-                    case 0x02: // Swizzled A1R5G5B5
-                    case 0x1C: { // Linear A1R5G5B5
-                        uint16_t v = reinterpret_cast<const uint16_t*>(sRow)[x];
-                        uint32_t a = (v & 0x8000) ? 0xFFu : 0x00u;
-                        uint32_t r = ((v >> 10) & 0x1F) * 255 / 31;
-                        uint32_t g = ((v >> 5)  & 0x1F) * 255 / 31;
-                        uint32_t b = (v         & 0x1F) * 255 / 31;
-                        argb = (a << 24) | (r << 16) | (g << 8) | b;
-                        break;
-                    }
-                    case 0x03: // Swizzled X1R5G5B5
-                    case 0x1D: {
-                        uint16_t v = reinterpret_cast<const uint16_t*>(sRow)[x];
-                        uint32_t r = ((v >> 10) & 0x1F) * 255 / 31;
-                        uint32_t g = ((v >> 5)  & 0x1F) * 255 / 31;
-                        uint32_t b = (v         & 0x1F) * 255 / 31;
-                        argb = 0xFF000000u | (r << 16) | (g << 8) | b;
-                        break;
-                    }
-                    case 0x04: // Swizzled A4R4G4B4
-                    case 0x1B: { // Linear A4R4G4B4
-                        uint16_t v = reinterpret_cast<const uint16_t*>(sRow)[x];
-                        uint32_t a = ((v >> 12) & 0x0F) * 17;
-                        uint32_t r = ((v >> 8)  & 0x0F) * 17;
-                        uint32_t g = ((v >> 4)  & 0x0F) * 17;
-                        uint32_t b = (v         & 0x0F) * 17;
-                        argb = (a << 24) | (r << 16) | (g << 8) | b;
-                        break;
-                    }
-                    case 0x05: // Swizzled R5G6B5
-                    case 0x11: { // Linear R5G6B5
-                        uint16_t v = reinterpret_cast<const uint16_t*>(sRow)[x];
-                        uint32_t r = ((v >> 11) & 0x1F) * 255 / 31;
-                        uint32_t g = ((v >> 5)  & 0x3F) * 255 / 63;
-                        uint32_t b = (v         & 0x1F) * 255 / 31;
-                        argb = 0xFF000000u | (r << 16) | (g << 8) | b;
-                        break;
-                    }
-                    case 0x00: // L8
-                    case 0x13: {
-                        uint32_t l = sRow[x];
-                        argb = 0xFF000000u | (l << 16) | (l << 8) | l;
-                        break;
-                    }
-                    case 0x01: // AL8
-                    case 0x19: // A8
-                    case 0x2F: {
-                        uint32_t a = sRow[x];
-                        argb = (a << 24) | 0x00FFFFFFu;
-                        break;
-                    }
-                    case 0x1A: // A8L8
-                    case 0x20: {
-                        uint16_t v = reinterpret_cast<const uint16_t*>(sRow)[x];
-                        uint32_t l = v & 0xFF;
-                        uint32_t a = (v >> 8) & 0xFF;
-                        argb = (a << 24) | (l << 16) | (l << 8) | l;
-                        break;
-                    }
-                    default:
-                        if (bpp == 4) argb = reinterpret_cast<const uint32_t*>(sRow)[x];
-                        break;
-                }
-                dRow[x] = argb;
-            }
-        }
+        bgraPixels.assign((size_t)w * h, 0xFFFFFFFFu);
+        DecodeSingleXboxSurfaceToBGRA8(srcData, w, h, xboxFmt, isSwizzled, linearPitch, false, 1u, 0u, bgraPixels.data());
     }
 
-    entry.isLinear = !isSwizzled;
-    if (!entry.tex2D || entry.width != w || entry.height != h) {
+    entry.width = w;
+    entry.height = h;
+    entry.isCubeAtlas = isCubeAtlas;
+
+    if (!entry.tex2D || entry.texWidth != atlasW || entry.texHeight != atlasH) {
         if (entry.rtv)   { entry.rtv->Release();   entry.rtv = nullptr; }
         if (entry.srv)   { entry.srv->Release();   entry.srv = nullptr; }
         if (entry.tex2D) { entry.tex2D->Release(); entry.tex2D = nullptr; }
-        entry.width = w;
-        entry.height = h;
-        entry.dxgiFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+        entry.texWidth = atlasW;
+        entry.texHeight = atlasH;
 
         D3D11_TEXTURE2D_DESC td = {};
-        td.Width = w;
-        td.Height = h;
+        td.Width = atlasW;
+        td.Height = atlasH;
         td.MipLevels = 1;
         td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -457,14 +498,14 @@ static void UploadXboxTextureToD3D11(CachedTexture& entry, const XboxPixelContai
 
         D3D11_SUBRESOURCE_DATA initData = {};
         initData.pSysMem = bgraPixels.data();
-        initData.SysMemPitch = w * 4;
+        initData.SysMemPitch = atlasW * 4;
 
         if (SUCCEEDED(g_d3dDevice->CreateTexture2D(&td, &initData, &entry.tex2D))) {
             g_d3dDevice->CreateShaderResourceView(entry.tex2D, nullptr, &entry.srv);
             g_d3dDevice->CreateRenderTargetView(entry.tex2D, nullptr, &entry.rtv);
         }
     } else if (entry.tex2D) {
-        g_d3dCtx->UpdateSubresource(entry.tex2D, 0, nullptr, bgraPixels.data(), w * 4, 0);
+        g_d3dCtx->UpdateSubresource(entry.tex2D, 0, nullptr, bgraPixels.data(), atlasW * 4, 0);
     }
     entry.dirty = false;
 }
@@ -519,7 +560,6 @@ static CachedTexture* GetOrCreateRenderTargetEntry(XboxPixelContainer* pTex) {
             c.xboxTex = pTex;
             c.format = pTex->Format;
             c.sizeField = pTex->Size;
-            c.isLinear = !isSwizzled;
             c.isRenderTarget = true;
             c.dirty = false;
             if (c.tex2D && !c.rtv) {
@@ -534,12 +574,12 @@ static CachedTexture* GetOrCreateRenderTargetEntry(XboxPixelContainer* pTex) {
     entry.dataPtr = pTex->Data;
     entry.format = pTex->Format;
     entry.sizeField = pTex->Size;
-    entry.isLinear = !isSwizzled;
     entry.isRenderTarget = true;
     entry.dirty = false;
     entry.width = w;
     entry.height = h;
-    entry.dxgiFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+    entry.texWidth = w;
+    entry.texHeight = h;
 
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = w;
@@ -561,9 +601,10 @@ static CachedTexture* GetOrCreateRenderTargetEntry(XboxPixelContainer* pTex) {
     return &g_texCache.back();
 }
 
-ID3D11ShaderResourceView* GetOrCreateD3D11SRV(XboxPixelContainer* pTex, float* outUScale, float* outVScale) {
+ID3D11ShaderResourceView* GetOrCreateD3D11SRV(XboxPixelContainer* pTex, float* outUScale, float* outVScale, bool* outIsCube) {
     if (outUScale) *outUScale = 1.0f;
     if (outVScale) *outVScale = 1.0f;
+    if (outIsCube) *outIsCube = false;
     if (!pTex || !pTex->Data || (uintptr_t)pTex->Data < 0x00400000) return nullptr;
 
     // Check if pTex is the Xbox main backbuffer (bound as a source texture by bloom/blur/refraction passes)
@@ -606,6 +647,7 @@ ID3D11ShaderResourceView* GetOrCreateD3D11SRV(XboxPixelContainer* pTex, float* o
     for (size_t i = 0; i < g_texCache.size(); ++i) {
         CachedTexture& c = g_texCache[i];
         if (c.dataPtr == pTex->Data && c.width == w && c.height == h) {
+            if (outIsCube) *outIsCube = c.isCubeAtlas;
             if (c.isRenderTarget) {
                 return (c.rtv && c.rtv == g_curActiveRTV) ? nullptr : c.srv;
             }
@@ -617,6 +659,7 @@ ID3D11ShaderResourceView* GetOrCreateD3D11SRV(XboxPixelContainer* pTex, float* o
                     if (c.dirty || c.contentHash != curHash) {
                         c.contentHash = curHash;
                         UploadXboxTextureToD3D11(c, pTex);
+                        if (outIsCube) *outIsCube = c.isCubeAtlas;
                     }
                 }
                 return c.srv;
@@ -638,6 +681,7 @@ ID3D11ShaderResourceView* GetOrCreateD3D11SRV(XboxPixelContainer* pTex, float* o
     entry.maxReadableBytes = maxReadable;
     entry.dirty = true;
     UploadXboxTextureToD3D11(entry, pTex);
+    if (outIsCube) *outIsCube = entry.isCubeAtlas;
     g_texCache.push_back(entry);
     return entry.srv;
 }
@@ -804,10 +848,10 @@ static void __stdcall Bridge_D3DDevice_CopyRects(
 
 void InitXboxD3D8TextureBridges() {
     constexpr uint32_t kAddrD3DVolumeTextureLockBox = 0x006B3470u;
-    InstallBridge(0x005F41F0, &Bridge_rlMain_SetRenderTarget,                     "rlMain_SetRenderTarget");
-    InstallBridge(0x006B1900, &Bridge_D3DDevice_SetTexture,                       "_D3DDevice_SetTexture@8");
-    InstallBridge(0x006B33D0, &Bridge_D3DTexture_LockRect,                        "_D3DTexture_LockRect@20");
-    InstallBridge(kAddrD3DVolumeTextureLockBox, &Bridge_D3DVolumeTexture_LockBox, "_D3DVolumeTexture_LockBox@20");
-    InstallBridge(0x006B45A0, &Bridge_D3DSurface_LockRect,                        "_D3DSurface_LockRect@16");
-    InstallBridge(0x006B0F40, &Bridge_D3DDevice_CopyRects,                        "_D3DDevice_CopyRects@20");
+    InstallBridge(0x005F41F0, &Bridge_rlMain_SetRenderTarget);                    // rlMain_SetRenderTarget
+    InstallBridge(0x006B1900, &Bridge_D3DDevice_SetTexture);                      // _D3DDevice_SetTexture@8
+    InstallBridge(0x006B33D0, &Bridge_D3DTexture_LockRect);                       // _D3DTexture_LockRect@20
+    InstallBridge(kAddrD3DVolumeTextureLockBox, &Bridge_D3DVolumeTexture_LockBox);// _D3DVolumeTexture_LockBox@20
+    InstallBridge(0x006B45A0, &Bridge_D3DSurface_LockRect);                       // _D3DSurface_LockRect@16
+    InstallBridge(0x006B0F40, &Bridge_D3DDevice_CopyRects);                       // _D3DDevice_CopyRects@20
 }

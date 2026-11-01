@@ -83,7 +83,7 @@ void PersistAndInitUserDataDir(const wchar_t* gameDirW);
 
 // Hooking / Bridging API (patch.cpp)
 // Overwrites the first 5 bytes of an Xbox function at `xboxVA` with `JMP rel32` to `hostFn`.
-void InstallBridge(uint32_t xboxVA, const void* hostFn, const char* name = nullptr);
+void InstallBridge(uint32_t xboxVA, const void* hostFn);
 
 // Writes raw bytes to an Xbox virtual address
 void PatchBytes(uint32_t xboxVA, const void* data, size_t len);
@@ -109,8 +109,16 @@ void InitXboxKernel();
 void InitXboxXapi();
 
 // Shared Xbox Audio Structures & Helpers (audio_adpcm.cpp / audio_buffer.cpp / audio_stream.cpp)
-#define XBOX_WAVE_FORMAT_PCM        1
 #define XBOX_WAVE_FORMAT_XBOX_ADPCM 0x0069
+
+static constexpr LONG  kMinDirectSoundVolumeMb = -10000;
+static constexpr LONG  kMaxDirectSoundVolumeMb = 0;
+static constexpr LONG  kMinDirectSoundPanMb    = -10000;
+static constexpr LONG  kMaxDirectSoundPanMb    = 10000;
+static constexpr DWORD kMinDirectSoundFreqHz   = 100u;
+static constexpr DWORD kMaxDirectSoundFreqHz   = 100000u;
+static constexpr DWORD kMaxXboxPitchFreqHz     = 192000u;
+static constexpr DWORD kDefaultSampleRateHz    = 48000u;
 
 #pragma pack(push, 1)
 struct XBOX_DSMIXBINVOLUMEPAIR {
@@ -122,6 +130,13 @@ struct XBOX_DSMIXBINS {
     uint32_t                       dwMixBinCount;
     const XBOX_DSMIXBINVOLUMEPAIR* lpMixBinVolumePairs;
 };
+
+struct XBOX_DSFILTERDESC {
+    uint32_t dwMode;              // +0x00: 0 = BYPASS, 1 = DLS2, 2 = PARAMEQ, 3 = MULTI
+    uint32_t dwQCoefficient;      // +0x04
+    uint32_t adwCoefficients[4];  // +0x08..+0x17
+};
+static_assert(sizeof(XBOX_DSFILTERDESC) == 0x18, "XBOX_DSFILTERDESC must be 0x18 bytes");
 
 struct XBOX_DSVOICEPROPS {
     uint32_t                dwMixBinCount;        // +0x00
@@ -136,6 +151,17 @@ struct XBOX_DSVOICEPROPS {
 static_assert(sizeof(XBOX_DSVOICEPROPS) == 0x5C, "XBOX_DSVOICEPROPS must be 0x5C bytes");
 #pragma pack(pop)
 
+struct Xbox3DVoiceMetrics {
+    LONG    pan;
+    LONG    totalAttenMb;
+    int32_t distanceVol;
+    int32_t coneVol;
+    int32_t dopplerPitch;
+    int32_t i3dl2DirectVol;
+    int32_t i3dl2RoomVol;
+    bool    active3D;
+};
+
 struct XboxDSObject {
     void** vtable;
     LONG   refCount;
@@ -145,11 +171,18 @@ extern CRITICAL_SECTION g_audioCs;
 extern bool             g_audioCsInit;
 
 DWORD XboxPitchToFrequencyHz(LONG lPitch);
-void Compute3DAudioPanAndAtten(const void* pVoiceData, LONG* outPan, LONG* outAttenDb);
-void ComputeMixBinsPan(const XBOX_DSMIXBINS* pMixBins, LONG* outPan);
-void DecodeXboxAdpcmPacket(const uint8_t* src, uint32_t srcBytes, uint32_t channels, int16_t* dstPcm, size_t maxSamples, size_t* outSamples);
-void AdvanceActiveAudioBuffersSubLoop();
-void InitXboxAudioBuffers();
+LONG  FrequencyHzToXboxPitch(DWORD freqHz);
+void  Compute3DAudioPanAndAtten(const void* pVoiceData, LONG* outPan, LONG* outAttenDb, Xbox3DVoiceMetrics* outMetrics = nullptr);
+void  ComputeMixBinsPan(const XBOX_DSMIXBINS* pMixBins, LONG* outPan);
+void  InitVoiceDefaultMixBins(uint32_t dwFlags, XBOX_DSMIXBINVOLUMEPAIR outPairs[8], uint32_t* outCount);
+void  AssignVoiceMixBins(const XBOX_DSMIXBINS* pMixBins, XBOX_DSMIXBINVOLUMEPAIR outPairs[8], uint32_t* outCount);
+void  UpdateVoiceMixBinVolumes(const XBOX_DSMIXBINS* pMixBins, XBOX_DSMIXBINVOLUMEPAIR ioPairs[8], uint32_t* ioCount);
+void  ComputeMixBinPairsPan(const XBOX_DSMIXBINVOLUMEPAIR pairs[8], uint32_t count, LONG* outPan);
+void  FillVoicePropsMixBins(const XBOX_DSMIXBINVOLUMEPAIR pairs[8], uint32_t count, XBOX_DSVOICEPROPS* outProps);
+bool  ComputeDls2FilterCoeffs(const XBOX_DSFILTERDESC* pFilter, uint32_t sampleRateHz, float* outF, float* outD);
+void  ApplyDls2FilterToPcm16(int16_t* pcm, size_t numFrames, uint32_t channels, float fCoeff, float dCoeff, float ioLow[2], float ioBand[2]);
+void  AdvanceActiveAudioBuffersSubLoop();
+void  InitXboxAudioBuffers();
 
 // Subsystem initialization functions
 bool InitD3D11HostDevice();

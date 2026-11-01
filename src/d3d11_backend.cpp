@@ -386,7 +386,6 @@ static void __stdcall Bridge_D3DDevice_SetRenderState_StencilFail(uint32_t Value
 // ============================================================================
 
 static constexpr uint32_t kMaxXboxVisibilityQueries = 1024u;
-static constexpr uint32_t kDefaultVisiblePixels     = 1u;
 
 struct XboxVisibilityQuerySlot {
     ID3D11Query* query;
@@ -435,22 +434,40 @@ static HRESULT __stdcall Bridge_D3DDevice_EndVisibilityTest(DWORD Index) {
 static HRESULT __stdcall Bridge_D3DDevice_GetVisibilityTestResult(
     DWORD Index, UINT* pResult, uint64_t* pTime)
 {
+    static constexpr HRESULT kXboxD3DErrTestIncomplete = static_cast<HRESULT>(0x8876086Au);
     uint32_t slotIdx = Index % kMaxXboxVisibilityQueries;
     XboxVisibilityQuerySlot& slot = g_visQuerySlots[slotIdx];
 
-    if (slot.query && slot.pending && g_d3dCtx) {
+    if (!slot.query || !g_d3dCtx) {
+        return kXboxD3DErrTestIncomplete;
+    }
+
+    uintptr_t flagsOrTimePtr = reinterpret_cast<uintptr_t>(pTime);
+    bool waitForResult = (flagsOrTimePtr == 1u); // D3DVISIBILITY_WAIT
+
+    if (slot.pending) {
         uint64_t passed = 0;
-        HRESULT hr = g_d3dCtx->GetData(slot.query, &passed, sizeof(passed), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        HRESULT hr = g_d3dCtx->GetData(slot.query, &passed, sizeof(passed), 0);
+        if (hr == S_FALSE && waitForResult) {
+            for (int spin = 0; spin < 5000 && hr == S_FALSE; ++spin) {
+                SwitchToThread();
+                hr = g_d3dCtx->GetData(slot.query, &passed, sizeof(passed), 0);
+            }
+        }
         if (hr == S_OK) {
-            slot.lastPixelsPassed = (UINT)passed;
+            slot.lastPixelsPassed = (passed > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : static_cast<UINT>(passed);
+            slot.pending = false;
+        } else if (hr == S_FALSE && !waitForResult) {
+            return kXboxD3DErrTestIncomplete;
+        } else {
             slot.pending = false;
         }
     }
 
     if (pResult) {
-        *pResult = slot.query ? slot.lastPixelsPassed : kDefaultVisiblePixels;
+        *pResult = slot.lastPixelsPassed;
     }
-    if (pTime) {
+    if (flagsOrTimePtr >= 0x10000u) {
         *pTime = 1ULL;
     }
     return S_OK;
@@ -1007,41 +1024,41 @@ void InitXboxD3D8() {
     PatchBytes(0x006B3510, kVbLock2, sizeof(kVbLock2));
 
     // 3. Bridge Dummy PushBuffer space functions
-    InstallBridge(0x006B4E80, &Bridge_D3DDevice_MakeSpace,                        "_D3DDevice_MakeSpace@0");
-    InstallBridge(0x006B4D50, &Bridge_MakeRequestedSpace,                         "?MakeRequestedSpace@D3D@@YGPCKKK@Z");
+    InstallBridge(0x006B4E80, &Bridge_D3DDevice_MakeSpace);                 // _D3DDevice_MakeSpace@0
+    InstallBridge(0x006B4D50, &Bridge_MakeRequestedSpace);                  // ?MakeRequestedSpace@D3D@@YGPCKKK@Z
 
     // 4. Bridge Device Creation, Swap & Gamma
-    InstallBridge(0x006BD9E0, &Bridge_Direct3DCreate8,                            "_Direct3DCreate8@4");
-    InstallBridge(0x006BCD20, &Bridge_Direct3D_CreateDevice,                      "_Direct3D_CreateDevice@24");
-    PatchRet(0x006BCD00, 8, 0, true);                                             // _Direct3D_SetPushBufferSize@8
-    InstallBridge(0x006BD830, &Bridge_D3DDevice_Swap,                             "_D3DDevice_Swap@4");
-    InstallBridge(0x006B77D0, &Bridge_D3DDevice_Clear,                            "_D3DDevice_Clear@24");
-    InstallBridge(0x005F4280, &Bridge_rlMain_SetGamma,                            "rlMain_SetGamma");
-    InstallBridge(0x006B0310, &Bridge_D3DDevice_SetGammaRamp,                     "_D3DDevice_SetGammaRamp@8");
+    InstallBridge(0x006BD9E0, &Bridge_Direct3DCreate8);                     // _Direct3DCreate8@4
+    InstallBridge(0x006BCD20, &Bridge_Direct3D_CreateDevice);               // _Direct3D_CreateDevice@24
+    PatchRet(0x006BCD00, 8, 0, true);                                       // _Direct3D_SetPushBufferSize@8
+    InstallBridge(0x006BD830, &Bridge_D3DDevice_Swap);                      // _D3DDevice_Swap@4
+    InstallBridge(0x006B77D0, &Bridge_D3DDevice_Clear);                     // _D3DDevice_Clear@24
+    InstallBridge(0x005F4280, &Bridge_rlMain_SetGamma);                     // rlMain_SetGamma
+    InstallBridge(0x006B0310, &Bridge_D3DDevice_SetGammaRamp);              // _D3DDevice_SetGammaRamp@8
 
     // 5. Bridge RenderState & TextureStageState functions
     constexpr uint32_t kAddrD3DDeviceSetTextureStateBorderColor   = 0x006AF600u;
     constexpr uint32_t kAddrD3DDeviceSetTextureStateColorKeyColor = 0x006AF640u;
-    InstallBridge(0x006AEC10, &Bridge_D3DDevice_SetRenderState_Simple,            "@D3DDevice_SetRenderState_Simple@8");
-    InstallBridge(0x006AEC40, &Bridge_D3DDevice_SetRenderStateNotInline,          "_D3DDevice_SetRenderStateNotInline@8");
-    InstallBridge(0x006AF680, &Bridge_D3DDevice_SetTextureStageStateNotInline,    "_D3DDevice_SetTextureStageStateNotInline@12");
-    InstallBridge(0x006AF480, &Bridge_D3DDevice_SetTextureState_TexCoordIndex,    "_D3DDevice_SetTextureState_TexCoordIndex@8");
-    InstallBridge(0x006AF590, &Bridge_D3DDevice_SetTextureState_BumpEnv,          "_D3DDevice_SetTextureState_BumpEnv@12");
-    InstallBridge(kAddrD3DDeviceSetTextureStateBorderColor,   &Bridge_D3DDevice_SetTextureState_BorderColor,   "_D3DDevice_SetTextureState_BorderColor@8");
-    InstallBridge(kAddrD3DDeviceSetTextureStateColorKeyColor, &Bridge_D3DDevice_SetTextureState_ColorKeyColor, "_D3DDevice_SetTextureState_ColorKeyColor@8");
-    InstallBridge(0x006AEF90, &Bridge_D3DDevice_SetRenderState_FogColor,          "_D3DDevice_SetRenderState_FogColor@4");
-    InstallBridge(0x006AEFE0, &Bridge_D3DDevice_SetRenderState_CullMode,          "_D3DDevice_SetRenderState_CullMode@4");
-    InstallBridge(0x006AF0D0, &Bridge_D3DDevice_SetRenderState_TextureFactor,     "_D3DDevice_SetRenderState_TextureFactor@4");
-    InstallBridge(0x006AF220, &Bridge_D3DDevice_SetRenderState_ZBias,             "_D3DDevice_SetRenderState_ZBias@4");
-    InstallBridge(0x006AF300, &Bridge_D3DDevice_SetRenderState_FillMode,          "_D3DDevice_SetRenderState_FillMode@4");
-    InstallBridge(0x006AFE60, &Bridge_D3DDevice_SetRenderState_ZEnable,           "_D3DDevice_SetRenderState_ZEnable@4");
-    InstallBridge(0x006AFEF0, &Bridge_D3DDevice_SetRenderState_StencilEnable,     "_D3DDevice_SetRenderState_StencilEnable@4");
-    InstallBridge(0x006AFF80, &Bridge_D3DDevice_SetRenderState_StencilFail,       "_D3DDevice_SetRenderState_StencilFail@4");
+    InstallBridge(0x006AEC10, &Bridge_D3DDevice_SetRenderState_Simple);             // @D3DDevice_SetRenderState_Simple@8
+    InstallBridge(0x006AEC40, &Bridge_D3DDevice_SetRenderStateNotInline);           // _D3DDevice_SetRenderStateNotInline@8
+    InstallBridge(0x006AF680, &Bridge_D3DDevice_SetTextureStageStateNotInline);     // _D3DDevice_SetTextureStageStateNotInline@12
+    InstallBridge(0x006AF480, &Bridge_D3DDevice_SetTextureState_TexCoordIndex);     // _D3DDevice_SetTextureState_TexCoordIndex@8
+    InstallBridge(0x006AF590, &Bridge_D3DDevice_SetTextureState_BumpEnv);           // _D3DDevice_SetTextureState_BumpEnv@12
+    InstallBridge(kAddrD3DDeviceSetTextureStateBorderColor,   &Bridge_D3DDevice_SetTextureState_BorderColor);   // _D3DDevice_SetTextureState_BorderColor@8
+    InstallBridge(kAddrD3DDeviceSetTextureStateColorKeyColor, &Bridge_D3DDevice_SetTextureState_ColorKeyColor); // _D3DDevice_SetTextureState_ColorKeyColor@8
+    InstallBridge(0x006AEF90, &Bridge_D3DDevice_SetRenderState_FogColor);           // _D3DDevice_SetRenderState_FogColor@4
+    InstallBridge(0x006AEFE0, &Bridge_D3DDevice_SetRenderState_CullMode);           // _D3DDevice_SetRenderState_CullMode@4
+    InstallBridge(0x006AF0D0, &Bridge_D3DDevice_SetRenderState_TextureFactor);      // _D3DDevice_SetRenderState_TextureFactor@4
+    InstallBridge(0x006AF220, &Bridge_D3DDevice_SetRenderState_ZBias);              // _D3DDevice_SetRenderState_ZBias@4
+    InstallBridge(0x006AF300, &Bridge_D3DDevice_SetRenderState_FillMode);           // _D3DDevice_SetRenderState_FillMode@4
+    InstallBridge(0x006AFE60, &Bridge_D3DDevice_SetRenderState_ZEnable);            // _D3DDevice_SetRenderState_ZEnable@4
+    InstallBridge(0x006AFEF0, &Bridge_D3DDevice_SetRenderState_StencilEnable);      // _D3DDevice_SetRenderState_StencilEnable@4
+    InstallBridge(0x006AFF80, &Bridge_D3DDevice_SetRenderState_StencilFail);        // _D3DDevice_SetRenderState_StencilFail@4
 
     // 6. Bridge Hardware Visibility Test (Occlusion Query) & Fence functions
-    InstallBridge(0x006B1B70, &Bridge_D3DDevice_BeginVisibilityTest,              "_D3DDevice_BeginVisibilityTest@0");
-    InstallBridge(0x006B1C10, &Bridge_D3DDevice_EndVisibilityTest,                "_D3DDevice_EndVisibilityTest@4");
-    InstallBridge(0x006B05B0, &Bridge_D3DDevice_GetVisibilityTestResult,          "_D3DDevice_GetVisibilityTestResult@12");
+    InstallBridge(0x006B1B70, &Bridge_D3DDevice_BeginVisibilityTest);               // _D3DDevice_BeginVisibilityTest@0
+    InstallBridge(0x006B1C10, &Bridge_D3DDevice_EndVisibilityTest);                 // _D3DDevice_EndVisibilityTest@4
+    InstallBridge(0x006B05B0, &Bridge_D3DDevice_GetVisibilityTestResult);           // _D3DDevice_GetVisibilityTestResult@12
     PatchRet(0x006B05A0, 4, 0, false); // _D3DDevice_BlockOnFence@4
     PatchRet(0x006B0700, 0, 1, true);  // _D3DDevice_InsertFence@0
 

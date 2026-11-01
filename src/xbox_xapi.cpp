@@ -719,11 +719,28 @@ static DWORD __stdcall Bridge_WaitForMultipleObjects(DWORD nCount, const HANDLE*
 }
 
 static DWORD __stdcall Bridge_SleepEx(DWORD dwMilliseconds, BOOL bAlertable) {
-    return SleepEx(dwMilliseconds > 50 ? 10 : dwMilliseconds, bAlertable);
+    if (dwMilliseconds == 0) {
+        return SleepEx(0, bAlertable);
+    }
+    DWORD remaining = dwMilliseconds;
+    while (remaining > 0) {
+        DWORD slice = (remaining > 10u) ? 10u : remaining;
+        DWORD res = SleepEx(slice, bAlertable);
+        UpdateXboxKernelTick();
+        UpdateXboxInputTick();
+        UpdateXboxAudioTick();
+        if (res != 0) {
+            return res;
+        }
+        if (remaining != INFINITE) {
+            remaining -= slice;
+        }
+    }
+    return 0;
 }
 
 static void __stdcall Bridge_Sleep(DWORD dwMilliseconds) {
-    Sleep(dwMilliseconds > 50 ? 10 : dwMilliseconds);
+    Bridge_SleepEx(dwMilliseconds, FALSE);
 }
 
 static HANDLE __stdcall Bridge_CreateThread(
@@ -802,119 +819,119 @@ void InitXboxXapi() {
     InitializeCriticalSection(&g_findCs);
 
     // 1. Bridge XAPILIB Functions
-    InstallBridge(0x0059FB75, &Bridge_QueryPerformanceCounter,   "_QueryPerformanceCounter@4");
-    InstallBridge(0x0059FB86, &Bridge_QueryPerformanceFrequency, "_QueryPerformanceFrequency@4");
-    InstallBridge(0x0059FB9A, &Bridge_XGetLanguage,              "_XGetLanguage@0");
-    InstallBridge(0x0059FBD4, &Krnl_DbgBreakPoint,               "_DebugBreak@0");
-    InstallBridge(0x0059FBD9, &Bridge_GetSystemTimeAsFileTime,   "_GetSystemTimeAsFileTime@4");
-    InstallBridge(0x0059FC09, &Bridge_XLaunchNewImageA,          "_XLaunchNewImageA@8");
-    PatchRet(0x0059FC4B, 24, 0, true);                           // _XWriteTitleInfoNoReboot@24
-    InstallBridge(0x0059FD2C, &Bridge_XGetLaunchInfo,            "_XGetLaunchInfo@8");
-    PatchRet(0x0059FD90, 20, 0, true);                           // _XWriteTitleInfoAndRebootA@20
+    InstallBridge(0x0059FB75, &Bridge_QueryPerformanceCounter);    // _QueryPerformanceCounter@4
+    InstallBridge(0x0059FB86, &Bridge_QueryPerformanceFrequency);  // _QueryPerformanceFrequency@4
+    InstallBridge(0x0059FB9A, &Bridge_XGetLanguage);               // _XGetLanguage@0
+    InstallBridge(0x0059FBD4, &Krnl_DbgBreakPoint);                // _DebugBreak@0
+    InstallBridge(0x0059FBD9, &Bridge_GetSystemTimeAsFileTime);    // _GetSystemTimeAsFileTime@4
+    InstallBridge(0x0059FC09, &Bridge_XLaunchNewImageA);           // _XLaunchNewImageA@8
+    PatchRet(0x0059FC4B, 24, 0, true);                             // _XWriteTitleInfoNoReboot@24
+    InstallBridge(0x0059FD2C, &Bridge_XGetLaunchInfo);             // _XGetLaunchInfo@8
+    PatchRet(0x0059FD90, 20, 0, true);                             // _XWriteTitleInfoAndRebootA@20
 
     // SaveGame & Signature APIs
-    InstallBridge(0x005A0225, &Bridge_XCreateSaveGame,           "_XCreateSaveGame@24");
-    InstallBridge(0x005A0488, &Bridge_XDeleteSaveGame,           "_XDeleteSaveGame@8");
-    InstallBridge(0x005A0558, &Bridge_XFindFirstSaveGame,        "_XFindFirstSaveGame@8");
-    InstallBridge(0x005A0662, &Bridge_XFindNextSaveGame,         "_XFindNextSaveGame@8");
-    InstallBridge(0x005A06A9, &Bridge_XFindClose,                "_XFindClose@4");
-    InstallBridge(0x005A09A9, &Bridge_XCalculateSignatureBeginEx,"_XCalculateSignatureBeginEx@8");
-    InstallBridge(0x005A09EA, &Bridge_XCalculateSignatureBegin,  "_XCalculateSignatureBegin@4");
-    InstallBridge(0x005A09FE, &Bridge_XCalculateSignatureUpdate, "_XCalculateSignatureUpdate@12");
-    InstallBridge(0x005A0A4C, &Bridge_XCalculateSignatureEnd,    "_XCalculateSignatureEnd@8");
+    InstallBridge(0x005A0225, &Bridge_XCreateSaveGame);            // _XCreateSaveGame@24
+    InstallBridge(0x005A0488, &Bridge_XDeleteSaveGame);            // _XDeleteSaveGame@8
+    InstallBridge(0x005A0558, &Bridge_XFindFirstSaveGame);         // _XFindFirstSaveGame@8
+    InstallBridge(0x005A0662, &Bridge_XFindNextSaveGame);          // _XFindNextSaveGame@8
+    InstallBridge(0x005A06A9, &Bridge_XFindClose);                 // _XFindClose@4
+    InstallBridge(0x005A09A9, &Bridge_XCalculateSignatureBeginEx); // _XCalculateSignatureBeginEx@8
+    InstallBridge(0x005A09EA, &Bridge_XCalculateSignatureBegin);   // _XCalculateSignatureBegin@4
+    InstallBridge(0x005A09FE, &Bridge_XCalculateSignatureUpdate);  // _XCalculateSignatureUpdate@12
+    InstallBridge(0x005A0A4C, &Bridge_XCalculateSignatureEnd);     // _XCalculateSignatureEnd@8
 
     // File & Directory APIs
-    InstallBridge(0x005A0A91, &Bridge_CloseHandle,               "_CloseHandle@4");
-    InstallBridge(0x005A0AAF, &Bridge_ReadFile,                  "_ReadFile@20");
-    InstallBridge(0x005A0B9C, &Bridge_WriteFile,                 "_WriteFile@20");
-    InstallBridge(0x005A0C72, &Bridge_SetEndOfFile,              "_SetEndOfFile@4");
-    InstallBridge(0x005A0CF6, &Bridge_SetFilePointer,            "_SetFilePointer@16");
-    InstallBridge(0x005A0DF0, &Bridge_SetFilePointerEx,          "_SetFilePointerEx@20");
-    InstallBridge(0x005A0EB8, &Bridge_FlushFileBuffers,          "_FlushFileBuffers@4");
-    InstallBridge(0x005A0EDF, &Bridge_GetFileSizeEx,             "_GetFileSizeEx@8");
-    InstallBridge(0x005A0F1D, &Bridge_GetFileSize,               "_GetFileSize@8");
-    InstallBridge(0x005A1079, &Bridge_CreateFileA,               "_CreateFileA@28");
-    InstallBridge(0x005A1204, &Bridge_GetLastError,              "_GetLastError@0");
-    InstallBridge(0x005A122C, &Bridge_SetLastError,              "_SetLastError@4");
-    InstallBridge(0x005A1271, &Bridge_GetOverlappedResult,       "_GetOverlappedResult@16");
-    InstallBridge(0x005A1514, &Bridge_GetTickCount,              "_GetTickCount@0");
-    InstallBridge(0x005A151C, &Bridge_FileTimeToSystemTime,      "_FileTimeToSystemTime@8");
-    InstallBridge(0x005A1587, &Bridge_SystemTimeToFileTime,      "_SystemTimeToFileTime@8");
-    InstallBridge(0x005A1806, &Bridge_GetTimeZoneInformation,    "_GetTimeZoneInformation@4");
-    InstallBridge(0x005A19B8, &Bridge_GetLocalTime,              "_GetLocalTime@4");
-    InstallBridge(0x005A1A37, &Bridge_XSetFileCacheSize,         "_XSetFileCacheSize@4");
-    InstallBridge(0x005A1A8A, &Bridge_CancelIo,                  "_CancelIo@4");
-    InstallBridge(0x005A1B53, &Bridge_GetDiskFreeSpaceExA,       "_GetDiskFreeSpaceExA@16");
-    PatchRet(0x005A1C47, 12, 1, true);                           // _XapiSelectCachePartition@12
-    InstallBridge(0x005A1E92, &Bridge_XMountUtilityDrive,        "_XMountUtilityDrive@4");
-    PatchRet(0x005A1F97, 4, 0, true);                            // _XUnmountAlternateTitleA@4
-    InstallBridge(0x005A1FF4, &Bridge_XGetDiskSectorSizeA,       "_XGetDiskSectorSizeA@4");
-    PatchRet(0x005A208F, 12, 0, true);                           // _XMUNameFromDriveLetter@12
+    InstallBridge(0x005A0A91, &Bridge_CloseHandle);                // _CloseHandle@4
+    InstallBridge(0x005A0AAF, &Bridge_ReadFile);                   // _ReadFile@20
+    InstallBridge(0x005A0B9C, &Bridge_WriteFile);                  // _WriteFile@20
+    InstallBridge(0x005A0C72, &Bridge_SetEndOfFile);               // _SetEndOfFile@4
+    InstallBridge(0x005A0CF6, &Bridge_SetFilePointer);             // _SetFilePointer@16
+    InstallBridge(0x005A0DF0, &Bridge_SetFilePointerEx);           // _SetFilePointerEx@20
+    InstallBridge(0x005A0EB8, &Bridge_FlushFileBuffers);           // _FlushFileBuffers@4
+    InstallBridge(0x005A0EDF, &Bridge_GetFileSizeEx);              // _GetFileSizeEx@8
+    InstallBridge(0x005A0F1D, &Bridge_GetFileSize);                // _GetFileSize@8
+    InstallBridge(0x005A1079, &Bridge_CreateFileA);                // _CreateFileA@28
+    InstallBridge(0x005A1204, &Bridge_GetLastError);               // _GetLastError@0
+    InstallBridge(0x005A122C, &Bridge_SetLastError);               // _SetLastError@4
+    InstallBridge(0x005A1271, &Bridge_GetOverlappedResult);        // _GetOverlappedResult@16
+    InstallBridge(0x005A1514, &Bridge_GetTickCount);               // _GetTickCount@0
+    InstallBridge(0x005A151C, &Bridge_FileTimeToSystemTime);       // _FileTimeToSystemTime@8
+    InstallBridge(0x005A1587, &Bridge_SystemTimeToFileTime);       // _SystemTimeToFileTime@8
+    InstallBridge(0x005A1806, &Bridge_GetTimeZoneInformation);     // _GetTimeZoneInformation@4
+    InstallBridge(0x005A19B8, &Bridge_GetLocalTime);               // _GetLocalTime@4
+    InstallBridge(0x005A1A37, &Bridge_XSetFileCacheSize);          // _XSetFileCacheSize@4
+    InstallBridge(0x005A1A8A, &Bridge_CancelIo);                   // _CancelIo@4
+    InstallBridge(0x005A1B53, &Bridge_GetDiskFreeSpaceExA);        // _GetDiskFreeSpaceExA@16
+    PatchRet(0x005A1C47, 12, 1, true);                             // _XapiSelectCachePartition@12
+    InstallBridge(0x005A1E92, &Bridge_XMountUtilityDrive);         // _XMountUtilityDrive@4
+    PatchRet(0x005A1F97, 4, 0, true);                              // _XUnmountAlternateTitleA@4
+    InstallBridge(0x005A1FF4, &Bridge_XGetDiskSectorSizeA);        // _XGetDiskSectorSizeA@4
+    PatchRet(0x005A208F, 12, 0, true);                             // _XMUNameFromDriveLetter@12
 
     // Physical Memory & Synchronization & Thread APIs
-    InstallBridge(0x005A216A, &Bridge_XPhysicalAlloc,            "_XPhysicalAlloc@16");
-    InstallBridge(0x005A21AD, &Bridge_XPhysicalAllocEx,          "_XPhysicalAllocEx@20");
-    InstallBridge(0x005A21DA, &Bridge_XPhysicalFree,             "_XPhysicalFree@4");
-    InstallBridge(0x005A21E0, &Bridge_CreateEventA,              "_CreateEventA@16");
-    InstallBridge(0x005A2241, &Bridge_SetEvent,                  "_SetEvent@4");
-    InstallBridge(0x005A2261, &Bridge_CreateMutexA,              "_CreateMutexA@12");
-    InstallBridge(0x005A22B9, &Bridge_ReleaseMutex,              "_ReleaseMutex@4");
-    InstallBridge(0x005A22D9, &Bridge_WaitForSingleObjectEx,     "_WaitForSingleObjectEx@12");
-    InstallBridge(0x005A231D, &Bridge_WaitForMultipleObjectsEx,  "_WaitForMultipleObjectsEx@20");
-    InstallBridge(0x005A239D, &Bridge_SleepEx,                   "_SleepEx@8");
-    InstallBridge(0x005A23EF, &Bridge_WaitForSingleObject,       "_WaitForSingleObject@8");
-    InstallBridge(0x005A2401, &Bridge_WaitForMultipleObjects,    "_WaitForMultipleObjects@16");
-    InstallBridge(0x005A241B, &Bridge_Sleep,                     "_Sleep@4");
-    PatchRet(0x005A2429, 4, 0, false);                           // _XapiCallThreadNotifyRoutines@4
-    InstallBridge(0x005A2461, &Bridge_ResumeThread,              "_ResumeThread@4");
-    PatchRet(0x005A24EF, 8, 0, false);                           // _XRegisterThreadNotifyRoutine@8
-    InstallBridge(0x005A260C, &Bridge_CreateThread,              "_CreateThread@24");
-    InstallBridge(0x005A267A, &Bridge_GetCurrentThreadId,        "_GetCurrentThreadId@0");
-    InstallBridge(0x005A276D, &Bridge_XGetGameRegion,            "_XGetGameRegion@0");
-    InstallBridge(0x005A2795, &Bridge_OutputDebugStringA,        "_OutputDebugStringA@4");
-    InstallBridge(0x005A2EBC, &Bridge_CreateDirectoryA,          "_CreateDirectoryA@8");
-    InstallBridge(0x005A2F28, &Bridge_RemoveDirectoryA,          "_RemoveDirectoryA@4");
-    PatchRet(0x005A2FB6, 8, 1, true);                            // _XapiNukeDirectoryFromHandle@8
-    PatchRet(0x005A3133, 8, 1, true);                            // _XapiNukeDirectory@8
-    InstallBridge(0x005A31A2, &Bridge_XMemAlloc,                 "_XMemAlloc@8");
-    InstallBridge(0x005A3242, &Bridge_XMemFree,                  "_XMemFree@8");
-    InstallBridge(0x005A32C8, &Bridge_FindFirstFileA,            "_FindFirstFileA@8");
-    InstallBridge(0x005A33D5, &Bridge_FindNextFileA,             "_FindNextFileA@8");
-    InstallBridge(0x005A3426, &Krnl_ExQueryNonVolatileSetting,   "_XQueryValue@20");
-    PatchRet(0x005A3B20, 12, 0, false);                          // _XapiBootToDash@12
-    PatchRet(0x005A3E16, 0, 0, false);                           // _XapiInitProcess@0
-    PatchRet(0x005A4338, 0, 0, false);                           // _XapiRestrictCodeSelectorLimit@0
-    PatchRet(0x005A439C, 0, 0, false);                           // _XapiApplyKernelPatches@0
+    InstallBridge(0x005A216A, &Bridge_XPhysicalAlloc);             // _XPhysicalAlloc@16
+    InstallBridge(0x005A21AD, &Bridge_XPhysicalAllocEx);           // _XPhysicalAllocEx@20
+    InstallBridge(0x005A21DA, &Bridge_XPhysicalFree);              // _XPhysicalFree@4
+    InstallBridge(0x005A21E0, &Bridge_CreateEventA);               // _CreateEventA@16
+    InstallBridge(0x005A2241, &Bridge_SetEvent);                   // _SetEvent@4
+    InstallBridge(0x005A2261, &Bridge_CreateMutexA);               // _CreateMutexA@12
+    InstallBridge(0x005A22B9, &Bridge_ReleaseMutex);               // _ReleaseMutex@4
+    InstallBridge(0x005A22D9, &Bridge_WaitForSingleObjectEx);      // _WaitForSingleObjectEx@12
+    InstallBridge(0x005A231D, &Bridge_WaitForMultipleObjectsEx);   // _WaitForMultipleObjectsEx@20
+    InstallBridge(0x005A239D, &Bridge_SleepEx);                    // _SleepEx@8
+    InstallBridge(0x005A23EF, &Bridge_WaitForSingleObject);        // _WaitForSingleObject@8
+    InstallBridge(0x005A2401, &Bridge_WaitForMultipleObjects);     // _WaitForMultipleObjects@16
+    InstallBridge(0x005A241B, &Bridge_Sleep);                      // _Sleep@4
+    PatchRet(0x005A2429, 4, 0, false);                             // _XapiCallThreadNotifyRoutines@4
+    InstallBridge(0x005A2461, &Bridge_ResumeThread);               // _ResumeThread@4
+    PatchRet(0x005A24EF, 8, 0, false);                             // _XRegisterThreadNotifyRoutine@8
+    InstallBridge(0x005A260C, &Bridge_CreateThread);               // _CreateThread@24
+    InstallBridge(0x005A267A, &Bridge_GetCurrentThreadId);         // _GetCurrentThreadId@0
+    InstallBridge(0x005A276D, &Bridge_XGetGameRegion);             // _XGetGameRegion@0
+    InstallBridge(0x005A2795, &Bridge_OutputDebugStringA);         // _OutputDebugStringA@4
+    InstallBridge(0x005A2EBC, &Bridge_CreateDirectoryA);           // _CreateDirectoryA@8
+    InstallBridge(0x005A2F28, &Bridge_RemoveDirectoryA);           // _RemoveDirectoryA@4
+    PatchRet(0x005A2FB6, 8, 1, true);                              // _XapiNukeDirectoryFromHandle@8
+    PatchRet(0x005A3133, 8, 1, true);                              // _XapiNukeDirectory@8
+    InstallBridge(0x005A31A2, &Bridge_XMemAlloc);                  // _XMemAlloc@8
+    InstallBridge(0x005A3242, &Bridge_XMemFree);                   // _XMemFree@8
+    InstallBridge(0x005A32C8, &Bridge_FindFirstFileA);             // _FindFirstFileA@8
+    InstallBridge(0x005A33D5, &Bridge_FindNextFileA);              // _FindNextFileA@8
+    InstallBridge(0x005A3426, &Krnl_ExQueryNonVolatileSetting);    // _XQueryValue@20
+    PatchRet(0x005A3B20, 12, 0, false);                            // _XapiBootToDash@12
+    PatchRet(0x005A3E16, 0, 0, false);                             // _XapiInitProcess@0
+    PatchRet(0x005A4338, 0, 0, false);                             // _XapiRestrictCodeSelectorLimit@0
+    PatchRet(0x005A439C, 0, 0, false);                             // _XapiApplyKernelPatches@0
 
     // Heap & Section & Misc XAPILIB
-    InstallBridge(0x005A4646, &Bridge_RtlFreeHeap,               "_HeapFree@12");
-    InstallBridge(0x005A465D, &Bridge_GetProcessHeap,            "_GetProcessHeap@0");
-    InstallBridge(0x005A4663, &Bridge_LocalAlloc,                "_LocalAlloc@8");
-    InstallBridge(0x005A4680, &Bridge_LocalFree,                 "_LocalFree@4");
-    InstallBridge(0x005A469E, &Bridge_XGetSectionHandleA,        "_XGetSectionHandleA@4");
-    InstallBridge(0x005A4705, &Bridge_XLoadSectionByHandle,      "_XLoadSectionByHandle@4");
-    InstallBridge(0x005A4726, &Bridge_XFreeSectionByHandle,      "_XFreeSectionByHandle@4");
-    InstallBridge(0x005A4744, &Bridge_XGetSectionSize,           "_XGetSectionSize@4");
-    InstallBridge(0x005A474E, &Bridge_XGetParentalControlSetting,"_XGetParentalControlSetting@0");
-    InstallBridge(0x005A528B, &Bridge_RtlSizeHeap,               "_RtlSizeHeap@12");
-    InstallBridge(0x005A5809, &Bridge_RtlCreateHeap,             "_RtlCreateHeap@24");
-    InstallBridge(0x005A5C2D, &Bridge_RtlAllocateHeap,           "_RtlAllocateHeap@12");
-    InstallBridge(0x005A63A8, &Bridge_RtlFreeHeap,               "_RtlFreeHeap@12");
-    InstallBridge(0x005A659C, &Bridge_RtlReAllocateHeap,         "_RtlReAllocateHeap@16");
-    PatchRet(0x005A6CCA, 0, 0, false);                           // _XAutoPowerDownResetTimer@0
-    PatchRet(0x005A6CF7, 0, 0, false);                           // _XapiInitAutoPowerDown@0
-    PatchRet(0x005A6DE4, 8, 1, true);                            // _XapiChangeCodeSelectorLimit@8
+    InstallBridge(0x005A4646, &Bridge_RtlFreeHeap);                // _HeapFree@12
+    InstallBridge(0x005A465D, &Bridge_GetProcessHeap);             // _GetProcessHeap@0
+    InstallBridge(0x005A4663, &Bridge_LocalAlloc);                 // _LocalAlloc@8
+    InstallBridge(0x005A4680, &Bridge_LocalFree);                  // _LocalFree@4
+    InstallBridge(0x005A469E, &Bridge_XGetSectionHandleA);         // _XGetSectionHandleA@4
+    InstallBridge(0x005A4705, &Bridge_XLoadSectionByHandle);       // _XLoadSectionByHandle@4
+    InstallBridge(0x005A4726, &Bridge_XFreeSectionByHandle);       // _XFreeSectionByHandle@4
+    InstallBridge(0x005A4744, &Bridge_XGetSectionSize);            // _XGetSectionSize@4
+    InstallBridge(0x005A474E, &Bridge_XGetParentalControlSetting); // _XGetParentalControlSetting@0
+    InstallBridge(0x005A528B, &Bridge_RtlSizeHeap);                // _RtlSizeHeap@12
+    InstallBridge(0x005A5809, &Bridge_RtlCreateHeap);              // _RtlCreateHeap@24
+    InstallBridge(0x005A5C2D, &Bridge_RtlAllocateHeap);            // _RtlAllocateHeap@12
+    InstallBridge(0x005A63A8, &Bridge_RtlFreeHeap);                // _RtlFreeHeap@12
+    InstallBridge(0x005A659C, &Bridge_RtlReAllocateHeap);          // _RtlReAllocateHeap@16
+    PatchRet(0x005A6CCA, 0, 0, false);                             // _XAutoPowerDownResetTimer@0
+    PatchRet(0x005A6CF7, 0, 0, false);                             // _XapiInitAutoPowerDown@0
+    PatchRet(0x005A6DE4, 8, 1, true);                              // _XapiChangeCodeSelectorLimit@8
 
-    InstallBridge(0x0069C68B, &Bridge_XGetAudioFlags,            "_XGetAudioFlags@0");
-    InstallBridge(0x0069C714, &Bridge_GlobalMemoryStatus,        "_GlobalMemoryStatus@4");
-    InstallBridge(0x0069C763, &Bridge_XGetAVPack,                "_XGetAVPack@0");
-    InstallBridge(0x0069C76B, &Bridge_XGetVideoFlags,            "_XGetVideoFlags@0");
-    PatchRet(0x0069C7B4, 8, 0, true);                            // _IsBadReadPtr@8 -> FALSE
-    PatchRet(0x0069C819, 8, 0, true);                            // _IsBadWritePtr@8 -> FALSE
-    PatchRet(0x0069C882, 4, 0, true);                            // _IsBadCodePtr@4 -> FALSE
-    InstallBridge(0x0069C890, &Bridge_XGetVideoStandard,         "_XGetVideoStandard@0");
-    InstallBridge(0x006AA8E7, &Bridge_MultiByteToWideChar,       "_MultiByteToWideChar@24");
-    InstallBridge(0x006AA9A2, &Bridge_WideCharToMultiByte,       "_WideCharToMultiByte@32");
+    InstallBridge(0x0069C68B, &Bridge_XGetAudioFlags);             // _XGetAudioFlags@0
+    InstallBridge(0x0069C714, &Bridge_GlobalMemoryStatus);         // _GlobalMemoryStatus@4
+    InstallBridge(0x0069C763, &Bridge_XGetAVPack);                 // _XGetAVPack@0
+    InstallBridge(0x0069C76B, &Bridge_XGetVideoFlags);             // _XGetVideoFlags@0
+    PatchRet(0x0069C7B4, 8, 0, true);                              // _IsBadReadPtr@8 -> FALSE
+    PatchRet(0x0069C819, 8, 0, true);                              // _IsBadWritePtr@8 -> FALSE
+    PatchRet(0x0069C882, 4, 0, true);                              // _IsBadCodePtr@4 -> FALSE
+    InstallBridge(0x0069C890, &Bridge_XGetVideoStandard);          // _XGetVideoStandard@0
+    InstallBridge(0x006AA8E7, &Bridge_MultiByteToWideChar);        // _MultiByteToWideChar@24
+    InstallBridge(0x006AA9A2, &Bridge_WideCharToMultiByte);        // _WideCharToMultiByte@32
 
     // 2. XNet / Winsock Offline Stubs (prevents null CXnSock* dereferences when hkBsdSockServer calls XNET)
     constexpr uint32_t kAddrXNetSocket         = 0x00739AA0u;

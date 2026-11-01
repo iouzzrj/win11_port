@@ -289,8 +289,13 @@ static constexpr uint32_t kXboxTexAddressMirror = 2u;
 static constexpr uint32_t kXboxTexAddressClamp  = 3u;
 static constexpr uint32_t kXboxTexAddressBorder = 4u;
 static constexpr uint32_t kXboxTexFilterPoint   = 1u;
-static constexpr uint32_t kCustomVsBumpEnv      = 8u;
-static constexpr uint32_t kCustomVsEnvmap       = 9u;
+static constexpr uint32_t kCustomVsBumpEnv           = 8u;
+static constexpr uint32_t kCustomVsEnvmap            = 9u;
+static constexpr uint32_t kCustomVsBump              = 10u;
+static constexpr uint32_t kCustomVsBumpEmboss        = 11u;
+static constexpr uint32_t kCustomVsSpecular          = 12u;
+static constexpr uint32_t kCustomVsGlossEnvmapDetail = 13u;
+static constexpr uint32_t kCustomVsLightProject      = 14u;
 
 #pragma pack(push, 1)
 struct XboxPixelContainer {
@@ -393,11 +398,14 @@ struct alignas(16) PerDrawCBData {
     float    psConst1[4];   // c1
     float    psConst2[4];   // c2
     float    psConst3[4];   // c3
+    float    psConst4[4];   // c4
+    float    psConst5[4];   // c5
+    float    psConst6[4];   // c6
+    float    psConst7[4];   // c7
 };
 #pragma pack(pop)
 
 struct XboxShaderDeclInfo {
-    bool     isValid;
     bool     hasPos;
     bool     hasRhw;
     bool     hasNorm;
@@ -414,7 +422,6 @@ struct XboxShaderDeclInfo {
     uint16_t offUv1;
     uint16_t offUv2;
     uint16_t offUv3;
-    uint32_t stride;
     int32_t  vsType; // 0..65 if from aVertexShaders[0..65] at 0x007D0BE0, else -1
 };
 
@@ -478,7 +485,7 @@ void DecodeXboxTextureFormat(
     const XboxPixelContainer* pTex,
     uint32_t* outWidth, uint32_t* outHeight, uint32_t* outLevels,
     uint32_t* outXboxFmt, bool* outSwizzled, uint32_t* outLinearPitch);
-ID3D11ShaderResourceView* GetOrCreateD3D11SRV(XboxPixelContainer* pTex, float* outUScale = nullptr, float* outVScale = nullptr);
+ID3D11ShaderResourceView* GetOrCreateD3D11SRV(XboxPixelContainer* pTex, float* outUScale = nullptr, float* outVScale = nullptr, bool* outIsCube = nullptr);
 void __cdecl Bridge_rlMain_SetRenderTarget(void* pTex, int bClear, int bFast);
 void InitXboxD3D8TextureBridges();
 
@@ -490,12 +497,19 @@ extern float           g_psConstants[8][4];
 extern int32_t         g_activeCustomVS;
 extern const uint32_t* g_curPrelitColors;
 extern uint32_t        g_curPrelitBaseVertex;
+extern const float*    g_curTangentBasis;
+extern uint32_t        g_curTangentBaseVertex;
 extern float           g_cloakDistort;
 extern float           g_cloakC35[4];
 extern float           g_shieldC35x;
 extern float           g_teleportC32[2];
 extern float           g_teleportC33x;
 extern float           g_motionBlurVec[4];
+extern float           g_embossScale;
+extern float           g_specularScale;
+extern float           g_detailUvScale[2];
+extern Mat44           g_lightProjMat0;
+extern Mat44           g_lightProjMat1;
 
 bool GetXboxVertexShaderDecl(uint32_t handle, XboxShaderDeclInfo* outDecl);
 void __stdcall Bridge_D3DDevice_SetVertexShader(uint32_t Handle);
