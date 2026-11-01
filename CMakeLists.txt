@@ -22,23 +22,28 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(Python3 REQUIRED COMPONENTS Interpreter)
-
-# Generate C++ raw string literal include from pure shaders/ghost.hlsl
+# Generate C++ raw string literal include from pure shaders/ghost.hlsl (native CMake, zero Python dependency)
 set(GHOST_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 set(GHOST_HLSL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ghost.hlsl")
 set(GHOST_HLSL_INC "${GHOST_GEN_DIR}/ghost_hlsl.inc")
+set(GHOST_EMBED_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_hlsl.cmake")
 
 add_custom_command(
     OUTPUT "${GHOST_HLSL_INC}"
-    COMMAND "${CMAKE_COMMAND}" -E make_directory "${GHOST_GEN_DIR}"
-    COMMAND "${Python3_EXECUTABLE}" -c
-        "import sys, pathlib; p = pathlib.Path(sys.argv[1]); out = pathlib.Path(sys.argv[2]); out.write_text('R\"GHOST_HLSL(\\n' + p.read_text(encoding='utf-8') + ')GHOST_HLSL\"\\n', encoding='utf-8')"
-        "${GHOST_HLSL_SRC}" "${GHOST_HLSL_INC}"
-    DEPENDS "${GHOST_HLSL_SRC}"
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSRC=${GHOST_HLSL_SRC}"
+        "-DDST=${GHOST_HLSL_INC}"
+        -P "${GHOST_EMBED_SCRIPT}"
+    DEPENDS "${GHOST_HLSL_SRC}" "${GHOST_EMBED_SCRIPT}"
     COMMENT "Embedding shaders/ghost.hlsl into generated/ghost_hlsl.inc"
     VERBATIM
 )
+
+# Native C++ post-build PE verifier & LoadConfig patcher (uses <windows.h> PE structs, zero Python dependency)
+add_executable(post_build_pe
+    cmake/post_build_pe.cpp
+)
+target_compile_definitions(post_build_pe PRIVATE _CRT_SECURE_NO_WARNINGS)
 
 # Define the GhostWin11 executable target
 # NOTE: src/xbox_space.cpp MUST be the first source file so the linker places '.xbox'
@@ -137,8 +142,9 @@ set_target_properties(GhostWin11 PROPERTIES
 )
 
 # Post-build verification & PE LoadConfig directory clearing
+add_dependencies(GhostWin11 post_build_pe)
 add_custom_command(TARGET GhostWin11 POST_BUILD
-    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/post_build_pe.py" "$<TARGET_FILE:GhostWin11>"
+    COMMAND "$<TARGET_FILE:post_build_pe>" "$<TARGET_FILE:GhostWin11>"
     COMMENT "Verifying .xbox section layout and clearing PE LoadConfig directory"
     VERBATIM
 )
