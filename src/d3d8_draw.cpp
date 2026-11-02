@@ -41,11 +41,21 @@ void __stdcall Bridge_D3DDevice_SetStreamSource(uint32_t StreamNumber, XboxVerte
         g_streams[StreamNumber].stride = Stride;
         *reinterpret_cast<uint32_t*>(ADDR_D3D_STREAM + StreamNumber * 12 + 0) = Stride;
         *reinterpret_cast<XboxVertexBuffer**>(ADDR_D3D_STREAM + StreamNumber * 12 + 8) = pStreamData;
-        if (StreamNumber == 1) {
-            g_curTangentBasis = (pStreamData && pStreamData->Data && Stride == 0x24)
-                ? reinterpret_cast<const float*>(pStreamData->Data)
-                : nullptr;
-            g_curTangentBaseVertex = 0;
+        if (StreamNumber == 0) {
+            g_curPrelitUseCustomBase = false;
+        } else if (StreamNumber == 1) {
+            if (Stride == 0x24) {
+                g_curTangentBasis = (pStreamData && pStreamData->Data)
+                    ? reinterpret_cast<const float*>(pStreamData->Data)
+                    : nullptr;
+                g_curTangentBaseVertex = 0;
+            } else if (Stride == 4) {
+                g_curPrelitColors = (pStreamData && pStreamData->Data)
+                    ? reinterpret_cast<const uint32_t*>(pStreamData->Data)
+                    : nullptr;
+                g_curPrelitBaseVertex    = 0;
+                g_curPrelitUseCustomBase = false;
+            }
         }
     }
 }
@@ -245,7 +255,8 @@ static void DecodeVerticesToUnified(
     uint32_t lightingMode = *reinterpret_cast<const uint32_t*>(ADDR_LIGHTING_MODE);
     bool lightingEnabled  = (xboxRS[102] != 0);
     bool pureDynamicMode  = (lightingMode == 4) || (lightingEnabled && xboxRS[111] == 0 && xboxRS[113] == 0); // SetLighting(4)
-    bool prelitOnlyMode   = (lightingMode == 2 && g_curPrelitColors != nullptr);
+    const bool hasPrelitColors = (g_curPrelitColors != nullptr) && (decl.hasStream1Diff || g_curPrelitUseCustomBase);
+    bool prelitOnlyMode   = (lightingMode == 2 && hasPrelitColors);
     float ambR = 0.0f, ambG = 0.0f, ambB = 0.0f, ambA = 1.0f;
     UnpackD3DColor(xboxRS[115], &ambR, &ambG, &ambB, &ambA);
     if (ambA <= 0.001f) ambA = 1.0f;
@@ -405,7 +416,7 @@ static void DecodeVerticesToUnified(
                 }
             }
         } else if (decl.hasNorm && !decl.hasRhw) {
-            if (lightingMode != 0 && (lightingEnabled || g_curPrelitColors != nullptr)) {
+            if (lightingMode != 0 && (lightingEnabled || hasPrelitColors)) {
                 float matDiffR = g_hasMaterial ? g_material.Diffuse[0] : 1.0f;
                 float matDiffG = g_hasMaterial ? g_material.Diffuse[1] : 1.0f;
                 float matDiffB = g_hasMaterial ? g_material.Diffuse[2] : 1.0f;
@@ -417,8 +428,10 @@ static void DecodeVerticesToUnified(
                 float totG = (!prelitOnlyMode && lightingEnabled) ? (ambG * matAmbG + (g_hasMaterial ? g_material.Emissive[1] : 0.0f)) : (g_hasMaterial ? g_material.Emissive[1] : 0.0f);
                 float totB = (!prelitOnlyMode && lightingEnabled) ? (ambB * matAmbB + (g_hasMaterial ? g_material.Emissive[2] : 0.0f)) : (g_hasMaterial ? g_material.Emissive[2] : 0.0f);
 
-                if (!pureDynamicMode && g_curPrelitColors != nullptr) {
-                    uint32_t preIdx = g_curPrelitBaseVertex + (optIndices ? (uint32_t)optIndices[i] : i);
+                if (!pureDynamicMode && hasPrelitColors) {
+                    uint32_t preIdx = g_curPrelitUseCustomBase
+                        ? (g_curPrelitBaseVertex + (optIndices ? (uint32_t)optIndices[i] : i))
+                        : vIdx;
                     float preR = 0.0f, preG = 0.0f, preB = 0.0f, preA = 1.0f;
                     UnpackD3DColor(g_curPrelitColors[preIdx], &preR, &preG, &preB, &preA);
                     totR += preR;
@@ -1356,12 +1369,469 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
     }
 }
 
+static void SubmitXvuDrawD3D11(
+    const XboxShaderDeclInfo& decl, uint32_t xboxPrim,
+    const uint8_t* stream0Data, uint32_t stream0Stride,
+    uint32_t vertexCount, const uint16_t* optIndices, uint32_t baseVertexIndex)
+{
+    if (!g_d3dDevice || !g_d3dCtx || !decl.gpuVS || !decl.gpuInputLayout || !g_cbVSConstants || !stream0Data || vertexCount == 0) return;
+
+    const uint32_t* xboxRS  = reinterpret_cast<const uint32_t*>(ADDR_D3D_RENDERSTATE);
+    const uint32_t* xboxTSS = reinterpret_cast<const uint32_t*>(ADDR_D3D_TEXTURESTATE);
+
+    D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    static std::vector<uint16_t> drawIndices;
+    drawIndices.clear();
+    bool useIB = false;
+
+    uint32_t firstVert = baseVertexIndex;
+    uint32_t numVerts  = vertexCount;
+
+    if (optIndices) {
+        uint16_t minIdx = 0xFFFFu;
+        uint16_t maxIdx = 0u;
+        for (uint32_t i = 0; i < vertexCount; ++i) {
+            uint16_t idx = optIndices[i];
+            if (idx < minIdx) minIdx = idx;
+            if (idx > maxIdx) maxIdx = idx;
+        }
+        if (minIdx > maxIdx) return;
+        firstVert = baseVertexIndex + minIdx;
+        numVerts  = (uint32_t)(maxIdx - minIdx) + 1u;
+        useIB     = true;
+
+        switch (xboxPrim) {
+            case 1: // POINTLIST
+                topo = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;
+                drawIndices.resize(vertexCount);
+                for (uint32_t i = 0; i < vertexCount; ++i) drawIndices[i] = (uint16_t)(optIndices[i] - minIdx);
+                break;
+            case 2: // LINELIST
+                if (vertexCount < 2) return;
+                topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST;
+                drawIndices.resize(vertexCount);
+                for (uint32_t i = 0; i < vertexCount; ++i) drawIndices[i] = (uint16_t)(optIndices[i] - minIdx);
+                break;
+            case 3: // LINELOOP
+                if (vertexCount < 2) return;
+                topo = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
+                drawIndices.resize(vertexCount + 1);
+                for (uint32_t i = 0; i < vertexCount; ++i) drawIndices[i] = (uint16_t)(optIndices[i] - minIdx);
+                drawIndices[vertexCount] = (uint16_t)(optIndices[0] - minIdx);
+                break;
+            case 4: // LINESTRIP
+                if (vertexCount < 2) return;
+                topo = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
+                drawIndices.resize(vertexCount);
+                for (uint32_t i = 0; i < vertexCount; ++i) drawIndices[i] = (uint16_t)(optIndices[i] - minIdx);
+                break;
+            case 5: // TRIANGLELIST
+                if (vertexCount < 3) return;
+                topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+                drawIndices.resize(vertexCount);
+                for (uint32_t i = 0; i < vertexCount; ++i) drawIndices[i] = (uint16_t)(optIndices[i] - minIdx);
+                break;
+            case 6: // TRIANGLESTRIP
+            case 9: // QUADSTRIP
+                if (vertexCount < 3) return;
+                topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
+                drawIndices.resize(vertexCount);
+                for (uint32_t i = 0; i < vertexCount; ++i) drawIndices[i] = (uint16_t)(optIndices[i] - minIdx);
+                break;
+            case 7: // TRIANGLEFAN
+            case 10: { // POLYGON
+                if (vertexCount < 3) return;
+                topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+                uint32_t numTris = vertexCount - 2;
+                drawIndices.resize(numTris * 3);
+                uint16_t i0 = (uint16_t)(optIndices[0] - minIdx);
+                for (uint32_t t = 0; t < numTris; ++t) {
+                    drawIndices[t * 3 + 0] = i0;
+                    drawIndices[t * 3 + 1] = (uint16_t)(optIndices[t + 1] - minIdx);
+                    drawIndices[t * 3 + 2] = (uint16_t)(optIndices[t + 2] - minIdx);
+                }
+                break;
+            }
+            case 8: { // QUADLIST
+                uint32_t numQuads = vertexCount / 4;
+                if (numQuads == 0) return;
+                topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+                drawIndices.resize(numQuads * 6);
+                for (uint32_t q = 0; q < numQuads; ++q) {
+                    uint16_t q0 = (uint16_t)(optIndices[q * 4 + 0] - minIdx);
+                    uint16_t q1 = (uint16_t)(optIndices[q * 4 + 1] - minIdx);
+                    uint16_t q2 = (uint16_t)(optIndices[q * 4 + 2] - minIdx);
+                    uint16_t q3 = (uint16_t)(optIndices[q * 4 + 3] - minIdx);
+                    drawIndices[q * 6 + 0] = q0;
+                    drawIndices[q * 6 + 1] = q1;
+                    drawIndices[q * 6 + 2] = q2;
+                    drawIndices[q * 6 + 3] = q0;
+                    drawIndices[q * 6 + 4] = q2;
+                    drawIndices[q * 6 + 5] = q3;
+                }
+                break;
+            }
+            default:
+                return;
+        }
+    } else {
+        switch (xboxPrim) {
+            case 1: // POINTLIST
+                topo = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;
+                break;
+            case 2: // LINELIST
+                if (numVerts < 2) return;
+                topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST;
+                break;
+            case 3: // LINELOOP
+                if (numVerts < 2) return;
+                topo  = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
+                useIB = true;
+                drawIndices.resize(numVerts + 1);
+                for (uint32_t i = 0; i < numVerts; ++i) drawIndices[i] = (uint16_t)i;
+                drawIndices[numVerts] = 0;
+                break;
+            case 4: // LINESTRIP
+                if (numVerts < 2) return;
+                topo = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
+                break;
+            case 5: // TRIANGLELIST
+                if (numVerts < 3) return;
+                topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+                break;
+            case 6: // TRIANGLESTRIP
+            case 9: // QUADSTRIP
+                if (numVerts < 3) return;
+                topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
+                break;
+            case 7: // TRIANGLEFAN
+            case 10: { // POLYGON
+                if (numVerts < 3) return;
+                topo  = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+                useIB = true;
+                uint32_t numTris = numVerts - 2;
+                drawIndices.resize(numTris * 3);
+                for (uint32_t t = 0; t < numTris; ++t) {
+                    drawIndices[t * 3 + 0] = 0;
+                    drawIndices[t * 3 + 1] = (uint16_t)(t + 1);
+                    drawIndices[t * 3 + 2] = (uint16_t)(t + 2);
+                }
+                break;
+            }
+            case 8: { // QUADLIST
+                uint32_t numQuads = numVerts / 4;
+                if (numQuads == 0) return;
+                topo  = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+                useIB = true;
+                drawIndices.resize(numQuads * 6);
+                for (uint32_t q = 0; q < numQuads; ++q) {
+                    drawIndices[q * 6 + 0] = (uint16_t)(q * 4 + 0);
+                    drawIndices[q * 6 + 1] = (uint16_t)(q * 4 + 1);
+                    drawIndices[q * 6 + 2] = (uint16_t)(q * 4 + 2);
+                    drawIndices[q * 6 + 3] = (uint16_t)(q * 4 + 0);
+                    drawIndices[q * 6 + 4] = (uint16_t)(q * 4 + 2);
+                    drawIndices[q * 6 + 5] = (uint16_t)(q * 4 + 3);
+                }
+                break;
+            }
+            default:
+                return;
+        }
+    }
+
+    static ID3D11Buffer* s_dynStreamVB[2] = { nullptr, nullptr };
+    static uint32_t      s_dynStreamCap[2] = { 0, 0 };
+    static uint32_t      s_dynStreamOff[2] = { 0, 0 };
+    UINT strides[2] = { 0, 0 };
+    UINT byteOff[2] = { 0, 0 };
+
+    auto uploadStreamSlice = [&](uint32_t slot, const uint8_t* basePtr, uint32_t stride, uint32_t firstV, uint32_t countV) -> bool {
+        if (stride == 0 || countV == 0) return false;
+        uint32_t bytesNeeded = countV * stride;
+        uint32_t alignedBytes = (bytesNeeded + 15u) & ~15u;
+        if (!s_dynStreamVB[slot] || alignedBytes > s_dynStreamCap[slot]) {
+            if (s_dynStreamVB[slot]) { s_dynStreamVB[slot]->Release(); s_dynStreamVB[slot] = nullptr; }
+            s_dynStreamCap[slot] = (alignedBytes > 2 * 1024 * 1024) ? (alignedBytes * 2) : (2 * 1024 * 1024);
+            s_dynStreamOff[slot] = 0;
+            D3D11_BUFFER_DESC bd = {};
+            bd.ByteWidth      = s_dynStreamCap[slot];
+            bd.Usage          = D3D11_USAGE_DYNAMIC;
+            bd.BindFlags      = D3D11_BIND_VERTEX_BUFFER;
+            bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            if (FAILED(g_d3dDevice->CreateBuffer(&bd, nullptr, &s_dynStreamVB[slot]))) return false;
+        }
+        D3D11_MAP mapMode = D3D11_MAP_WRITE_NO_OVERWRITE;
+        if (s_dynStreamOff[slot] == 0 || (s_dynStreamOff[slot] + alignedBytes) > s_dynStreamCap[slot]) {
+            mapMode = D3D11_MAP_WRITE_DISCARD;
+            s_dynStreamOff[slot] = 0;
+        }
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (FAILED(g_d3dCtx->Map(s_dynStreamVB[slot], 0, mapMode, 0, &mapped))) return false;
+        uint8_t* dst = reinterpret_cast<uint8_t*>(mapped.pData) + s_dynStreamOff[slot];
+        if (basePtr) {
+            memcpy(dst, basePtr + firstV * stride, bytesNeeded);
+        } else {
+            memset(dst, 0, bytesNeeded);
+        }
+        g_d3dCtx->Unmap(s_dynStreamVB[slot], 0);
+        strides[slot] = stride;
+        byteOff[slot] = s_dynStreamOff[slot];
+        s_dynStreamOff[slot] += alignedBytes;
+        return true;
+    };
+
+    uint32_t s0 = (stream0Stride != 0) ? stream0Stride : decl.streamStrides[0];
+    if (!uploadStreamSlice(0, stream0Data, s0, firstVert, numVerts)) return;
+
+    uint32_t numStreams = 1u;
+    if (decl.usesStream[1]) {
+        uint32_t s1 = (decl.streamStrides[1] != 0) ? decl.streamStrides[1] : g_streams[1].stride;
+        const uint8_t* p1 = (g_streams[1].stride == s1) ? reinterpret_cast<const uint8_t*>(g_streams[1].data) : nullptr;
+        if (!uploadStreamSlice(1, p1, s1, firstVert, numVerts)) return;
+        numStreams = 2u;
+    }
+
+    static ID3D11Buffer* s_dynIB    = nullptr;
+    static uint32_t      s_dynIBCap = 0;
+    static uint32_t      s_dynIBOff = 0;
+    uint32_t startIndex   = 0;
+    uint32_t drawIdxCount = (uint32_t)drawIndices.size();
+    if (useIB) {
+        if (drawIdxCount == 0) return;
+        if (!s_dynIB || drawIdxCount > s_dynIBCap) {
+            if (s_dynIB) { s_dynIB->Release(); s_dynIB = nullptr; }
+            s_dynIBCap = (drawIdxCount > 131072u) ? (drawIdxCount * 2u) : 131072u;
+            s_dynIBOff = 0;
+            D3D11_BUFFER_DESC ibd = {};
+            ibd.ByteWidth      = s_dynIBCap * sizeof(uint16_t);
+            ibd.Usage          = D3D11_USAGE_DYNAMIC;
+            ibd.BindFlags      = D3D11_BIND_INDEX_BUFFER;
+            ibd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            if (FAILED(g_d3dDevice->CreateBuffer(&ibd, nullptr, &s_dynIB))) return;
+        }
+        D3D11_MAP ibMapMode = D3D11_MAP_WRITE_NO_OVERWRITE;
+        if (s_dynIBOff == 0 || (s_dynIBOff + drawIdxCount) > s_dynIBCap) {
+            ibMapMode  = D3D11_MAP_WRITE_DISCARD;
+            s_dynIBOff = 0;
+        }
+        D3D11_MAPPED_SUBRESOURCE mappedIB = {};
+        if (FAILED(g_d3dCtx->Map(s_dynIB, 0, ibMapMode, 0, &mappedIB))) return;
+        memcpy(reinterpret_cast<uint16_t*>(mappedIB.pData) + s_dynIBOff, drawIndices.data(), drawIdxCount * sizeof(uint16_t));
+        g_d3dCtx->Unmap(s_dynIB, 0);
+        startIndex = s_dynIBOff;
+        s_dynIBOff += drawIdxCount;
+    }
+
+    // Update Xbox NV2A hardware viewport constants c[58] (scale) and c[59] (offset)
+    float vpX    = (float)g_viewport.X;
+    float vpY    = (float)g_viewport.Y;
+    float vpW    = (float)(g_viewport.Width  ? g_viewport.Width  : 640);
+    float vpH    = (float)(g_viewport.Height ? g_viewport.Height : 480);
+    float vpMinZ = g_viewport.MinZ;
+    float vpMaxZ = (g_viewport.MaxZ > g_viewport.MinZ) ? g_viewport.MaxZ : 1.0f;
+    float* vsConsts = reinterpret_cast<float*>(ADDR_D3D_VS_CONSTANTS);
+    vsConsts[58 * 4 + 0] =  vpW * 0.5f;
+    vsConsts[58 * 4 + 1] = -vpH * 0.5f;
+    vsConsts[58 * 4 + 2] =  vpMaxZ - vpMinZ;
+    vsConsts[58 * 4 + 3] =  1.0f;
+    vsConsts[59 * 4 + 0] =  vpX + vpW * 0.5f;
+    vsConsts[59 * 4 + 1] =  vpY + vpH * 0.5f;
+    vsConsts[59 * 4 + 2] =  vpMinZ;
+    vsConsts[59 * 4 + 3] =  0.0f;
+
+    D3D11_MAPPED_SUBRESOURCE mappedVS = {};
+    if (SUCCEEDED(g_d3dCtx->Map(g_cbVSConstants, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedVS))) {
+        memcpy(mappedVS.pData, reinterpret_cast<const void*>(ADDR_D3D_VS_CONSTANTS), 192 * 16);
+        g_d3dCtx->Unmap(g_cbVSConstants, 0);
+    }
+
+    float uScale[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    float vScale[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    bool  isCube[4] = { false, false, false, false };
+    ID3D11ShaderResourceView* srvs[4] = {
+        GetOrCreateD3D11SRV(g_boundTextures[0], &uScale[0], &vScale[0], &isCube[0]),
+        GetOrCreateD3D11SRV(g_boundTextures[1], &uScale[1], &vScale[1], &isCube[1]),
+        GetOrCreateD3D11SRV(g_boundTextures[2], &uScale[2], &vScale[2], &isCube[2]),
+        GetOrCreateD3D11SRV(g_boundTextures[3], &uScale[3], &vScale[3], &isCube[3])
+    };
+
+    PerDrawCBData cb = {};
+    Mat44 wvp = MulMat44(MulMat44(g_matWorld, g_matView), g_matProj);
+    for (int i = 0; i < 4; ++i) {
+        cb.wvpRow0[i] = wvp.m[0][i];
+        cb.wvpRow1[i] = wvp.m[1][i];
+        cb.wvpRow2[i] = wvp.m[2][i];
+        cb.wvpRow3[i] = wvp.m[3][i];
+    }
+    cb.viewport[0] = vpX;
+    cb.viewport[1] = vpY;
+    cb.viewport[2] = vpW;
+    cb.viewport[3] = vpH;
+
+    UnpackD3DColor(xboxRS[XBOX_D3DRS_TEXTUREFACTOR], &cb.tfactor[0], &cb.tfactor[1], &cb.tfactor[2], &cb.tfactor[3]);
+
+    uint32_t* stageOpsPtrs[4]   = { cb.stage0Ops,   cb.stage1Ops,   cb.stage2Ops,   cb.stage3Ops   };
+    uint32_t* stageAlphaPtrs[4] = { cb.stage0Alpha, cb.stage1Alpha, cb.stage2Alpha, cb.stage3Alpha };
+    for (int s = 0; s < 4; ++s) {
+        stageOpsPtrs[s][0]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLOROP];
+        stageOpsPtrs[s][1]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORARG1];
+        stageOpsPtrs[s][2]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORARG2];
+        stageOpsPtrs[s][3]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORARG0];
+        stageAlphaPtrs[s][0] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAOP];
+        stageAlphaPtrs[s][1] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG1];
+        stageAlphaPtrs[s][2] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG2];
+        stageAlphaPtrs[s][3] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG0];
+    }
+
+    uint32_t texMask  = 0;
+    uint32_t cubeMask = 0;
+    for (int s = 0; s < 4; ++s) {
+        if (srvs[s]) {
+            texMask |= (1u << s);
+            if (isCube[s]) cubeMask |= (1u << s);
+        }
+    }
+
+    cb.flags[0] = decl.hasRhw ? 1u : 0u;
+    cb.flags[1] = texMask | (cubeMask << 4);
+    cb.flags[2] = xboxRS[XBOX_D3DRS_ALPHATESTENABLE] ? 1u : 0u;
+    cb.flags[3] = (g_currentPsHandle != 0 && g_currentPsType >= 0) ? (uint32_t)(g_currentPsType + 1) : 0u;
+
+    cb.alphaTest[0] = (float)MapXboxCmpFuncInt(xboxRS[XBOX_D3DRS_ALPHAFUNC]);
+    cb.alphaTest[1] = (float)(xboxRS[XBOX_D3DRS_ALPHAREF] & 0xFFu) * (1.0f / 255.0f);
+    cb.alphaTest[2] = g_gamma;
+    cb.alphaTest[3] = g_brightness;
+
+    cb.uvScale01[0] = uScale[0]; cb.uvScale01[1] = vScale[0];
+    cb.uvScale01[2] = uScale[1]; cb.uvScale01[3] = vScale[1];
+    cb.uvScale23[0] = uScale[2]; cb.uvScale23[1] = vScale[2];
+    cb.uvScale23[2] = uScale[3]; cb.uvScale23[3] = vScale[3];
+
+    const uint32_t* bumpMat1 = &xboxTSS[1 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVMAT00];
+    const uint32_t* bumpMat0 = &xboxTSS[0 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVMAT00];
+    const uint32_t* chosenBump = (bumpMat1[0] || bumpMat1[1] || bumpMat1[2] || bumpMat1[3]) ? bumpMat1 : bumpMat0;
+    memcpy(&cb.bumpParams[0], chosenBump, 16);
+    if (cb.bumpParams[0] == 0.0f && cb.bumpParams[1] == 0.0f && cb.bumpParams[2] == 0.0f && cb.bumpParams[3] == 0.0f) {
+        cb.bumpParams[0] = 0.04f;
+        cb.bumpParams[3] = 0.04f;
+    }
+
+    if (xboxRS[XBOX_D3DRS_FOGENABLE] != 0 && !decl.hasRhw) {
+        uint32_t fogMode = xboxRS[XBOX_D3DRS_FOGTABLEMODE];
+        if (fogMode == 0) fogMode = 3;
+        cb.fogParams[0] = (float)fogMode;
+        memcpy(&cb.fogParams[1], &xboxRS[XBOX_D3DRS_FOGSTART], 4);
+        memcpy(&cb.fogParams[2], &xboxRS[XBOX_D3DRS_FOGEND], 4);
+        memcpy(&cb.fogParams[3], &xboxRS[XBOX_D3DRS_FOGDENSITY], 4);
+        float fA = 1.0f;
+        UnpackD3DColor(xboxRS[XBOX_D3DRS_FOGCOLOR], &cb.fogColor[0], &cb.fogColor[1], &cb.fogColor[2], &fA);
+        bool isAddBlend = (xboxRS[XBOX_D3DRS_ALPHABLENDENABLE] != 0) && (xboxRS[XBOX_D3DRS_DESTBLEND] == 1 || xboxRS[XBOX_D3DRS_DESTBLEND] == 0x302);
+        cb.fogColor[3] = isAddBlend ? 1.0f : 0.0f;
+    }
+
+    memcpy(cb.psConst0, g_psConstants[0], 16);
+    memcpy(cb.psConst1, g_psConstants[1], 16);
+    memcpy(cb.psConst2, g_psConstants[2], 16);
+    memcpy(cb.psConst3, g_psConstants[3], 16);
+    memcpy(cb.psConst4, g_psConstants[4], 16);
+    memcpy(cb.psConst5, g_psConstants[5], 16);
+    memcpy(cb.psConst6, g_psConstants[6], 16);
+    memcpy(cb.psConst7, g_psConstants[7], 16);
+
+    D3D11_MAPPED_SUBRESOURCE mappedCB = {};
+    if (SUCCEEDED(g_d3dCtx->Map(g_cbPerDraw, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedCB))) {
+        memcpy(mappedCB.pData, &cb, sizeof(cb));
+        g_d3dCtx->Unmap(g_cbPerDraw, 0);
+    }
+
+    uint32_t cwRaw = xboxRS[XBOX_D3DRS_COLORWRITEENABLE];
+    uint32_t cwMask = 0x0Fu;
+    if (cwRaw == 0) {
+        cwMask = 0;
+    } else if (cwRaw <= 0x0Fu) {
+        cwMask = cwRaw;
+    } else {
+        cwMask = 0;
+        if (cwRaw & 0x00FF0000u) cwMask |= D3D11_COLOR_WRITE_ENABLE_RED;
+        if (cwRaw & 0x0000FF00u) cwMask |= D3D11_COLOR_WRITE_ENABLE_GREEN;
+        if (cwRaw & 0x000000FFu) cwMask |= D3D11_COLOR_WRITE_ENABLE_BLUE;
+        if (cwRaw & 0xFF000000u) cwMask |= D3D11_COLOR_WRITE_ENABLE_ALPHA;
+    }
+
+    ID3D11BlendState* bs = GetBlendState(
+        xboxRS[XBOX_D3DRS_ALPHABLENDENABLE], xboxRS[XBOX_D3DRS_SRCBLEND],
+        xboxRS[XBOX_D3DRS_DESTBLEND], xboxRS[XBOX_D3DRS_BLENDOP], cwMask);
+    ID3D11DepthStencilState* ds = GetDepthState(
+        xboxRS[XBOX_D3DRS_ZENABLE], xboxRS[XBOX_D3DRS_ZWRITEENABLE], xboxRS[XBOX_D3DRS_ZFUNC],
+        xboxRS[XBOX_D3DRS_STENCILENABLE], xboxRS[XBOX_D3DRS_STENCILFAIL],
+        xboxRS[XBOX_D3DRS_STENCILZFAIL], xboxRS[XBOX_D3DRS_STENCILPASS],
+        xboxRS[XBOX_D3DRS_STENCILFUNC], xboxRS[XBOX_D3DRS_STENCILMASK], xboxRS[XBOX_D3DRS_STENCILWRITEMASK]);
+    uint32_t cull = decl.hasRhw ? 0 : xboxRS[XBOX_D3DRS_CULLMODE];
+    ID3D11RasterizerState* rs = GetRastState(
+        cull, xboxRS[XBOX_D3DRS_FILLMODE], xboxRS[XBOX_D3DRS_ZBIAS], g_scissorEnabled);
+
+    D3D11_VIEWPORT vp11 = {};
+    vp11.TopLeftX = vpX;
+    vp11.TopLeftY = vpY;
+    vp11.Width    = vpW;
+    vp11.Height   = vpH;
+    vp11.MinDepth = decl.hasRhw ? 0.0f : vpMinZ;
+    vp11.MaxDepth = decl.hasRhw ? 1.0f : vpMaxZ;
+    g_d3dCtx->RSSetViewports(1, &vp11);
+
+    ID3D11SamplerState* smps[4] = {
+        GetSamplerState(xboxTSS[0 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ADDRESSU], xboxTSS[0 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ADDRESSV], xboxTSS[0 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_MAGFILTER], xboxTSS[0 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BORDERCOLOR]),
+        GetSamplerState(xboxTSS[1 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ADDRESSU], xboxTSS[1 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ADDRESSV], xboxTSS[1 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_MAGFILTER], xboxTSS[1 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BORDERCOLOR]),
+        GetSamplerState(xboxTSS[2 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ADDRESSU], xboxTSS[2 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ADDRESSV], xboxTSS[2 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_MAGFILTER], xboxTSS[2 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BORDERCOLOR]),
+        GetSamplerState(xboxTSS[3 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ADDRESSU], xboxTSS[3 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ADDRESSV], xboxTSS[3 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_MAGFILTER], xboxTSS[3 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BORDERCOLOR])
+    };
+
+    float blendFactor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    g_d3dCtx->OMSetBlendState(bs, blendFactor, 0xFFFFFFFFu);
+    g_d3dCtx->OMSetDepthStencilState(ds, xboxRS[XBOX_D3DRS_STENCILREF] & 0xFFu);
+    g_d3dCtx->RSSetState(rs);
+
+    g_d3dCtx->IASetInputLayout(decl.gpuInputLayout);
+    g_d3dCtx->IASetVertexBuffers(0, numStreams, s_dynStreamVB, strides, byteOff);
+    g_d3dCtx->IASetPrimitiveTopology(topo);
+
+    ID3D11Buffer* cbVBs[2] = { g_cbPerDraw, g_cbVSConstants };
+    g_d3dCtx->VSSetShader(decl.gpuVS, nullptr, 0);
+    g_d3dCtx->VSSetConstantBuffers(0, 2, cbVBs);
+    ID3D11PixelShader* activePS = GetPixelShaderPermutation(cb.flags[3]);
+    g_d3dCtx->PSSetShader(activePS ? activePS : g_ps, nullptr, 0);
+    g_d3dCtx->PSSetConstantBuffers(0, 1, &g_cbPerDraw);
+
+    g_d3dCtx->PSSetShaderResources(0, 4, srvs);
+    g_d3dCtx->PSSetSamplers(0, 4, smps);
+
+    if (useIB) {
+        g_d3dCtx->IASetIndexBuffer(s_dynIB, DXGI_FORMAT_R16_UINT, 0);
+        g_d3dCtx->DrawIndexed(drawIdxCount, startIndex, 0);
+    } else {
+        g_d3dCtx->Draw(numVerts, 0);
+    }
+
+    if (g_curOffscreenRT == nullptr) {
+        g_backBufferDirty = true;
+    }
+}
+
 static void __stdcall Bridge_D3DDevice_DrawVerticesUP(
     DWORD PrimitiveType, UINT VertexCount, const void* pVertexStreamZeroData, UINT VertexStreamZeroStride)
 {
-    g_curPrelitColors = nullptr;
-    g_activeCustomVS  = 0;
+    g_curPrelitUseCustomBase = false;
+    g_activeCustomVS         = 0;
     if (!pVertexStreamZeroData || VertexCount == 0 || VertexStreamZeroStride == 0) return;
+
+    XboxShaderDeclInfo decl = {};
+    if (GetXboxVertexShaderDecl(g_currentVsHandle, &decl) && decl.isCompiledXvu && decl.gpuVS && decl.gpuInputLayout) {
+        SubmitXvuDrawD3D11(
+            decl, PrimitiveType,
+            reinterpret_cast<const uint8_t*>(pVertexStreamZeroData),
+            VertexStreamZeroStride, VertexCount, nullptr, 0);
+        return;
+    }
 
     static std::vector<UnifiedVertex> verts;
     verts.clear();
@@ -1376,12 +1846,24 @@ static void __stdcall Bridge_D3DDevice_DrawVertices(
     DWORD PrimitiveType, UINT StartVertex, UINT VertexCount)
 {
     if (!g_streams[0].data || g_streams[0].stride == 0 || VertexCount == 0) return;
+
+    XboxShaderDeclInfo decl = {};
+    if (GetXboxVertexShaderDecl(g_currentVsHandle, &decl) && decl.isCompiledXvu && decl.gpuVS && decl.gpuInputLayout) {
+        SubmitXvuDrawD3D11(
+            decl, PrimitiveType,
+            reinterpret_cast<const uint8_t*>(g_streams[0].data),
+            g_streams[0].stride, VertexCount, nullptr, StartVertex);
+        g_curPrelitUseCustomBase = false;
+        return;
+    }
+
     static std::vector<UnifiedVertex> verts;
     verts.clear();
     bool isRhw = false;
     DecodeVerticesToUnified(
         reinterpret_cast<const uint8_t*>(g_streams[0].data),
         g_streams[0].stride, VertexCount, nullptr, StartVertex, verts, &isRhw);
+    g_curPrelitUseCustomBase = false;
     SubmitUnifiedVerticesD3D11(PrimitiveType, verts, isRhw);
 }
 
@@ -1390,20 +1872,31 @@ static void __stdcall Bridge_D3DDevice_DrawIndexedVertices(
 {
     if (!g_streams[0].data || g_streams[0].stride == 0 || !pIndexData || VertexCount == 0) return;
 
+    XboxShaderDeclInfo decl = {};
+    bool hasDecl = GetXboxVertexShaderDecl(g_currentVsHandle, &decl);
+    if (hasDecl && decl.isCompiledXvu && decl.gpuVS && decl.gpuInputLayout) {
+        SubmitXvuDrawD3D11(
+            decl, PrimitiveType,
+            reinterpret_cast<const uint8_t*>(g_streams[0].data),
+            g_streams[0].stride, VertexCount, pIndexData, g_baseVertexIndex);
+        g_curPrelitUseCustomBase = false;
+        return;
+    }
+
     static std::vector<UnifiedVertex> verts;
     verts.clear();
     bool isRhw = false;
     DecodeVerticesToUnified(
         reinterpret_cast<const uint8_t*>(g_streams[0].data),
         g_streams[0].stride, VertexCount, pIndexData, g_baseVertexIndex, verts, &isRhw);
+    g_curPrelitUseCustomBase = false;
     SubmitUnifiedVerticesD3D11(PrimitiveType, verts, isRhw);
 }
 
 // _D3DDevice_RunPushBuffer@8 (0x006BACD0) - executes terrain & world pushbuffers
 static void __stdcall Bridge_D3DDevice_RunPushBuffer(XboxPushBuffer* pPushBuffer, void* pFixup) {
     (void)pFixup;
-    g_curPrelitColors = nullptr;
-    g_activeCustomVS  = 0;
+    g_activeCustomVS = 0;
     if (!pPushBuffer || !pPushBuffer->Data || pPushBuffer->Size < 8) return;
 
     const uint32_t* p = reinterpret_cast<const uint32_t*>(pPushBuffer->Data);

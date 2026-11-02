@@ -416,24 +416,34 @@ struct alignas(16) PerDrawCBData {
 };
 #pragma pack(pop)
 
+struct ID3D11VertexShader;
+struct ID3D11InputLayout;
+
 struct XboxShaderDeclInfo {
-    bool     hasPos;
-    bool     hasRhw;
-    bool     hasNorm;
-    bool     hasDiff;
-    bool     hasUv0;
-    bool     hasUv1;
-    bool     hasUv2;
-    bool     hasUv3;
-    uint16_t offPos;
-    uint16_t offRhw;
-    uint16_t offNorm;
-    uint16_t offDiff;
-    uint16_t offUv0;
-    uint16_t offUv1;
-    uint16_t offUv2;
-    uint16_t offUv3;
-    int32_t  vsType; // 0..65 if from aVertexShaders[0..65] at 0x007D0BE0, else -1
+    bool                hasPos;
+    bool                hasRhw;
+    bool                hasNorm;
+    bool                hasDiff;
+    bool                hasUv0;
+    bool                hasUv1;
+    bool                hasUv2;
+    bool                hasUv3;
+    uint16_t            offPos;
+    uint16_t            offRhw;
+    uint16_t            offNorm;
+    uint16_t            offDiff;
+    uint16_t            offUv0;
+    uint16_t            offUv1;
+    uint16_t            offUv2;
+    uint16_t            offUv3;
+    int32_t             vsType; // 0..65 if from aVertexShaders[0..65] at 0x007D0BE0, else -1
+    bool                hasStream1Diff;
+    uint16_t            offStream1Diff;
+    bool                isCompiledXvu;
+    ID3D11VertexShader* gpuVS;
+    ID3D11InputLayout*  gpuInputLayout;
+    uint16_t            streamStrides[2];
+    bool                usesStream[2];
 };
 
 // ============================================================================
@@ -477,6 +487,7 @@ extern ID3D11VertexShader*       g_vs;
 extern ID3D11PixelShader*        g_ps;
 extern ID3D11InputLayout*        g_inputLayout;
 extern ID3D11Buffer*             g_cbPerDraw;
+extern ID3D11Buffer*             g_cbVSConstants;
 extern ID3D11Buffer*             g_dynVB;
 extern uint32_t                  g_dynVBCapacity;
 
@@ -509,6 +520,7 @@ extern float           g_psConstants[8][4];
 extern int32_t         g_activeCustomVS;
 extern const uint32_t* g_curPrelitColors;
 extern uint32_t        g_curPrelitBaseVertex;
+extern bool            g_curPrelitUseCustomBase;
 extern const float*    g_curTangentBasis;
 extern uint32_t        g_curTangentBaseVertex;
 extern float           g_cloakDistort;

@@ -70,10 +70,10 @@ struct VSIn {
 struct PSIn {
     float4 pos    : SV_POSITION;
     float4 color  : COLOR0;
-    float2 uv0    : TEXCOORD0;
-    float2 uv1    : TEXCOORD1;
-    float2 uv2    : TEXCOORD2;
-    float2 uv3    : TEXCOORD3;
+    float4 uv0    : TEXCOORD0;
+    float4 uv1    : TEXCOORD1;
+    float4 uv2    : TEXCOORD2;
+    float4 uv3    : TEXCOORD3;
     float2 eyeDist: TEXCOORD4;
     float3 norm   : TEXCOORD5;
 };
@@ -141,10 +141,10 @@ PSIn VSMain(VSIn input) {
     } else {
         o.color = input.color;
     }
-    o.uv0   = input.uv0 * uUvScale01.xy;
-    o.uv1   = input.uv1 * uUvScale01.zw;
-    o.uv2   = input.uv2 * uUvScale23.xy;
-    o.uv3   = input.uv3 * uUvScale23.zw;
+    o.uv0   = float4(input.uv0 * uUvScale01.xy, 0.0f, 0.0f);
+    o.uv1   = float4(input.uv1 * uUvScale01.zw, 0.0f, 0.0f);
+    o.uv2   = float4(input.uv2 * uUvScale23.xy, 0.0f, 0.0f);
+    o.uv3   = float4(input.uv3 * uUvScale23.zw, 0.0f, 0.0f);
     o.norm  = input.norm;
     return o;
 }
@@ -174,11 +174,14 @@ float4 SampleCubeAtlas(Texture2D tex, SamplerState smp, float3 dir) {
     return tex.Sample(smp, float2((face + u) * (1.0f / 6.0f), v));
 }
 
-float4 SampleStage2D(Texture2D tex, SamplerState smp, float2 uv, bool isCubeAtlas) {
-    float2 sampleUv = isCubeAtlas
-        ? float2(clamp(frac(uv.x), 0.004f, 0.996f) * (1.0f / 6.0f), clamp(frac(uv.y), 0.004f, 0.996f))
-        : uv;
-    return tex.Sample(smp, sampleUv);
+float4 SampleStage2D(Texture2D tex, SamplerState smp, float4 uv, bool isCubeAtlas) {
+    if (isCubeAtlas) {
+        if (uv.w != 0.0f) {
+            return SampleCubeAtlas(tex, smp, uv.xyz);
+        }
+        return tex.Sample(smp, float2(clamp(frac(uv.x), 0.004f, 0.996f) * (1.0f / 6.0f), clamp(frac(uv.y), 0.004f, 0.996f)));
+    }
+    return tex.Sample(smp, uv.xy);
 }
 
 float4 EvalArg(uint arg, float4 diffuse, float4 current, float4 tex, float4 tfactor, float4 spec) {
@@ -276,10 +279,10 @@ float4 PSMain(PSIn input) : SV_TARGET {
 #endif
 
     float invProjQ = (projMask != 0u && abs(input.eyeDist.y) > 0.0001f) ? (1.0f / input.eyeDist.y) : 1.0f;
-    float2 uv0 = ((projMask & 1u) != 0u) ? (input.uv0 * invProjQ) : input.uv0;
-    float2 uv1 = ((projMask & 2u) != 0u) ? (input.uv1 * invProjQ) : input.uv1;
-    float2 uv2 = ((projMask & 4u) != 0u) ? (input.uv2 * invProjQ) : input.uv2;
-    float2 uv3 = ((projMask & 8u) != 0u) ? (input.uv3 * invProjQ) : input.uv3;
+    float4 uv0 = ((projMask & 1u) != 0u) ? float4(input.uv0.xy * invProjQ, input.uv0.zw) : input.uv0;
+    float4 uv1 = ((projMask & 2u) != 0u) ? float4(input.uv1.xy * invProjQ, input.uv1.zw) : input.uv1;
+    float4 uv2 = ((projMask & 4u) != 0u) ? float4(input.uv2.xy * invProjQ, input.uv2.zw) : input.uv2;
+    float4 uv3 = ((projMask & 8u) != 0u) ? float4(input.uv3.xy * invProjQ, input.uv3.zw) : input.uv3;
 
     float4 t0 = ((texMask & 1u) != 0u) ? SampleStage2D(tex0, smp0, uv0, (cubeMask & 1u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);
     float4 t1 = ((texMask & 2u) != 0u) ? SampleStage2D(tex1, smp1, uv1, (cubeMask & 2u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);
@@ -287,12 +290,12 @@ float4 PSMain(PSIn input) : SV_TARGET {
     // Apply BumpEnv UV offset if stage 0 / stage 1 uses BUMPENVMAP (22 without SPECULAR arg2) or texbem t1, t0 pixel shaders (emBump=1, lava=2, heatShimmer=3)
     if ((uStage0Ops.x == 22u && (uStage0Ops.z & 0x0Fu) != 4u) || psMode == 1u || psMode == 2u || psMode == 3u) {
         float2 d = t0.rg * 2.0f - 1.0f;
-        uv1 += float2(d.x * uBumpParams.x + d.y * uBumpParams.z, d.x * uBumpParams.y + d.y * uBumpParams.w);
+        uv1.xy += float2(d.x * uBumpParams.x + d.y * uBumpParams.z, d.x * uBumpParams.y + d.y * uBumpParams.w);
         if ((texMask & 2u) != 0u) t1 = SampleStage2D(tex1, smp1, uv1, (cubeMask & 2u) != 0u);
     }
     if (uStage1Ops.x == 22u && (uStage1Ops.z & 0x0Fu) != 4u) {
         float2 d = t1.rg * 2.0f - 1.0f;
-        uv2 += float2(d.x * uBumpParams.x + d.y * uBumpParams.z, d.x * uBumpParams.y + d.y * uBumpParams.w);
+        uv2.xy += float2(d.x * uBumpParams.x + d.y * uBumpParams.z, d.x * uBumpParams.y + d.y * uBumpParams.w);
     }
 
     float4 t2 = ((texMask & 4u) != 0u) ? SampleStage2D(tex2, smp2, uv2, (cubeMask & 4u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);
@@ -320,12 +323,10 @@ float4 PSMain(PSIn input) : SV_TARGET {
             current = r0 * t0;
         } else if (pt == 6u) { // bumpreflect.xpu: tex t0; texm3x3pad t1, t0; texm3x3pad t2, t0; texm3x3vspec t3, t0; mov r0, t3
             float3 nTs = t0.rgb * 2.0f - 1.0f;
-            float3 Tw  = float3(uv1.x, uv1.y, uv2.x);
-            float3 Bw  = float3(uv2.y, uv3.x, uv3.y);
-            float3 Nw  = cross(Tw, Bw);
-            float3 Np  = (dot(Nw, Nw) > 0.0001f) ? normalize(nTs.x * Tw + nTs.y * Bw + nTs.z * Nw) : normalize(nTs);
-            float3 Vw  = (dot(input.norm, input.norm) > 0.0001f) ? normalize(input.norm) : float3(0.0f, 0.0f, 1.0f);
-            float3 R   = reflect(-Vw, Np);
+            float3 uvw = float3(dot(uv1.xyz, nTs), dot(uv2.xyz, nTs), dot(uv3.xyz, nTs));
+            float3 Vw  = float3(uv1.w, uv2.w, uv3.w);
+            float3 Np  = (dot(uvw, uvw) > 1e-6f) ? normalize(uvw) : float3(0.0f, 0.0f, 1.0f);
+            float3 R   = (dot(Vw, Vw) > 1e-6f) ? reflect(-normalize(Vw), Np) : Np;
             float4 refl = t3;
             if ((texMask & 8u) != 0u) {
                 refl = ((cubeMask & 8u) != 0u)

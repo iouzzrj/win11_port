@@ -1,6 +1,7 @@
 #include "ghost_runtime.h"
 #include "ghost_addresses.h"
 #include "xbox_d3d8_types.h"
+#include "ghost_bot.h"
 #include <d3d11.h>
 #include <dxgi.h>
 #include <d3dcompiler.h>
@@ -36,6 +37,7 @@ ID3D11VertexShader*       g_vs                = nullptr;
 ID3D11PixelShader*        g_ps                = nullptr;
 ID3D11InputLayout*        g_inputLayout       = nullptr;
 ID3D11Buffer*             g_cbPerDraw         = nullptr;
+ID3D11Buffer*             g_cbVSConstants     = nullptr;
 ID3D11Buffer*             g_dynVB             = nullptr;
 uint32_t                  g_dynVBCapacity     = 0;
 
@@ -370,7 +372,16 @@ static void __stdcall Bridge_D3DDevice_SetRenderState_TextureFactor(uint32_t Val
 }
 
 static void __stdcall Bridge_D3DDevice_SetRenderState_ZBias(uint32_t Value) {
-    reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE)[XBOX_D3DRS_ZBIAS] = Value;
+    uint32_t* rs = reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE);
+    float fBias = -static_cast<float>(static_cast<int32_t>(Value));
+    float fSlope = fBias * 0.25f;
+    uint32_t enable = (Value != 0) ? 1u : 0u;
+    memcpy(&rs[77], &fSlope, 4); // D3DRS_POLYGONOFFSETZSLOPESCALE (0x006C0724)
+    memcpy(&rs[78], &fBias, 4);  // D3DRS_POLYGONOFFSETZOFFSET (0x006C0728)
+    rs[79] = enable;             // D3DRS_POINTOFFSETENABLE (0x006C072C)
+    rs[80] = enable;             // D3DRS_WIREFRAMEOFFSETENABLE (0x006C0730)
+    rs[81] = enable;             // D3DRS_SOLIDOFFSETENABLE (0x006C0734)
+    rs[XBOX_D3DRS_ZBIAS] = Value;// D3DRS_ZBIAS (0x006C0844)
 }
 
 static void __stdcall Bridge_D3DDevice_SetRenderState_StencilEnable(uint32_t Value) {
@@ -784,6 +795,7 @@ static void __stdcall Bridge_D3DDevice_Swap(DWORD Flags) {
     g_backBufferDirty = true;
 
     DrawOsdOverlayOnBackbuffer();
+    GhostBot_On3DSwapFrame();
 
     if (g_swapChain) {
         g_swapChain->Present(0, 0);
@@ -990,6 +1002,13 @@ bool InitD3D11HostDevice() {
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     g_d3dDevice->CreateBuffer(&cbd, nullptr, &g_cbPerDraw);
+
+    D3D11_BUFFER_DESC vscbd = {};
+    vscbd.ByteWidth = 192 * 16;
+    vscbd.Usage = D3D11_USAGE_DYNAMIC;
+    vscbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    vscbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    g_d3dDevice->CreateBuffer(&vscbd, nullptr, &g_cbVSConstants);
 
     return true;
 }

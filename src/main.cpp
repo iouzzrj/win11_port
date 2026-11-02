@@ -1,5 +1,6 @@
 #include "ghost_runtime.h"
 #include "ghost_addresses.h"
+#include "ghost_bot.h"
 #include <vector>
 
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='x86' publicKeyToken='6595b64144ccf1df' language='*'\"")
@@ -327,13 +328,18 @@ static DWORD WINAPI XboxGameThreadProc(LPVOID) {
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    (void)hPrevInstance; (void)lpCmdLine; (void)nCmdShow;
+    (void)hPrevInstance; (void)nCmdShow;
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     g_hInstance = hInstance;
 
-    // Show Native Win32 Pre-Launch Setup UI (selects GameDir & GPU, and initializes
-    // g_gameRootDir and g_appRootDir = <exeDir>\GhostWin11)
-    if (!ShowLauncherDialog(hInstance)) {
+    GhostBot_InitFromCommandLine(lpCmdLine);
+
+    // Show Native Win32 Pre-Launch Setup UI (or auto-configure from config.ini when --bot is active)
+    if (GhostBot_IsActive()) {
+        if (!GhostBot_AutoConfigureLauncher()) {
+            return 1;
+        }
+    } else if (!ShowLauncherDialog(hInstance)) {
         return 0;
     }
 

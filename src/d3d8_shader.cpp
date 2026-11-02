@@ -1,7 +1,11 @@
 #include "ghost_runtime.h"
 #include "ghost_addresses.h"
 #include "xbox_d3d8_types.h"
+#include <d3d11.h>
+#include <d3dcompiler.h>
 #include <math.h>
+#include <stdio.h>
+#include <string>
 #include <vector>
 
 // ============================================================================
@@ -18,9 +22,9 @@ float    g_psConstants[8][4] = {};
 bool GetXboxVertexShaderDecl(uint32_t handle, XboxShaderDeclInfo* outDecl) {
     if (!outDecl) return false;
     if ((handle & 0x00010001u) == 0x00010001u) {
-        uint32_t idx = (handle >> 4) - 1;
-        if (idx < g_vertexShaders.size()) {
-            *outDecl = g_vertexShaders[idx];
+        uint32_t rawIdx = (handle & 0xFFFFu) >> 4;
+        if (rawIdx > 0 && (rawIdx - 1) < g_vertexShaders.size()) {
+            *outDecl = g_vertexShaders[rawIdx - 1];
             return true;
         }
     }
@@ -98,6 +102,13 @@ static HRESULT __stdcall Bridge_D3DDevice_SetPixelShaderConstant(DWORD Register,
     return S_OK;
 }
 
+struct XboxDeclElem {
+    uint8_t  stream;
+    uint8_t  reg;
+    uint8_t  xType;
+    uint16_t offset;
+};
+
 static uint32_t GetXboxDeclTypeByteSize(uint32_t xboxType) {
     switch (xboxType) {
         case 0x12: return 4;  // FLOAT1
@@ -114,10 +125,359 @@ static uint32_t GetXboxDeclTypeByteSize(uint32_t xboxType) {
     }
 }
 
+static DXGI_FORMAT MapXboxDeclTypeToDXGI(uint8_t xType) {
+    switch (xType) {
+        case 0x12: return DXGI_FORMAT_R32_FLOAT;
+        case 0x22: return DXGI_FORMAT_R32G32_FLOAT;
+        case 0x32: return DXGI_FORMAT_R32G32B32_FLOAT;
+        case 0x42: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+        case 0x40: return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case 0x41: return DXGI_FORMAT_R8G8B8A8_UINT;
+        case 0x25: return DXGI_FORMAT_R16G16_SINT;
+        case 0x45: return DXGI_FORMAT_R16G16B16A16_SINT;
+        case 0x24: return DXGI_FORMAT_R16G16_SNORM;
+        case 0x44: return DXGI_FORMAT_R16G16B16A16_SNORM;
+        default:   return DXGI_FORMAT_R32G32B32_FLOAT;
+    }
+}
+
+static void FormatXvuSwizzle(uint32_t swz, char* outBuf) {
+    static const char kComp[4] = { 'x', 'y', 'z', 'w' };
+    uint32_t x = (swz >> 6) & 3u;
+    uint32_t y = (swz >> 4) & 3u;
+    uint32_t z = (swz >> 2) & 3u;
+    uint32_t w = swz & 3u;
+    if (x == 0u && y == 1u && z == 2u && w == 3u) {
+        outBuf[0] = '\0';
+        return;
+    }
+    outBuf[0] = '.';
+    outBuf[1] = kComp[x];
+    outBuf[2] = kComp[y];
+    outBuf[3] = kComp[z];
+    outBuf[4] = kComp[w];
+    outBuf[5] = '\0';
+}
+
+static void FormatXvuWriteMask(uint32_t mask, char* outBuf) {
+    static const char kComp[4] = { 'x', 'y', 'z', 'w' };
+    int pos = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (mask & (1u << (3 - i))) {
+            outBuf[pos++] = kComp[i];
+        }
+    }
+    outBuf[pos] = '\0';
+}
+
+static void FormatXvuSrcOperand(
+    uint32_t src, uint32_t reg, uint32_t neg, uint32_t swz,
+    uint32_t va, uint32_t cIdx, uint32_t rel, char* outBuf, size_t outSize)
+{
+    char base[64];
+    if (src == 1u) {
+        snprintf(base, sizeof(base), "r%u", (reg <= 12u) ? reg : 0u);
+    } else if (src == 2u) {
+        snprintf(base, sizeof(base), "v%u", va & 15u);
+    } else if (src == 3u) {
+        if (rel != 0u) {
+            snprintf(base, sizeof(base), "c[clamp(a0x + %u, 0, 191)]", cIdx);
+        } else {
+            snprintf(base, sizeof(base), "c[%u]", (cIdx < 192u) ? cIdx : 191u);
+        }
+    } else {
+        snprintf(base, sizeof(base), "float4(0.0f, 0.0f, 0.0f, 0.0f)");
+    }
+
+    char swzStr[8];
+    FormatXvuSwizzle(swz, swzStr);
+    if (neg != 0u) {
+        snprintf(outBuf, outSize, "(-%s%s)", base, swzStr);
+    } else {
+        snprintf(outBuf, outSize, "%s%s", base, swzStr);
+    }
+}
+
+// Decompiles 128-bit Xbox NV2A .xvu vertex shader microcode into D3D11 HLSL (vs_4_0)
+static std::string DecompileXvuToHLSL(const XboxDeclElem* elems, uint32_t numElems, const DWORD* pFunction) {
+    uint32_t count = (pFunction[0] >> 16) & 0xFFFFu;
+    bool hasC58     = false;
+    bool writesOD1  = false;
+    bool writesOFog = false;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t w1 = pFunction[1 + i * 4 + 1];
+        uint32_t w2 = pFunction[1 + i * 4 + 2];
+        uint32_t w3 = pFunction[1 + i * 4 + 3];
+        uint32_t cIdx = (w1 >> 13) & 0xFFu;
+        uint32_t aSrc = (w2 >> 26) & 3u;
+        uint32_t bSrc = (w2 >> 11) & 3u;
+        uint32_t cSrc = (w3 >> 28) & 3u;
+        uint32_t rel  = (w3 >> 1)  & 1u;
+        if ((aSrc == 3u || bSrc == 3u || cSrc == 3u) && rel == 0u && (cIdx == 58u || cIdx == 59u)) {
+            hasC58 = true;
+        }
+        uint32_t outMask  = (w3 >> 12) & 0xFu;
+        uint32_t outWrite = (w3 >> 11) & 1u;
+        uint32_t outReg   = (w3 >> 3)  & 0xFFu;
+        if (outWrite != 0u && outMask != 0u) {
+            if (outReg == 4u) writesOD1 = true;
+            if (outReg == 5u) writesOFog = true;
+        }
+    }
+
+    std::string s;
+    s.reserve(8192);
+    s += "cbuffer PerDrawCB : register(b0) {\n"
+         "    float4 uWvp0; float4 uWvp1; float4 uWvp2; float4 uWvp3;\n"
+         "    float4 uViewport; float4 uTFactor;\n"
+         "    uint4 uStage0Ops; uint4 uStage0Alpha;\n"
+         "    uint4 uStage1Ops; uint4 uStage1Alpha;\n"
+         "    uint4 uStage2Ops; uint4 uStage2Alpha;\n"
+         "    uint4 uStage3Ops; uint4 uStage3Alpha;\n"
+         "    uint4 uFlags;\n"
+         "    float4 uAlphaTest;\n"
+         "    float4 uUvScale01;\n"
+         "    float4 uUvScale23;\n"
+         "};\n"
+         "cbuffer VSConstantsCB : register(b1) {\n"
+         "    float4 c[192];\n"
+         "};\n"
+         "struct VSIn {\n";
+
+    bool declaredReg[16] = {};
+    char line[512];
+    for (uint32_t i = 0; i < numElems; ++i) {
+        uint8_t r = elems[i].reg;
+        if (r >= 16 || declaredReg[r]) continue;
+        declaredReg[r] = true;
+        const char* hlslType = "float3";
+        switch (elems[i].xType) {
+            case 0x12: hlslType = "float";  break;
+            case 0x22:
+            case 0x24: hlslType = "float2"; break;
+            case 0x25: hlslType = "int2";   break;
+            case 0x32: hlslType = "float3"; break;
+            case 0x41: hlslType = "uint4";  break;
+            case 0x45: hlslType = "int4";   break;
+            default:   hlslType = "float4"; break;
+        }
+        snprintf(line, sizeof(line), "    %s raw_v%u : ATTR%u;\n", hlslType, r, r);
+        s += line;
+    }
+    if (numElems == 0) {
+        s += "    uint vid : SV_VertexID;\n";
+    }
+    s += "};\n"
+         "struct VSOut {\n"
+         "    float4 pos     : SV_POSITION;\n"
+         "    float4 color   : COLOR0;\n"
+         "    float4 uv0     : TEXCOORD0;\n"
+         "    float4 uv1     : TEXCOORD1;\n"
+         "    float4 uv2     : TEXCOORD2;\n"
+         "    float4 uv3     : TEXCOORD3;\n"
+         "    float2 eyeDist : TEXCOORD4;\n"
+         "    float3 norm    : TEXCOORD5;\n"
+         "};\n"
+         "float nv_rcp(float x) { return (abs(x) > 1e-12f) ? clamp(1.0f / x, -1e12f, 1e12f) : 1e12f; }\n"
+         "float nv_rsq(float x) { return (x > 1e-12f) ? clamp(rsqrt(x), 0.0f, 1e12f) : 0.0f; }\n"
+         "float nv_rcc(float x) { float t = (abs(x) > 1e-12f) ? (1.0f / x) : 0.0f; return (t >= 0.0f) ? clamp(t, 5.42101086e-20f, 1.884467e19f) : clamp(t, -1.884467e19f, -5.42101086e-20f); }\n"
+         "float4 nv_lit(float4 v) { float x = max(v.x, 0.0f); float y = (v.x > 0.0f) ? pow(max(v.y, 0.0f), clamp(v.w, -128.0f, 128.0f)) : 0.0f; return float4(1.0f, x, y, 1.0f); }\n"
+         "VSOut VSMain(VSIn In) {\n";
+
+    bool unpackedReg[16] = {};
+    for (uint32_t i = 0; i < numElems; ++i) {
+        uint8_t r = elems[i].reg;
+        if (r >= 16 || unpackedReg[r]) continue;
+        unpackedReg[r] = true;
+        switch (elems[i].xType) {
+            case 0x12:
+                snprintf(line, sizeof(line), "    float4 v%u = float4(In.raw_v%u, 0.0f, 0.0f, 1.0f);\n", r, r);
+                break;
+            case 0x22:
+            case 0x24:
+            case 0x25:
+                snprintf(line, sizeof(line), "    float4 v%u = float4(In.raw_v%u, 0.0f, 1.0f);\n", r, r);
+                break;
+            case 0x32:
+                snprintf(line, sizeof(line), "    float4 v%u = float4(In.raw_v%u, 1.0f);\n", r, r);
+                break;
+            default:
+                snprintf(line, sizeof(line), "    float4 v%u = float4(In.raw_v%u);\n", r, r);
+                break;
+        }
+        s += line;
+    }
+    for (uint32_t r = 0; r < 16; ++r) {
+        if (!unpackedReg[r]) {
+            snprintf(line, sizeof(line), "    float4 v%u = float4(0.0f, 0.0f, 0.0f, 1.0f);\n", r);
+            s += line;
+        }
+    }
+
+    s += "    float4 r0 = 0, r1 = 0, r2 = 0, r3 = 0, r4 = 0, r5 = 0, r6 = 0, r7 = 0, r8 = 0, r9 = 0, r10 = 0, r11 = 0;\n"
+         "    float4 r12 = float4(0.0f, 0.0f, 0.0f, 1.0f);\n"
+         "    int a0x = 0;\n"
+         "    float4 clipPos = float4(0.0f, 0.0f, 0.0f, 1.0f);\n"
+         "    float4 oD0 = float4(1.0f, 1.0f, 1.0f, 1.0f), oD1 = 0, oFog = float4(1.0f, 0.0f, 0.0f, 0.0f), oPts = float4(1.0f, 0.0f, 0.0f, 0.0f), oB0 = 0, oB1 = 0;\n"
+         "    float4 oT0 = float4(0.0f, 0.0f, 0.0f, 1.0f), oT1 = float4(0.0f, 0.0f, 0.0f, 1.0f), oT2 = float4(0.0f, 0.0f, 0.0f, 1.0f), oT3 = float4(0.0f, 0.0f, 0.0f, 1.0f);\n"
+         "    float4 macVal = 0, iluVal = 0;\n";
+
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t w1 = pFunction[1 + i * 4 + 1];
+        uint32_t w2 = pFunction[1 + i * 4 + 2];
+        uint32_t w3 = pFunction[1 + i * 4 + 3];
+
+        uint32_t ilu  = (w1 >> 25) & 0x7u;
+        uint32_t mac  = (w1 >> 21) & 0xFu;
+        uint32_t cIdx = (w1 >> 13) & 0xFFu;
+        uint32_t va   = (w1 >> 9)  & 0xFu;
+
+        uint32_t aNeg = (w1 >> 8)  & 1u;
+        uint32_t aSwz =  w1        & 0xFFu;
+        uint32_t aR   = (w2 >> 28) & 0xFu;
+        uint32_t aSrc = (w2 >> 26) & 3u;
+
+        uint32_t bNeg = (w2 >> 25) & 1u;
+        uint32_t bSwz = (w2 >> 17) & 0xFFu;
+        uint32_t bR   = (w2 >> 13) & 0xFu;
+        uint32_t bSrc = (w2 >> 11) & 3u;
+
+        uint32_t cNeg = (w2 >> 10) & 1u;
+        uint32_t cSwz = (w2 >> 2)  & 0xFFu;
+        uint32_t cR   = ((w2 & 3u) << 2) | ((w3 >> 30) & 3u);
+        uint32_t cSrc = (w3 >> 28) & 3u;
+
+        uint32_t macMask  = (w3 >> 24) & 0xFu;
+        uint32_t macR     = (w3 >> 20) & 0xFu;
+        uint32_t iluMask  = (w3 >> 16) & 0xFu;
+        uint32_t outMask  = (w3 >> 12) & 0xFu;
+        uint32_t outWrite = (w3 >> 11) & 1u;
+        uint32_t outReg   = (w3 >> 3)  & 0xFFu;
+        uint32_t outMux   = (w3 >> 2)  & 1u;
+        uint32_t rel      = (w3 >> 1)  & 1u;
+
+        char sA[128], sB[128], sC[128];
+        FormatXvuSrcOperand(aSrc, aR, aNeg, aSwz, va, cIdx, rel, sA, sizeof(sA));
+        FormatXvuSrcOperand(bSrc, bR, bNeg, bSwz, va, cIdx, rel, sB, sizeof(sB));
+        FormatXvuSrcOperand(cSrc, cR, cNeg, cSwz, va, cIdx, rel, sC, sizeof(sC));
+
+        if (mac == 13u) {
+            snprintf(line, sizeof(line), "    a0x = (int)floor((%s).x);\n", sA);
+            s += line;
+        } else if (mac != 0u) {
+            switch (mac) {
+                case 1u:  snprintf(line, sizeof(line), "    macVal = %s;\n", sA); break;
+                case 2u:  snprintf(line, sizeof(line), "    macVal = (%s * %s);\n", sA, sB); break;
+                case 3u:  snprintf(line, sizeof(line), "    macVal = (%s + %s);\n", sA, sC); break;
+                case 4u:  snprintf(line, sizeof(line), "    macVal = (%s * %s + %s);\n", sA, sB, sC); break;
+                case 5u:  snprintf(line, sizeof(line), "    macVal = dot((%s).xyz, (%s).xyz).xxxx;\n", sA, sB); break;
+                case 6u:  snprintf(line, sizeof(line), "    macVal = dot(float4((%s).xyz, 1.0f), %s).xxxx;\n", sA, sB); break;
+                case 7u:  snprintf(line, sizeof(line), "    macVal = dot(%s, %s).xxxx;\n", sA, sB); break;
+                case 8u:  snprintf(line, sizeof(line), "    macVal = float4(1.0f, (%s).y * (%s).y, (%s).z, (%s).w);\n", sA, sB, sA, sB); break;
+                case 9u:  snprintf(line, sizeof(line), "    macVal = min(%s, %s);\n", sA, sB); break;
+                case 10u: snprintf(line, sizeof(line), "    macVal = max(%s, %s);\n", sA, sB); break;
+                case 11u: snprintf(line, sizeof(line), "    macVal = ((%s < %s) ? float4(1,1,1,1) : float4(0,0,0,0));\n", sA, sB); break;
+                case 12u: snprintf(line, sizeof(line), "    macVal = ((%s >= %s) ? float4(1,1,1,1) : float4(0,0,0,0));\n", sA, sB); break;
+                default:  snprintf(line, sizeof(line), "    macVal = float4(0,0,0,0);\n"); break;
+            }
+            s += line;
+        }
+
+        if (ilu != 0u) {
+            switch (ilu) {
+                case 1u: snprintf(line, sizeof(line), "    iluVal = %s;\n", sC); break;
+                case 2u: snprintf(line, sizeof(line), "    iluVal = nv_rcp((%s).x).xxxx;\n", sC); break;
+                case 3u: snprintf(line, sizeof(line), "    iluVal = nv_rcc((%s).x).xxxx;\n", sC); break;
+                case 4u: snprintf(line, sizeof(line), "    iluVal = nv_rsq((%s).x).xxxx;\n", sC); break;
+                case 5u: snprintf(line, sizeof(line), "    iluVal = exp2((%s).x).xxxx;\n", sC); break;
+                case 6u: snprintf(line, sizeof(line), "    iluVal = log2(max(abs((%s).x), 1e-12f)).xxxx;\n", sC); break;
+                case 7u: snprintf(line, sizeof(line), "    iluVal = nv_lit(%s);\n", sC); break;
+                default: snprintf(line, sizeof(line), "    iluVal = float4(0,0,0,0);\n"); break;
+            }
+            s += line;
+        }
+
+        char maskStr[8];
+        if (mac != 0u && mac != 13u && macMask != 0u && macR <= 12u) {
+            FormatXvuWriteMask(macMask, maskStr);
+            snprintf(line, sizeof(line), "    r%u.%s = macVal.%s;\n", macR, maskStr, maskStr);
+            s += line;
+        }
+        if (ilu != 0u && iluMask != 0u) {
+            uint32_t iluR = (mac == 0u && macR <= 12u) ? macR : 1u;
+            FormatXvuWriteMask(iluMask, maskStr);
+            snprintf(line, sizeof(line), "    r%u.%s = iluVal.%s;\n", iluR, maskStr, maskStr);
+            s += line;
+        }
+        if (outWrite != 0u && outMask != 0u) {
+            const char* outName = nullptr;
+            switch (outReg) {
+                case 0u:  outName = "r12";  break;
+                case 3u:  outName = "oD0";  break;
+                case 4u:  outName = "oD1";  break;
+                case 5u:  outName = "oFog"; break;
+                case 6u:  outName = "oPts"; break;
+                case 7u:  outName = "oB0";  break;
+                case 8u:  outName = "oB1";  break;
+                case 9u:  outName = "oT0";  break;
+                case 10u: outName = "oT1";  break;
+                case 11u: outName = "oT2";  break;
+                case 12u: outName = "oT3";  break;
+                default:  break;
+            }
+            if (outName) {
+                const char* srcVal = (outMux != 0u) ? "iluVal" : "macVal";
+                FormatXvuWriteMask(outMask, maskStr);
+                snprintf(line, sizeof(line), "    %s.%s = %s.%s;\n", outName, maskStr, srcVal, maskStr);
+                s += line;
+                if (outReg == 0u && hasC58 && !(rel == 0u && (cIdx == 58u || cIdx == 59u))) {
+                    snprintf(line, sizeof(line), "    clipPos.%s = %s.%s;\n", maskStr, srcVal, maskStr);
+                    s += line;
+                }
+            }
+        }
+    }
+
+    s += "    VSOut o = (VSOut)0;\n";
+    if (hasC58) {
+        s += "    o.pos = clipPos;\n";
+        if (writesOFog) {
+            s += "    o.eyeDist = float2(max(oFog.x, 0.0f), 1.0f);\n";
+        } else {
+            s += "    o.eyeDist = float2(0.0f, 1.0f);\n";
+        }
+    } else {
+        s += "    o.pos = float4(((r12.x - uViewport.x) / max(uViewport.z, 1.0f)) * 2.0f - 1.0f,\n"
+             "                   1.0f - ((r12.y - uViewport.y) / max(uViewport.w, 1.0f)) * 2.0f,\n"
+             "                   saturate(r12.z), 1.0f);\n"
+             "    o.eyeDist = float2(0.0f, 1.0f);\n";
+    }
+    s += "    o.color = saturate(oD0);\n"
+         "    o.uv0   = float4(oT0.xy * uUvScale01.xy, oT0.zw);\n"
+         "    o.uv1   = float4(oT1.xy * uUvScale01.zw, oT1.zw);\n"
+         "    o.uv2   = float4(oT2.xy * uUvScale23.xy, oT2.zw);\n"
+         "    o.uv3   = float4(oT3.xy * uUvScale23.zw, oT3.zw);\n"
+         "    o.norm  = saturate(oD1.xyz);\n";
+
+    if (writesOD1) {
+        s += "    if ((uStage0Ops.x == 25u && (uStage0Ops.z & 0x0Fu) == 0u) ||\n"
+             "        (uStage1Ops.x == 25u && (uStage1Ops.z & 0x0Fu) == 0u) ||\n"
+             "        (uStage2Ops.x == 25u && (uStage2Ops.z & 0x0Fu) == 0u) ||\n"
+             "        (uStage3Ops.x == 25u && (uStage3Ops.z & 0x0Fu) == 0u)) {\n"
+             "        o.color = float4(saturate(oD1.xyz), saturate(oD0.w));\n"
+             "    }\n";
+    }
+
+    s += "    return o;\n"
+         "}\n";
+    return s;
+}
+
 static HRESULT __stdcall Bridge_D3DDevice_CreateVertexShader(
     const DWORD* pDeclaration, const DWORD* pFunction, DWORD* pHandle, DWORD Usage)
 {
-    (void)pFunction; (void)Usage;
+    (void)Usage;
     if (!pHandle) return E_INVALIDARG;
 
     XboxShaderDeclInfo info = {};
@@ -128,6 +488,9 @@ static HRESULT __stdcall Bridge_D3DDevice_CreateVertexShader(
         info.vsType = (int32_t)((hAddr - ADDR_VERTEX_SHADERS_TABLE) / 24);
     }
 
+    XboxDeclElem elems[16] = {};
+    uint32_t numElems = 0;
+
     if (pDeclaration) {
         uint16_t curStream = 0;
         uint16_t curOffset = 0;
@@ -137,7 +500,7 @@ static HRESULT __stdcall Bridge_D3DDevice_CreateVertexShader(
             if (tokType == 1) {
                 curStream = (uint16_t)(tok & 0x0F);
                 curOffset = 0;
-            } else if (tokType == 2 && curStream == 0) {
+            } else if (tokType == 2) {
                 if (tok & 0x10000000) {
                     DWORD skipDwords = (tok >> 16) & 0x0F;
                     curOffset += (uint16_t)(skipDwords * 4);
@@ -145,23 +508,90 @@ static HRESULT __stdcall Bridge_D3DDevice_CreateVertexShader(
                     uint32_t reg = tok & 0x1F;
                     uint32_t xType = (tok >> 16) & 0xFF;
                     uint32_t byteSize = GetXboxDeclTypeByteSize(xType);
-                    // Ghost.exe D3DVSD register convention (0x007A980C..0x007A996C):
-                    // reg 0 = Pos, reg 1 = Normal, reg 2 = Diffuse, reg 3..6 = UV0..UV3, reg 10 = RHW
-                    switch (reg) {
-                        case 0:  info.hasPos  = true; info.offPos  = curOffset; break;
-                        case 1:  info.hasNorm = true; info.offNorm = curOffset; break;
-                        case 2:  info.hasDiff = true; info.offDiff = curOffset; break;
-                        case 3:  info.hasUv0  = true; info.offUv0  = curOffset; break;
-                        case 4:  info.hasUv1  = true; info.offUv1  = curOffset; break;
-                        case 5:  info.hasUv2  = true; info.offUv2  = curOffset; break;
-                        case 6:  info.hasUv3  = true; info.offUv3  = curOffset; break;
-                        case 10: info.hasRhw  = true; info.offRhw  = curOffset; break;
-                        default: break;
+                    if (curStream < 2 && reg < 16 && numElems < 16) {
+                        elems[numElems].stream = (uint8_t)curStream;
+                        elems[numElems].reg    = (uint8_t)reg;
+                        elems[numElems].xType  = (uint8_t)xType;
+                        elems[numElems].offset = curOffset;
+                        numElems++;
+                        info.usesStream[curStream] = true;
+                    }
+                    if (pFunction == nullptr) {
+                        // Xbox fixed-function D3DVSDE_* register mapping (e.g. VertexSetupPrelitRigid at 0x00605B50)
+                        if (curStream == 0) {
+                            switch (reg) {
+                                case 0:  info.hasPos  = true; info.offPos  = curOffset; break;
+                                case 2:  info.hasNorm = true; info.offNorm = curOffset; break;
+                                case 3:  info.hasDiff = true; info.offDiff = curOffset; break;
+                                case 9:  info.hasUv0  = true; info.offUv0  = curOffset; break;
+                                case 10: info.hasUv1  = true; info.offUv1  = curOffset; break;
+                                case 11: info.hasUv2  = true; info.offUv2  = curOffset; break;
+                                case 12: info.hasUv3  = true; info.offUv3  = curOffset; break;
+                                default: break;
+                            }
+                        } else if (curStream == 1 && reg == 3) {
+                            info.hasStream1Diff = true;
+                            info.offStream1Diff = curOffset;
+                        }
+                    } else if (curStream == 0) {
+                        // Ghost.exe programmable D3DVSD register convention (0x007A980C..0x007A996C)
+                        switch (reg) {
+                            case 0:  info.hasPos  = true; info.offPos  = curOffset; break;
+                            case 1:  info.hasNorm = true; info.offNorm = curOffset; break;
+                            case 2:  info.hasDiff = true; info.offDiff = curOffset; break;
+                            case 3:  info.hasUv0  = true; info.offUv0  = curOffset; break;
+                            case 4:  info.hasUv1  = true; info.offUv1  = curOffset; break;
+                            case 5:  info.hasUv2  = true; info.offUv2  = curOffset; break;
+                            case 6:  info.hasUv3  = true; info.offUv3  = curOffset; break;
+                            case 10: info.hasRhw  = true; info.offRhw  = curOffset; break;
+                            default: break;
+                        }
                     }
                     curOffset += (uint16_t)byteSize;
                 }
+                if (curStream < 2) {
+                    info.streamStrides[curStream] = curOffset;
+                }
             }
         }
+    }
+
+    if (pFunction && (pFunction[0] & 0xFFFFu) == 0x2078u && g_d3dDevice && numElems > 0) {
+        std::string hlsl = DecompileXvuToHLSL(elems, numElems, pFunction);
+        ID3DBlob* vsBlob  = nullptr;
+        ID3DBlob* errBlob = nullptr;
+        HRESULT hr = D3DCompile(
+            hlsl.data(), hlsl.size(), "XvuVS",
+            nullptr, nullptr, "VSMain", "vs_4_0",
+            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsBlob, &errBlob);
+        if (SUCCEEDED(hr) && vsBlob) {
+            g_d3dDevice->CreateVertexShader(
+                vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(),
+                nullptr, &info.gpuVS);
+            D3D11_INPUT_ELEMENT_DESC ied[16] = {};
+            uint32_t iedCount = 0;
+            bool seenReg[16] = {};
+            for (uint32_t i = 0; i < numElems; ++i) {
+                uint8_t r = elems[i].reg;
+                if (r >= 16 || seenReg[r]) continue;
+                seenReg[r] = true;
+                ied[iedCount].SemanticName         = "ATTR";
+                ied[iedCount].SemanticIndex        = r;
+                ied[iedCount].Format               = MapXboxDeclTypeToDXGI(elems[i].xType);
+                ied[iedCount].InputSlot            = elems[i].stream;
+                ied[iedCount].AlignedByteOffset    = elems[i].offset;
+                ied[iedCount].InputSlotClass       = D3D11_INPUT_PER_VERTEX_DATA;
+                ied[iedCount].InstanceDataStepRate = 0;
+                iedCount++;
+            }
+            g_d3dDevice->CreateInputLayout(
+                ied, iedCount,
+                vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(),
+                &info.gpuInputLayout);
+            info.isCompiledXvu = (info.gpuVS != nullptr && info.gpuInputLayout != nullptr);
+            vsBlob->Release();
+        }
+        if (errBlob) errBlob->Release();
     }
 
     g_vertexShaders.push_back(info);
@@ -324,35 +754,34 @@ static uint32_t Host_RenderSetupWeightedSkin(uint8_t* pMeshGroup, uint8_t* pMode
         Bridge_D3DDevice_SetTransform(6, reinterpret_cast<const Mat44*>(0x007D0790));
         *reinterpret_cast<uint8_t*>(0x008AA454) = 1;
     }
-    if (*reinterpret_cast<uint32_t*>(0x008AA468) != 0x112) {
-        *reinterpret_cast<uint32_t*>(0x008AA468) = 0x112;
-        Bridge_D3DDevice_SetVertexShader(0x112);
-    }
+    *reinterpret_cast<uint32_t*>(0x008AA468) = 0x112;
+    Bridge_D3DDevice_SetVertexShader(0x112);
+
     XboxVertexBuffer* dynVbObj = *reinterpret_cast<XboxVertexBuffer**>(reinterpret_cast<uint8_t*>(pDynVB) + 0x10);
-    if (*reinterpret_cast<XboxVertexBuffer**>(0x008AA480) != dynVbObj) {
-        *reinterpret_cast<XboxVertexBuffer**>(0x008AA480) = dynVbObj;
-        Bridge_D3DDevice_SetStreamSource(0, dynVbObj, 0x20);
-    }
+    *reinterpret_cast<XboxVertexBuffer**>(0x008AA480) = dynVbObj;
+    Bridge_D3DDevice_SetStreamSource(0, dynVbObj, 0x20);
+
     XboxVertexBuffer* idxBuf = *reinterpret_cast<XboxVertexBuffer* const*>(pModel + 0x7C);
     Bridge_D3DDevice_SetIndices(idxBuf, outBaseVert);
     return 0;
 }
 
-const uint32_t* g_curPrelitColors      = nullptr;
-uint32_t        g_curPrelitBaseVertex  = 0;
-const float*    g_curTangentBasis      = nullptr;
-uint32_t        g_curTangentBaseVertex = 0;
-float           g_cloakDistort         = 16.0f;
-float           g_cloakC35[4]          = { 1.0f, 0.0f, 0.0f, 0.5f };
-float           g_shieldC35x           = 1.0f;
-float           g_teleportC32[2]       = { 1.0f / 640.0f, 1.0f / 480.0f };
-float           g_teleportC33x         = 0.0f;
-float           g_motionBlurVec[4]     = { 0.0f, 0.0f, 0.0f, 1.0f };
-float           g_embossScale          = 0.015f;
-float           g_specularScale        = 1.0f;
-float           g_detailUvScale[2]     = { 1.0f, 1.0f };
-Mat44           g_lightProjMat0        = { {{1,0,0,0}, {0,1,0,0}, {0,0,1,0}, {0,0,0,1}} };
-Mat44           g_lightProjMat1        = { {{1,0,0,0}, {0,1,0,0}, {0,0,1,0}, {0,0,0,1}} };
+const uint32_t* g_curPrelitColors        = nullptr;
+uint32_t        g_curPrelitBaseVertex    = 0;
+bool            g_curPrelitUseCustomBase = false;
+const float*    g_curTangentBasis        = nullptr;
+uint32_t        g_curTangentBaseVertex   = 0;
+float           g_cloakDistort           = 16.0f;
+float           g_cloakC35[4]            = { 1.0f, 0.0f, 0.0f, 0.5f };
+float           g_shieldC35x             = 1.0f;
+float           g_teleportC32[2]         = { 1.0f / 640.0f, 1.0f / 480.0f };
+float           g_teleportC33x           = 0.0f;
+float           g_motionBlurVec[4]       = { 0.0f, 0.0f, 0.0f, 1.0f };
+float           g_embossScale            = 0.015f;
+float           g_specularScale          = 1.0f;
+float           g_detailUvScale[2]       = { 1.0f, 1.0f };
+Mat44           g_lightProjMat0          = { {{1,0,0,0}, {0,1,0,0}, {0,0,1,0}, {0,0,0,1}} };
+Mat44           g_lightProjMat1          = { {{1,0,0,0}, {0,1,0,0}, {0,0,1,0}, {0,0,0,1}} };
 
 static void SetupTangentStreamForMesh(const uint8_t* pMeshGroup, bool bindStream1) {
     g_curTangentBasis      = nullptr;
@@ -373,281 +802,37 @@ static void SetupTangentStreamForMesh(const uint8_t* pMeshGroup, bool bindStream
 }
 
 static void SetupPrelitStreamForMesh(const uint8_t* pMeshGroup, const uint8_t* pModelInst) {
-    g_curPrelitColors     = nullptr;
-    g_curPrelitBaseVertex = 0;
+    g_curPrelitColors        = nullptr;
+    g_curPrelitBaseVertex    = 0;
+    g_curPrelitUseCustomBase = false;
     SetupTangentStreamForMesh(pMeshGroup, false);
     if (pMeshGroup && pModelInst && (pModelInst[0x14] & 1) != 0) {
         uint8_t lodIdx = pMeshGroup[0x50];
         if (lodIdx < 3) {
             XboxVertexBuffer* prelitVB = *reinterpret_cast<XboxVertexBuffer* const*>(pModelInst + 0xB0 + lodIdx * 4);
-            if (!prelitVB) {
-                const uint8_t* pModel = *reinterpret_cast<const uint8_t* const*>(pMeshGroup + 0x04);
-                if (pModel) {
-                    prelitVB = *reinterpret_cast<XboxVertexBuffer* const*>(pModel + 0x2C + lodIdx * 0x18);
-                }
-            }
             if (prelitVB && prelitVB->Data) {
-                g_curPrelitColors     = reinterpret_cast<const uint32_t*>(prelitVB->Data);
-                g_curPrelitBaseVertex = *reinterpret_cast<const uint32_t*>(pMeshGroup + 0x48);
+                g_curPrelitColors        = reinterpret_cast<const uint32_t*>(prelitVB->Data);
+                g_curPrelitBaseVertex    = *reinterpret_cast<const uint32_t*>(pMeshGroup + 0x48);
+                g_curPrelitUseCustomBase = true;
             }
         }
     }
 }
 
-static int __fastcall Bridge_Shader_VertexSetup(void* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
-    (void)pShader; (void)edxUnused;
+static uint32_t __fastcall Bridge_MeshGroup_RenderSetupWeightedSkin(uint8_t* pMeshGroup, void* edxUnused, uint8_t* pModelInst, uint32_t lod) {
+    (void)edxUnused;
     g_activeCustomVS = 0;
-    if (!pMeshGroup) {
-        g_curPrelitColors = nullptr;
-        g_curTangentBasis = nullptr;
-        return -1;
-    }
-
+    uint32_t res = Host_RenderSetupWeightedSkin(pMeshGroup, pModelInst, lod, false);
     SetupPrelitStreamForMesh(pMeshGroup, pModelInst);
-
-    if (pMeshGroup[0x52] != 0 && pModelInst && *reinterpret_cast<uint32_t*>(pModelInst + 0xAC) != 0) {
-        return (int)Host_RenderSetupWeightedSkin(pMeshGroup, pModelInst, 0, true);
-    }
-
-    uint8_t lodIdx = pMeshGroup[0x50];
-    uint8_t* pModel = *reinterpret_cast<uint8_t**>(pMeshGroup + 0x04);
-    if (!pModel) return -1;
-
-    uint8_t vertType = pModel[lodIdx * 24 + 0x24];
-    uint32_t lod = pModelInst ? pModelInst[0x28] : 0;
-
-    switch (vertType) {
-        case 0:
-        case 3:
-            return (int)g_fnRenderSetupRigid(pMeshGroup, pModelInst, lod);
-        case 1:
-        case 4:
-            return (int)g_fnRenderSetupSkinned(pMeshGroup, pModelInst, lod);
-        case 2:
-        case 5:
-            return (int)Host_RenderSetupWeightedSkin(pMeshGroup, pModelInst, lod, false);
-        default:
-            return -1;
-    }
+    return res;
 }
 
-static int __fastcall Bridge_CloakShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
-    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
-    g_activeCustomVS = 1;
-    if (pShader) {
-        float distortBase = *reinterpret_cast<const float*>(pShader + 0x68);
-        float targetLerp  = *reinterpret_cast<const float*>(pShader + 0x6C);
-        float cloakLerp   = *reinterpret_cast<const float*>(pShader + 0x70);
-        uint32_t flag58   = *reinterpret_cast<const uint32_t*>(pShader + 0x58);
-        uint32_t empFlag  = *reinterpret_cast<const uint32_t*>(pShader + 0x5C);
-        float d = distortBase;
-        if (flag58 == 0) {
-            d = distortBase + (1.0f - cloakLerp) * (distortBase * 60.0f);
-        }
-        if (fabsf(d) < 0.5f) d = 14.0f;
-        g_cloakDistort = d;
-
-        float c35x = 1.0f - cloakLerp;
-        float c35y = *reinterpret_cast<const float*>(pShader + 0x78);
-        float c35z = *reinterpret_cast<const float*>(pShader + 0x7C);
-        float c35w = 0.0f;
-        if (flag58 == 0 && empFlag == 0 && cloakLerp < 1.0f) {
-            c35y = 0.0f;
-            c35z = 0.0f;
-            if (cloakLerp <= targetLerp && cloakLerp >= 0.94f) {
-                c35w = cloakLerp;
-            }
-        }
-        g_cloakC35[0] = (c35x > 0.01f) ? c35x : 1.0f;
-        g_cloakC35[1] = c35y;
-        g_cloakC35[2] = c35z;
-        g_cloakC35[3] = c35w;
-    }
-    return rc;
-}
-
-static int __fastcall Bridge_ScreenEffectShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
-    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
-    g_activeCustomVS = 2;
-    return rc;
-}
-
-static int __fastcall Bridge_MembraneShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
-    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
-    g_activeCustomVS = 3;
-    return rc;
-}
-
-static int __fastcall Bridge_GhostSuitShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
-    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
-    if (pShader) {
-        memcpy(reinterpret_cast<void*>(ADDR_D3D_DEVICE + 0xC60 + 3 * 64), pShader + 0x60, 64);
-    }
-    return rc;
-}
-
-static int __fastcall Bridge_SightShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
-    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
-    g_activeCustomVS = 4;
-    return rc;
-}
-
-static int __fastcall Bridge_ShieldShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
-    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
-    g_activeCustomVS = 5;
-    if (pShader) {
-        uint16_t mode = *reinterpret_cast<const uint16_t*>(pShader + 0x5C);
-        g_shieldC35x  = (mode == 1 || mode == 2) ? *reinterpret_cast<const float*>(pShader + 0x58) : 0.0f;
-    }
-    return rc;
-}
-
-static int __fastcall Bridge_TeleportShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
-    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
-    g_activeCustomVS = 6;
-    if (pShader) {
-        float t = *reinterpret_cast<const float*>(pShader + 0xA8);
-        if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
-        *reinterpret_cast<float*>(pShader + 0xA0) = t;
-        *reinterpret_cast<float*>(pShader + 0xA4) = 1.0f - t;
-        float scale = (pShader[0xB0] == 0) ? 255.0f : 128.0f;
-        uint32_t b = (uint32_t)(t * scale);
-        if (b > 255u) b = 255u;
-        *reinterpret_cast<uint32_t*>(pShader + 0xAC) = (b << 24) | (b << 16) | (b << 8) | b;
-        g_teleportC32[0] = (t * 3.0f + 1.0f) * (1.0f / 640.0f);
-        g_teleportC32[1] = ((1.0f - t) * 3.0f + 1.0f) * (1.0f / 480.0f);
-        g_teleportC33x   = t;
-    }
-    return rc;
-}
-
-static int __fastcall Bridge_MotionBlur_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
-    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
-    g_activeCustomVS = 7;
-    if (pShader) {
-        const float* v = reinterpret_cast<const float*>(pShader + 0x54);
-        g_motionBlurVec[0] = v[0];
-        g_motionBlurVec[1] = v[1];
-        g_motionBlurVec[2] = v[2];
-        g_motionBlurVec[3] = v[3];
-    }
-    return rc;
-}
-
-static int __fastcall Bridge_BumpShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
-    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
-    SetupTangentStreamForMesh(pMeshGroup, true);
-    g_activeCustomVS = kCustomVsBump;
-    return rc;
-}
-
-static int __fastcall Bridge_BumpEnvShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
-    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
-    SetupTangentStreamForMesh(pMeshGroup, true);
-    g_activeCustomVS = kCustomVsBumpEnv;
-    return rc;
-}
-
-static int __fastcall Bridge_BumpEmbossShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
-    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
-    SetupTangentStreamForMesh(pMeshGroup, true);
-    g_activeCustomVS = kCustomVsBumpEmboss;
-    if (pShader) {
-        float s = *reinterpret_cast<const float*>(pShader + 0x58);
-        g_embossScale = (fabsf(s) > 0.0001f) ? (s * 0.05f) : 0.015f;
-    }
-    return rc;
-}
-
-static int __fastcall Bridge_EnvmapShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
-    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
-    g_activeCustomVS = kCustomVsEnvmap;
-    return rc;
-}
-
-static int __fastcall Bridge_SpecularShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
-    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
-    g_activeCustomVS = kCustomVsSpecular;
-    if (pShader) {
-        float s = *reinterpret_cast<const float*>(pShader + 0x58);
-        g_specularScale = (fabsf(s) > 0.0001f) ? s : 1.0f;
-    }
-    return rc;
-}
-
-static int __fastcall Bridge_GlossEnvmapDetailShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
-    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
-    g_activeCustomVS = kCustomVsGlossEnvmapDetail;
-    if (pShader) {
-        // cGlossEnvmapDetailShader is 0x5C bytes (NewInstance at 0x005FEDF0); +0x58 holds scalar detailScale
-        float s = *reinterpret_cast<const float*>(pShader + 0x58);
-        float val = (fabsf(s) > 0.0001f) ? s : 1.0f;
-        g_detailUvScale[0] = val;
-        g_detailUvScale[1] = val;
-    }
-    return rc;
-}
-
-static int __fastcall Bridge_LightProjectShader_VertexSetup(uint8_t* pShader, void* edxUnused, uint8_t* pMeshGroup, uint8_t* pModelInst) {
-    int rc = Bridge_Shader_VertexSetup(pShader, edxUnused, pMeshGroup, pModelInst);
-    g_activeCustomVS = kCustomVsLightProject;
-    if (pShader) {
-        memcpy(&g_lightProjMat0, pShader + 0xE0, sizeof(Mat44));
-        memcpy(&g_lightProjMat1, pShader + 0x120, sizeof(Mat44));
-    }
-    return rc;
-}
-
-static int __fastcall Bridge_Shader_VertexSetupRigid(void* pShader, void* edxUnused, uint8_t* pMeshGroup, uint32_t lod, int bSetVS) {
-    (void)pShader; (void)edxUnused; (void)bSetVS;
+static uint32_t __fastcall Bridge_MeshGroup_RenderSetupBlendWeightedSkin(uint8_t* pMeshGroup, void* edxUnused, uint8_t* pModelInst, uint32_t lod) {
+    (void)edxUnused;
     g_activeCustomVS = 0;
-    uint8_t* pModelInst = *reinterpret_cast<uint8_t**>(ADDR_CUR_MODEL_INST_PTR);
+    uint32_t res = Host_RenderSetupWeightedSkin(pMeshGroup, pModelInst, lod, true);
     SetupPrelitStreamForMesh(pMeshGroup, pModelInst);
-    return (int)g_fnRenderSetupRigid(pMeshGroup, pModelInst, lod);
-}
-
-static int __fastcall Bridge_Shader_VertexSetupRigidBump(void* pShader, void* edxUnused, uint8_t* pMeshGroup, uint32_t lod, int bSetVS) {
-    int rc = Bridge_Shader_VertexSetupRigid(pShader, edxUnused, pMeshGroup, lod, bSetVS);
-    SetupTangentStreamForMesh(pMeshGroup, true);
-    return rc;
-}
-
-static int __fastcall Bridge_Shader_VertexSetupWeightedSkin(void* pShader, void* edxUnused, uint8_t* pMeshGroup, uint32_t lod, int bSetVS) {
-    (void)pShader; (void)edxUnused; (void)bSetVS;
-    g_activeCustomVS = 0;
-    uint8_t* pModelInst = *reinterpret_cast<uint8_t**>(ADDR_CUR_MODEL_INST_PTR);
-    SetupPrelitStreamForMesh(pMeshGroup, pModelInst);
-    return (int)Host_RenderSetupWeightedSkin(pMeshGroup, pModelInst, lod, false);
-}
-
-static int __fastcall Bridge_Shader_VertexSetupWeightedSkinBump(void* pShader, void* edxUnused, uint8_t* pMeshGroup, uint32_t lod, int bSetVS) {
-    int rc = Bridge_Shader_VertexSetupWeightedSkin(pShader, edxUnused, pMeshGroup, lod, bSetVS);
-    SetupTangentStreamForMesh(pMeshGroup, true);
-    return rc;
-}
-
-static int __fastcall Bridge_Shader_VertexSetupSkinned(void* pShader, void* edxUnused, uint8_t* pMeshGroup, uint32_t lod, int bSetVS) {
-    (void)pShader; (void)edxUnused; (void)bSetVS;
-    g_activeCustomVS = 0;
-    uint8_t* pModelInst = *reinterpret_cast<uint8_t**>(ADDR_CUR_MODEL_INST_PTR);
-    SetupPrelitStreamForMesh(pMeshGroup, pModelInst);
-    return (int)g_fnRenderSetupSkinned(pMeshGroup, pModelInst, lod);
-}
-
-static int __fastcall Bridge_Shader_VertexSetupSkinnedBump(void* pShader, void* edxUnused, uint8_t* pMeshGroup, uint32_t lod, int bSetVS) {
-    int rc = Bridge_Shader_VertexSetupSkinned(pShader, edxUnused, pMeshGroup, lod, bSetVS);
-    SetupTangentStreamForMesh(pMeshGroup, true);
-    return rc;
-}
-
-static int __fastcall Bridge_Shader_VertexSetupPrelit2(void* pShader, void* edxUnused, void* pMeshGroup, void* pModelInst) {
-    (void)pShader; (void)edxUnused; (void)pMeshGroup; (void)pModelInst;
-    return 0; // Return 0 so caller falls back to standard rigid/skinned setup
-}
-
-static int __fastcall Bridge_Shader_VertexSetupPrelit4(void* pShader, void* edxUnused, void* pMeshGroup, void* pModelInst, uint32_t lod, int bSetVS) {
-    (void)pShader; (void)edxUnused; (void)pMeshGroup; (void)pModelInst; (void)lod; (void)bSetVS;
-    return 0;
+    return res;
 }
 
 void InitXboxD3D8ShaderBridges() {
@@ -665,32 +850,8 @@ void InitXboxD3D8ShaderBridges() {
     InstallBridge(0x006B3CF0, &Bridge_D3DDevice_SetPixelShader);                   // _D3DDevice_SetPixelShader@4
     InstallBridge(0x006B3EF0, &Bridge_D3DDevice_SetPixelShaderConstant);           // _D3DDevice_SetPixelShaderConstant@12
 
-    // 3. Bridge cShader::VertexSetup* to Ghost.exe's built-in CPU skinning (cMeshGroup::RenderSetup*)
-    InstallBridge(0x00607AB0, &Bridge_Shader_VertexSetup);                         // cShader::VertexSetup
-    InstallBridge(0x00602FE0, &Bridge_LightProjectShader_VertexSetup);             // cLightProjectShader::VertexSetup
-    InstallBridge(0x006085B0, &Bridge_SightShader_VertexSetup);                    // cSightShader::VertexSetup
-    InstallBridge(0x00608A20, &Bridge_ShieldShader_VertexSetup);                   // cShieldShader::VertexSetup
-    InstallBridge(0x00608C50, &Bridge_TeleportShader_VertexSetup);                 // cTeleportShader::VertexSetup
-    InstallBridge(0x00609560, &Bridge_GhostSuitShader_VertexSetup);                // cGhostSuitShader::VertexSetup
-    InstallBridge(0x00609620, &Bridge_ScreenEffectShader_VertexSetup);             // cScreenEffectShader::VertexSetup
-    InstallBridge(0x00609830, &Bridge_CloakShader_VertexSetup);                    // cCloakShader::VertexSetup
-    InstallBridge(0x00609E20, &Bridge_MembraneShader_VertexSetup);                 // cMembraneShader::VertexSetup
-    InstallBridge(0x00609FE0, &Bridge_MotionBlur_VertexSetup);                     // cMotionBlur::VertexSetup
-    InstallBridge(0x006127D0, &Bridge_BumpShader_VertexSetup);                     // cBumpShader::VertexSetup
-    InstallBridge(0x00612920, &Bridge_BumpEnvShader_VertexSetup);                  // cBumpEnvShader::VertexSetup
-    InstallBridge(0x00612A70, &Bridge_BumpEmbossShader_VertexSetup);               // cBumpEmbossShader::VertexSetup
-    InstallBridge(0x00616450, &Bridge_EnvmapShader_VertexSetup);                   // cEnvmapShader::VertexSetup
-    InstallBridge(0x006165B0, &Bridge_EnvmapShader_VertexSetup);                   // cMetalEnvmapShader::VertexSetup
-    InstallBridge(0x00616860, &Bridge_GlossEnvmapDetailShader_VertexSetup);        // cGlossEnvmapDetailShader::VertexSetup
-    InstallBridge(0x00616AD0, &Bridge_SpecularShader_VertexSetup);                 // cSpecularShader::VertexSetup
-
-    InstallBridge(0x00605750, &Bridge_Shader_VertexSetupRigid);                    // cShader::VertexSetupRigid
-    InstallBridge(0x00605950, &Bridge_Shader_VertexSetupRigidBump);                // cShader::VertexSetupRigidBump
-    InstallBridge(0x00605B50, &Bridge_Shader_VertexSetupPrelit2);                  // cShader::VertexSetupPrelitRigid
-    InstallBridge(0x00605CD0, &Bridge_Shader_VertexSetupWeightedSkin);             // cShader::VertexSetupWeightedSkin
-    InstallBridge(0x00607880, &Bridge_Shader_VertexSetupWeightedSkinBump);         // cShader::VertexSetupWeightedSkinBump
-    InstallBridge(0x00605EC0, &Bridge_Shader_VertexSetupPrelit4);                  // cShader::VertexSetupPrelitWeightedSkin
-    InstallBridge(0x006060D0, &Bridge_Shader_VertexSetupSkinned);                  // cShader::VertexSetupSkinned
-    InstallBridge(0x006062D0, &Bridge_Shader_VertexSetupSkinnedBump);              // cShader::VertexSetupSkinnedBump
-    InstallBridge(0x006064F0, &Bridge_Shader_VertexSetupPrelit4);                  // cShader::VertexSetupPrelitSkinned
+    // 3. Bridge CPU weighted-skin & facial morph-target fallbacks (with Bone 0 normal-aliasing fix & prelit stream setup).
+    // All 25 cShader::VertexSetup* functions run natively in Ghost.exe, executing compiled .xvu shaders on the GPU!
+    InstallBridge(0x00606E50, &Bridge_MeshGroup_RenderSetupWeightedSkin);          // cMeshGroup::RenderSetupWeightedSkin
+    InstallBridge(0x00607390, &Bridge_MeshGroup_RenderSetupBlendWeightedSkin);     // cMeshGroup::RenderSetupBlendWeightedSkin
 }
