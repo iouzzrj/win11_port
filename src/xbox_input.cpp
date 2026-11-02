@@ -1,5 +1,4 @@
 #include "ghost_runtime.h"
-#include "ghost_bot.h"
 
 // ============================================================================
 // Xbox Input Structures (Exact 22-byte XINPUT_STATE layout)
@@ -265,14 +264,6 @@ static DWORD __stdcall Bridge_XInputGetState(HANDLE hDevice, XBOX_XINPUT_STATE* 
         if (rx != 0) pState->Gamepad.sThumbRX = (int16_t)rx;
         if (ry != 0) pState->Gamepad.sThumbRY = (int16_t)ry;
     }
-
-    GhostBot_ApplyInputState(
-        &pState->Gamepad.wButtons,
-        pState->Gamepad.bAnalogButtons,
-        &pState->Gamepad.sThumbLX,
-        &pState->Gamepad.sThumbLY,
-        &pState->Gamepad.sThumbRX,
-        &pState->Gamepad.sThumbRY);
 
     return ERROR_SUCCESS;
 }

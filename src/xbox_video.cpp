@@ -1,7 +1,6 @@
 #include "ghost_runtime.h"
 #include "ghost_addresses.h"
 #include "xbox_d3d8_types.h"
-#include "ghost_bot.h"
 #include <d3d11.h>
 #include <math.h>
 #include <vector>
@@ -209,7 +208,6 @@ static void __stdcall Bridge_D3DDevice_UpdateOverlay(
         g_swapFrameCount++;
         g_d3dCtx->UpdateSubresource(g_backBufferTex, 0, nullptr, g_overlayPixels.data(), w * 4, 0);
         DrawOsdOverlayOnBackbuffer();
-        GhostBot_OnVideoOverlayFrame();
         g_swapChain->Present(0, 0);
         if (g_rtv && g_dsv) {
             g_d3dCtx->OMSetRenderTargets(1, &g_rtv, g_dsv);

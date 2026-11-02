@@ -65,11 +65,9 @@ add_executable(GhostWin11 WIN32
     src/d3d8_texture.cpp
     src/d3d8_shader.cpp
     src/d3d8_draw.cpp
-    src/ghost_bot.cpp
     include/ghost_runtime.h
     include/ghost_addresses.h
     include/xbox_d3d8_types.h
-    include/ghost_bot.h
     shaders/ghost.hlsl
     "${GHOST_HLSL_INC}"
 )
@@ -125,7 +123,6 @@ target_link_libraries(GhostWin11 PRIVATE
     d3dcompiler
     dsound
     winmm
-    windowscodecs
 )
 
 # Output GhostWin11.exe into build/bin/GhostWin11.exe

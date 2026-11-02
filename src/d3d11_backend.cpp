@@ -1,7 +1,6 @@
 #include "ghost_runtime.h"
 #include "ghost_addresses.h"
 #include "xbox_d3d8_types.h"
-#include "ghost_bot.h"
 #include <d3d11.h>
 #include <dxgi.h>
 #include <d3dcompiler.h>
@@ -795,7 +794,6 @@ static void __stdcall Bridge_D3DDevice_Swap(DWORD Flags) {
     g_backBufferDirty = true;
 
     DrawOsdOverlayOnBackbuffer();
-    GhostBot_On3DSwapFrame();
 
     if (g_swapChain) {
         g_swapChain->Present(0, 0);
