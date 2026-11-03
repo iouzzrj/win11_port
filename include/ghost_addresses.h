@@ -25,6 +25,11 @@ static constexpr uint32_t  ADDR_D3D_DIRTYFLAGS                 = 0x006C03E8u; //
 static constexpr uint32_t  ADDR_D3D_VS_CONSTANTS               = 0x006BF7D0u; // CDevice VertexShader constants (192 * vec4)
 static constexpr uint32_t  ADDR_D3D_STREAM                     = 0x006C2D48u; // g_Stream (16 * 12 bytes)
 static constexpr uint32_t  ADDR_SIMPLE_RS_ENCODE               = 0x007502A0u; // _D3D__SimpleRenderStateEncode (92 DWORDs)
+static constexpr uint32_t  ADDR_COMPLEX_RS_FUNC_TABLE          = 0x006BE438u; // g_ComplexRenderStateFunctionTable (30 fn ptrs, RS 136..165)
+static constexpr uint32_t  ADDR_INITIAL_TEXTURE_STATES         = 0x006BE950u; // g_InitialTextureStates (32 bytes, TSS 0..31)
+static constexpr uint32_t  ADDR_INITIAL_RENDER_STATES          = 0x006BE970u; // g_InitialRenderStates (109 DWORDs, RS 57..165)
+static constexpr uint32_t  ADDR_DEVICE_MATERIAL                = 0x006C1790u; // _D3D__Device + 0x0F00 (Front D3DMATERIAL8, 68 bytes)
+static constexpr uint32_t  ADDR_DEVICE_BACK_MATERIAL           = 0x006C17D4u; // _D3D__Device + 0x0F44 (Back D3DMATERIAL8, 68 bytes)
 
 // --- Xbox D3D8 Internal Helpers (XGRPH / PixelJar) ---
 static constexpr uint32_t  ADDR_XG_SWIZZLE_RECT                = 0x0071F711u; // _XGSwizzleRect@32

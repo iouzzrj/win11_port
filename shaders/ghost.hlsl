@@ -46,16 +46,37 @@ cbuffer PerDrawCB : register(b0) {
     float4 uLightSpotParams[8];
     float4 uLightDiffuse[8];
     float4 uLightAmbient[8];
+    float4 uLightSpecular[8];
+    float4 uEyePosWorld;
+    float4 uMatBackDiffAmb;
+    float4 uMatBackSpec;
+    uint4  uStageColorKeyOp;
+    float4 uStageColorKeyColor[4];
+    uint4  uStageColorSign;
+    float4 uBumpLuminance;
+    float4 uScissorRects[8];
+    float4 uRcStageC0[8];
+    float4 uRcStageC1[8];
+    float4 uRcFinalConst[2];
 };
 
-Texture2D    tex0 : register(t0);
-Texture2D    tex1 : register(t1);
-Texture2D    tex2 : register(t2);
-Texture2D    tex3 : register(t3);
-SamplerState smp0 : register(s0);
-SamplerState smp1 : register(s1);
-SamplerState smp2 : register(s2);
-SamplerState smp3 : register(s3);
+Texture2D    tex0        : register(t0);
+Texture2D    tex1        : register(t1);
+Texture2D    tex2        : register(t2);
+Texture2D    tex3        : register(t3);
+TextureCube  cubeTex0    : register(t4);
+TextureCube  cubeTex1    : register(t5);
+TextureCube  cubeTex2    : register(t6);
+TextureCube  cubeTex3    : register(t7);
+Texture3D    volTex0     : register(t8);
+Texture3D    volTex1     : register(t9);
+Texture3D    volTex2     : register(t10);
+Texture3D    volTex3     : register(t11);
+Texture2D    gammaLutTex : register(t12);
+SamplerState smp0        : register(s0);
+SamplerState smp1        : register(s1);
+SamplerState smp2        : register(s2);
+SamplerState smp3        : register(s3);
 
 struct VSIn {
     float4 pos   : POSITION;
@@ -65,6 +86,8 @@ struct VSIn {
     float2 uv1   : TEXCOORD1;
     float2 uv2   : TEXCOORD2;
     float2 uv3   : TEXCOORD3;
+    float4 uvw_w : TEXCOORD4;
+    float4 spec  : COLOR1;
 };
 
 struct PSIn {
@@ -80,7 +103,8 @@ struct PSIn {
 
 PSIn VSMain(VSIn input) {
     PSIn o;
-    if (uFlags.x != 0u) {
+    bool isRhw = (uFlags.x & 1u) != 0u;
+    if (isRhw) {
         float vpW = max(uViewport.z, 1.0f);
         float vpH = max(uViewport.w, 1.0f);
         float ndcX = ((input.pos.x - uViewport.x) / vpW) * 2.0f - 1.0f;
@@ -95,7 +119,7 @@ PSIn VSMain(VSIn input) {
         o.pos = clipPos;
         o.eyeDist = float2(max(clipPos.w, 0.0f), input.pos.w);
     }
-    if (uLightCount.y != 0u && uFlags.x == 0u) {
+    if (uLightCount.y != 0u && !isRhw) {
         float3 wPos = input.pos.x * uWorldRow0.xyz +
                       input.pos.y * uWorldRow1.xyz +
                       input.pos.z * uWorldRow2.xyz +
@@ -106,7 +130,13 @@ PSIn VSMain(VSIn input) {
         float nLen = length(wNorm);
         if (nLen > 0.0001f) wNorm /= nLen;
 
-        float3 totRgb = input.color.rgb;
+        bool specEnable  = (uLightCount.z & 1u) != 0u;
+        bool localViewer = (uLightCount.z & 2u) != 0u;
+        float specPower  = max(uEyePosWorld.w, 0.001f);
+        float3 V = localViewer ? normalize(uEyePosWorld.xyz - wPos) : normalize(uEyePosWorld.xyz);
+
+        float3 totRgb  = input.color.rgb;
+        float3 totSpec = input.spec.rgb;
         uint numLights = min(uLightCount.x, 8u);
         for (uint l = 0u; l < numLights; ++l) {
             float4 posType = uLightPosType[l];
@@ -136,55 +166,71 @@ PSIn VSMain(VSIn input) {
             }
             float ndotl = max(dot(wNorm, L), 0.0f);
             totRgb += atten * (uLightAmbient[l].rgb + ndotl * uLightDiffuse[l].rgb);
+            if (specEnable && ndotl > 0.0f) {
+                float3 H = normalize(L + V);
+                float ndoth = max(dot(wNorm, H), 0.0f);
+                totSpec += atten * pow(ndoth, specPower) * uLightSpecular[l].rgb;
+            }
         }
         o.color = float4(saturate(totRgb), input.color.a);
+        o.norm  = specEnable ? saturate(totSpec) : ((dot(abs(input.spec.rgb), float3(1.0f, 1.0f, 1.0f)) > 0.0f) ? input.spec.rgb : input.norm);
     } else {
         o.color = input.color;
+        o.norm  = (dot(abs(input.spec.rgb), float3(1.0f, 1.0f, 1.0f)) > 0.0f) ? input.spec.rgb : input.norm;
     }
-    o.uv0   = float4(input.uv0 * uUvScale01.xy, 0.0f, 0.0f);
-    o.uv1   = float4(input.uv1 * uUvScale01.zw, 0.0f, 0.0f);
-    o.uv2   = float4(input.uv2 * uUvScale23.xy, 0.0f, 0.0f);
-    o.uv3   = float4(input.uv3 * uUvScale23.zw, 0.0f, 0.0f);
-    o.norm  = input.norm;
+    o.uv0 = float4(input.uv0 * uUvScale01.xy, input.uvw_w.x, 0.0f);
+    o.uv1 = float4(input.uv1 * uUvScale01.zw, input.uvw_w.y, 0.0f);
+    o.uv2 = float4(input.uv2 * uUvScale23.xy, input.uvw_w.z, 0.0f);
+    o.uv3 = float4(input.uv3 * uUvScale23.zw, input.uvw_w.w, 0.0f);
     return o;
 }
 
-float4 SampleCubeAtlas(Texture2D tex, SamplerState smp, float3 dir) {
-    float3 a = abs(dir);
-    float ma = max(a.x, max(a.y, a.z));
-    float face = 4.0f;
-    float sc = dir.x;
-    float tc = -dir.y;
-    if (a.x >= a.y && a.x >= a.z) {
-        ma = a.x;
-        if (dir.x >= 0.0f) { face = 0.0f; sc = -dir.z; tc = -dir.y; }
-        else               { face = 1.0f; sc =  dir.z; tc = -dir.y; }
-    } else if (a.y >= a.x && a.y >= a.z) {
-        ma = a.y;
-        if (dir.y >= 0.0f) { face = 2.0f; sc =  dir.x; tc =  dir.z; }
-        else               { face = 3.0f; sc =  dir.x; tc = -dir.z; }
+float4 SampleStageTex(
+    uint stageIdx, Texture2D tex2d, TextureCube texCube, Texture3D texVol,
+    SamplerState smp, float4 uv, bool isCube, bool isVol)
+{
+    float4 c;
+    if (isCube) {
+        c = texCube.Sample(smp, uv.xyz);
+    } else if (isVol) {
+        c = texVol.Sample(smp, uv.xyz);
     } else {
-        ma = a.z;
-        if (dir.z >= 0.0f) { face = 4.0f; sc =  dir.x; tc = -dir.y; }
-        else               { face = 5.0f; sc = -dir.x; tc = -dir.y; }
+        c = tex2d.Sample(smp, uv.xy);
     }
-    float invMa = 1.0f / max(ma, 0.0001f);
-    float u = clamp(0.5f * (sc * invMa + 1.0f), 0.004f, 0.996f);
-    float v = clamp(0.5f * (tc * invMa + 1.0f), 0.004f, 0.996f);
-    return tex.Sample(smp, float2((face + u) * (1.0f / 6.0f), v));
-}
 
-float4 SampleStage2D(Texture2D tex, SamplerState smp, float4 uv, bool isCubeAtlas) {
-    if (isCubeAtlas) {
-        if (uv.w != 0.0f) {
-            return SampleCubeAtlas(tex, smp, uv.xyz);
+    // XBOX_D3DTSS_COLORKEYOP (1=ALPHA, 2=RGBA, 3=KILL)
+    uint ckOp = uStageColorKeyOp[stageIdx];
+    if (ckOp != 0u) {
+        float4 ckCol = uStageColorKeyColor[stageIdx];
+        bool matchRgb = all(abs(c.rgb - ckCol.rgb) < (1.5f / 255.0f));
+        if (ckOp == 1u && matchRgb) {
+            c.a = 0.0f;
+        } else if (ckOp == 2u && matchRgb && abs(c.a - ckCol.a) < (1.5f / 255.0f)) {
+            c = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        } else if (ckOp == 3u && matchRgb) {
+            discard;
         }
-        return tex.Sample(smp, float2(clamp(frac(uv.x), 0.004f, 0.996f) * (1.0f / 6.0f), clamp(frac(uv.y), 0.004f, 0.996f)));
     }
-    return tex.Sample(smp, uv.xy);
+
+    // XBOX_D3DTSS_ALPHAKILL (bit 16+stageIdx in uFlags.y)
+    if (((uFlags.y >> (16u + stageIdx)) & 1u) != 0u) {
+        if (c.a < (0.5f / 255.0f)) {
+            discard;
+        }
+    }
+
+    // XBOX_D3DTSS_COLORSIGN (0x10=ASIGNED, 0x20=RSIGNED, 0x40=GSIGNED, 0x80=BSIGNED)
+    uint cSign = uStageColorSign[stageIdx];
+    if (cSign != 0u) {
+        if ((cSign & 0x20u) != 0u) c.r = c.r * 2.0f - 1.0f;
+        if ((cSign & 0x40u) != 0u) c.g = c.g * 2.0f - 1.0f;
+        if ((cSign & 0x80u) != 0u) c.b = c.b * 2.0f - 1.0f;
+        if ((cSign & 0x10u) != 0u) c.a = c.a * 2.0f - 1.0f;
+    }
+    return c;
 }
 
-float4 EvalArg(uint arg, float4 diffuse, float4 current, float4 tex, float4 tfactor, float4 spec) {
+float4 EvalArg(uint arg, float4 diffuse, float4 current, float4 tex, float4 tfactor, float4 spec, float4 tempReg) {
     uint src = arg & 0x0Fu;
     float4 v = current;
     if (src == 0u)      v = diffuse;
@@ -192,6 +238,7 @@ float4 EvalArg(uint arg, float4 diffuse, float4 current, float4 tex, float4 tfac
     else if (src == 2u) v = tex;
     else if (src == 3u) v = tfactor;
     else if (src == 4u) v = spec;
+    else if (src == 5u) v = tempReg;
     if ((arg & 0x10u) != 0u) v = 1.0f - v;
     if ((arg & 0x20u) != 0u) v = v.aaaa;
     return v;
@@ -252,54 +299,121 @@ float EvalAlphaOp(uint op, float a1, float a2, float a0, float4 diffuse, float4 
     return a1 * a2;
 }
 
-void EvalStage(uint4 colorOps, uint4 alphaOps, float4 diffuse, inout float4 current, float4 tex, float4 tfactor, float4 spec) {
-    float4 c1 = EvalArg(colorOps.y, diffuse, current, tex, tfactor, spec);
-    float4 c2 = EvalArg(colorOps.z, diffuse, current, tex, tfactor, spec);
-    float4 c0 = EvalArg(colorOps.w, diffuse, current, tex, tfactor, spec);
-    current.rgb = EvalColorOp(colorOps.x, colorOps.z, c1, c2, c0, diffuse, current, tex, tfactor);
+void EvalStage(
+    uint4 colorOps, uint4 alphaOps, float4 diffuse, inout float4 current, inout float4 tempReg,
+    float4 tex, float4 tfactor, float4 spec, bool writeToTemp)
+{
+    float4 c1 = EvalArg(colorOps.y, diffuse, current, tex, tfactor, spec, tempReg);
+    float4 c2 = EvalArg(colorOps.z, diffuse, current, tex, tfactor, spec, tempReg);
+    float4 c0 = EvalArg(colorOps.w, diffuse, current, tex, tfactor, spec, tempReg);
+    float3 outRgb = EvalColorOp(colorOps.x, colorOps.z, c1, c2, c0, diffuse, current, tex, tfactor);
+    float  outA   = writeToTemp ? tempReg.a : current.a;
     if (alphaOps.x > 1u) {
-        float4 a1 = EvalArg(alphaOps.y, diffuse, current, tex, tfactor, spec);
-        float4 a2 = EvalArg(alphaOps.z, diffuse, current, tex, tfactor, spec);
-        float4 a0 = EvalArg(alphaOps.w, diffuse, current, tex, tfactor, spec);
-        current.a = EvalAlphaOp(alphaOps.x, a1.a, a2.a, a0.a, diffuse, current, tex, tfactor);
+        float4 a1 = EvalArg(alphaOps.y, diffuse, current, tex, tfactor, spec, tempReg);
+        float4 a2 = EvalArg(alphaOps.z, diffuse, current, tex, tfactor, spec, tempReg);
+        float4 a0 = EvalArg(alphaOps.w, diffuse, current, tex, tfactor, spec, tempReg);
+        outA = EvalAlphaOp(alphaOps.x, a1.a, a2.a, a0.a, diffuse, current, tex, tfactor);
+    }
+    if (writeToTemp) {
+        tempReg = float4(outRgb, outA);
+    } else {
+        current = float4(outRgb, outA);
+    }
+}
+
+float ComputeFogFactor(float d) {
+    if (uFogParams.x <= 0.5f || (uFlags.x & 1u) != 0u) return 1.0f;
+    float fogMode = uFogParams.x;
+    if (fogMode > 3.5f) { // Pre-computed vertex fog in eyeDist.x (0..1)
+        return saturate(d);
+    } else if (fogMode > 2.5f) { // D3DFOG_LINEAR (3)
+        float span = max(uFogParams.z - uFogParams.y, 0.001f);
+        return saturate((uFogParams.z - d) / span);
+    } else if (fogMode < 1.5f) { // D3DFOG_EXP (1)
+        return saturate(exp(-d * uFogParams.w));
+    } else { // D3DFOG_EXP2 (2)
+        float df = d * uFogParams.w;
+        return saturate(exp(-(df * df)));
     }
 }
 
 float4 PSMain(PSIn input) : SV_TARGET {
+    // Hardware Multi-Rect & Exclusive Scissor Clipping (D3DDevice_SetScissors)
+    uint scissorCount = (uFlags.x >> 4u) & 0x0Fu;
+    if (scissorCount > 0u) {
+        bool insideAny = false;
+        [unroll]
+        for (uint si = 0u; si < 8u; ++si) {
+            if (si < scissorCount) {
+                float4 sr = uScissorRects[si];
+                if (input.pos.x >= sr.x && input.pos.x < sr.z &&
+                    input.pos.y >= sr.y && input.pos.y < sr.w) {
+                    insideAny = true;
+                }
+            }
+        }
+        bool scissorExcl = (uFlags.x & 4u) != 0u;
+        if (scissorExcl ? insideAny : !insideAny) {
+            discard;
+        }
+    }
+
     float4 diffuse = input.color;
     float4 specCol = float4(input.norm, 1.0f);
     float4 current = diffuse;
+    float4 tempReg = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
     uint texMask  = uFlags.y & 0x0Fu;
-    uint cubeMask = (uFlags.y >> 4u) & 0x0Fu;
-    uint projMask = (uFlags.y >> 8u) & 0x0Fu;
+    uint cubeMask = (uFlags.y >> 4u)  & 0x0Fu;
+    uint projMask = (uFlags.y >> 8u)  & 0x0Fu;
+    uint volMask  = (uFlags.y >> 12u) & 0x0Fu;
+    uint tempMask = (uFlags.y >> 20u) & 0x0Fu;
 #ifdef FIXED_PS_MODE
     const uint psMode = (uint)FIXED_PS_MODE;
 #else
     uint psMode   = uFlags.w;
 #endif
 
-    float invProjQ = (projMask != 0u && abs(input.eyeDist.y) > 0.0001f) ? (1.0f / input.eyeDist.y) : 1.0f;
-    float4 uv0 = ((projMask & 1u) != 0u) ? float4(input.uv0.xy * invProjQ, input.uv0.zw) : input.uv0;
-    float4 uv1 = ((projMask & 2u) != 0u) ? float4(input.uv1.xy * invProjQ, input.uv1.zw) : input.uv1;
-    float4 uv2 = ((projMask & 4u) != 0u) ? float4(input.uv2.xy * invProjQ, input.uv2.zw) : input.uv2;
-    float4 uv3 = ((projMask & 8u) != 0u) ? float4(input.uv3.xy * invProjQ, input.uv3.zw) : input.uv3;
+    float invProjQ0 = ((projMask & 1u) != 0u && abs(input.uv0.w) > 0.0001f) ? (1.0f / input.uv0.w) :
+                      (((projMask & 1u) != 0u && abs(input.eyeDist.y) > 0.0001f) ? (1.0f / input.eyeDist.y) : 1.0f);
+    float invProjQ1 = ((projMask & 2u) != 0u && abs(input.uv1.w) > 0.0001f) ? (1.0f / input.uv1.w) :
+                      (((projMask & 2u) != 0u && abs(input.eyeDist.y) > 0.0001f) ? (1.0f / input.eyeDist.y) : 1.0f);
+    float invProjQ2 = ((projMask & 4u) != 0u && abs(input.uv2.w) > 0.0001f) ? (1.0f / input.uv2.w) :
+                      (((projMask & 4u) != 0u && abs(input.eyeDist.y) > 0.0001f) ? (1.0f / input.eyeDist.y) : 1.0f);
+    float invProjQ3 = ((projMask & 8u) != 0u && abs(input.uv3.w) > 0.0001f) ? (1.0f / input.uv3.w) :
+                      (((projMask & 8u) != 0u && abs(input.eyeDist.y) > 0.0001f) ? (1.0f / input.eyeDist.y) : 1.0f);
 
-    float4 t0 = ((texMask & 1u) != 0u) ? SampleStage2D(tex0, smp0, uv0, (cubeMask & 1u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);
-    float4 t1 = ((texMask & 2u) != 0u) ? SampleStage2D(tex1, smp1, uv1, (cubeMask & 2u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);
+    float4 uv0 = ((projMask & 1u) != 0u) ? float4(input.uv0.xyz * invProjQ0, input.uv0.w) : input.uv0;
+    float4 uv1 = ((projMask & 2u) != 0u) ? float4(input.uv1.xyz * invProjQ1, input.uv1.w) : input.uv1;
+    float4 uv2 = ((projMask & 4u) != 0u) ? float4(input.uv2.xyz * invProjQ2, input.uv2.w) : input.uv2;
+    float4 uv3 = ((projMask & 8u) != 0u) ? float4(input.uv3.xyz * invProjQ3, input.uv3.w) : input.uv3;
 
-    // Apply BumpEnv UV offset if stage 0 / stage 1 uses BUMPENVMAP (22 without SPECULAR arg2) or texbem t1, t0 pixel shaders (emBump=1, lava=2, heatShimmer=3)
+    float4 t0 = ((texMask & 1u) != 0u) ? SampleStageTex(0u, tex0, cubeTex0, volTex0, smp0, uv0, (cubeMask & 1u) != 0u, (volMask & 1u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);
+    float4 t1 = ((texMask & 2u) != 0u) ? SampleStageTex(1u, tex1, cubeTex1, volTex1, smp1, uv1, (cubeMask & 2u) != 0u, (volMask & 2u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);
+
+    // Apply BumpEnv UV offset & BUMPENVLSCALE/OFFSET if stage 0 / stage 1 uses BUMPENVMAP (22 without SPECULAR arg2) or texbem t1, t0 pixel shaders
     if ((uStage0Ops.x == 22u && (uStage0Ops.z & 0x0Fu) != 4u) || psMode == 1u || psMode == 2u || psMode == 3u) {
-        float2 d = t0.rg * 2.0f - 1.0f;
+        float2 d = ((uStageColorSign[0] & 0x60u) != 0u) ? t0.rg : (t0.rg * 2.0f - 1.0f);
         uv1.xy += float2(d.x * uBumpParams.x + d.y * uBumpParams.z, d.x * uBumpParams.y + d.y * uBumpParams.w);
-        if ((texMask & 2u) != 0u) t1 = SampleStage2D(tex1, smp1, uv1, (cubeMask & 2u) != 0u);
+        if ((texMask & 2u) != 0u) {
+            t1 = SampleStageTex(1u, tex1, cubeTex1, volTex1, smp1, uv1, (cubeMask & 2u) != 0u, (volMask & 2u) != 0u);
+        }
+        if (uBumpLuminance.x != 0.0f || uBumpLuminance.y != 0.0f) {
+            t1.rgb *= saturate(t0.b * uBumpLuminance.x + uBumpLuminance.y);
+        }
     }
     if (uStage1Ops.x == 22u && (uStage1Ops.z & 0x0Fu) != 4u) {
-        float2 d = t1.rg * 2.0f - 1.0f;
+        float2 d = ((uStageColorSign[1] & 0x60u) != 0u) ? t1.rg : (t1.rg * 2.0f - 1.0f);
         uv2.xy += float2(d.x * uBumpParams.x + d.y * uBumpParams.z, d.x * uBumpParams.y + d.y * uBumpParams.w);
     }
 
-    float4 t2 = ((texMask & 4u) != 0u) ? SampleStage2D(tex2, smp2, uv2, (cubeMask & 4u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);
-    float4 t3 = ((texMask & 8u) != 0u) ? SampleStage2D(tex3, smp3, uv3, (cubeMask & 8u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);
+    float4 t2 = ((texMask & 4u) != 0u) ? SampleStageTex(2u, tex2, cubeTex2, volTex2, smp2, uv2, (cubeMask & 4u) != 0u, (volMask & 4u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);
+    if (uStage1Ops.x == 22u && (uStage1Ops.z & 0x0Fu) != 4u && (uBumpLuminance.z != 0.0f || uBumpLuminance.w != 0.0f)) {
+        t2.rgb *= saturate(t1.b * uBumpLuminance.z + uBumpLuminance.w);
+    }
+    float4 t3 = ((texMask & 8u) != 0u) ? SampleStageTex(3u, tex3, cubeTex3, volTex3, smp3, uv3, (cubeMask & 8u) != 0u, (volMask & 8u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);
+
+    float fogFactor = ComputeFogFactor(input.eyeDist.x);
 
     if (psMode > 0u) {
         uint pt = psMode - 1u;
@@ -311,9 +425,9 @@ float4 PSMain(PSIn input) : SV_TARGET {
         } else if (pt == 2u) { // heatShimmer.xpu: tex t0; texbem t1, t0; tex t2; mul r0.rgb, t1, t2; mul r0.a, t2.a, v0.a
             current.rgb = t1.rgb * t2.rgb;
             current.a   = t2.a * diffuse.a;
-        } else if (pt == 3u) { // terrain_fog.xpu: outputs fog.rgb and diffuse.a
+        } else if (pt == 3u) { // terrain_fog.xpu: xfc zero, zero, zero, fog.rgb, zero, zero, fog.a
             current.rgb = uFogColor.rgb;
-            current.a   = saturate(diffuse.a);
+            current.a   = (uFogParams.x > 0.5f) ? fogFactor : saturate(diffuse.a);
         } else if (pt == 4u) { // ghostsuit.xpu: add r1.rgb, t1, c1; mov r0.a, t0.a; xmmc r0, t0, v0, c0, r1 (r0.a>=0.5 ? CD : AB)
             float3 r1 = saturate(t1.rgb + uPsConst1.rgb);
             current.rgb = (t0.a >= 0.5f) ? (uPsConst0.rgb * r1)   : (t0.rgb * diffuse.rgb);
@@ -330,7 +444,7 @@ float4 PSMain(PSIn input) : SV_TARGET {
             float4 refl = t3;
             if ((texMask & 8u) != 0u) {
                 refl = ((cubeMask & 8u) != 0u)
-                    ? SampleCubeAtlas(tex3, smp3, R)
+                    ? cubeTex3.Sample(smp3, R)
                     : tex3.Sample(smp3, float2(R.x * 0.5f + 0.5f, 0.5f - R.y * 0.5f));
             }
             current = refl;
@@ -443,16 +557,21 @@ float4 PSMain(PSIn input) : SV_TARGET {
             r0a = t2.b - (saturate(uPsConst0.b) - 0.5f);
             current = (r0a >= 0.5f) ? r1 : uPsConst2;
         }
-    } else if (uStage0Ops.x > 1u) {
-        EvalStage(uStage0Ops, uStage0Alpha, diffuse, current, t0, uTFactor, specCol);
-        if (uStage1Ops.x > 1u) {
-            EvalStage(uStage1Ops, uStage1Alpha, diffuse, current, t1, uTFactor, specCol);
-            if (uStage2Ops.x > 1u) {
-                EvalStage(uStage2Ops, uStage2Alpha, diffuse, current, t2, uTFactor, specCol);
-                if (uStage3Ops.x > 1u) {
-                    EvalStage(uStage3Ops, uStage3Alpha, diffuse, current, t3, uTFactor, specCol);
+    } else {
+        if (uStage0Ops.x > 1u) {
+            EvalStage(uStage0Ops, uStage0Alpha, diffuse, current, tempReg, t0, uTFactor, specCol, (tempMask & 1u) != 0u);
+            if (uStage1Ops.x > 1u) {
+                EvalStage(uStage1Ops, uStage1Alpha, diffuse, current, tempReg, t1, uTFactor, specCol, (tempMask & 2u) != 0u);
+                if (uStage2Ops.x > 1u) {
+                    EvalStage(uStage2Ops, uStage2Alpha, diffuse, current, tempReg, t2, uTFactor, specCol, (tempMask & 4u) != 0u);
+                    if (uStage3Ops.x > 1u) {
+                        EvalStage(uStage3Ops, uStage3Alpha, diffuse, current, tempReg, t3, uTFactor, specCol, (tempMask & 8u) != 0u);
+                    }
                 }
             }
+        }
+        if ((uFlags.x & 8u) != 0u || (uLightCount.z & 1u) != 0u) {
+            current.rgb = saturate(current.rgb + specCol.rgb);
         }
     }
 
@@ -470,20 +589,8 @@ float4 PSMain(PSIn input) : SV_TARGET {
         if (!passAlpha) discard;
     }
 
-    // Hardware Distance & Atmospheric Fog (3D geometry only)
-    if (uFogParams.x > 0.5f && uFlags.x == 0u) {
-        float fogMode = uFogParams.x;
-        float d = input.eyeDist.x;
-        float fogFactor = 1.0f;
-        if (fogMode > 2.5f) { // D3DFOG_LINEAR (3)
-            float span = max(uFogParams.z - uFogParams.y, 0.001f);
-            fogFactor = saturate((uFogParams.z - d) / span);
-        } else if (fogMode < 1.5f) { // D3DFOG_EXP (1)
-            fogFactor = saturate(exp(-d * uFogParams.w));
-        } else { // D3DFOG_EXP2 (2)
-            float df = d * uFogParams.w;
-            fogFactor = saturate(exp(-(df * df)));
-        }
+    // Hardware Distance & Atmospheric Fog (3D geometry only; skip for terrain_fog.xpu which outputs fog directly)
+    if (uFogParams.x > 0.5f && (uFlags.x & 1u) == 0u && psMode != 4u) {
         float fogAmt = 1.0f - fogFactor;
         if (uFogColor.w > 0.5f) {
             current.rgb *= fogFactor;
@@ -492,8 +599,14 @@ float4 PSMain(PSIn input) : SV_TARGET {
         }
     }
 
-    // Gamma & Brightness adjustment
-    if (uAlphaTest.z > 0.1f && abs(uAlphaTest.z - 1.0f) > 0.01f) {
+    // Full 256-entry RGB Gamma Ramp LUT or scalar Gamma/Brightness adjustment
+    if ((uFlags.x & 2u) != 0u) {
+        int3 lutIdx = clamp(int3(saturate(current.rgb) * 255.0f + 0.5f), 0, 255);
+        float rLut  = gammaLutTex.Load(int3(lutIdx.r, 0, 0)).r;
+        float gLut  = gammaLutTex.Load(int3(lutIdx.g, 0, 0)).g;
+        float bLut  = gammaLutTex.Load(int3(lutIdx.b, 0, 0)).b;
+        current.rgb = float3(rLut, gLut, bLut);
+    } else if (uAlphaTest.z > 0.1f && (abs(uAlphaTest.z - 1.0f) > 0.01f || abs(uAlphaTest.w - 1.0f) > 0.01f)) {
         current.rgb = pow(max(current.rgb, 0.0f), 1.0f / uAlphaTest.z) * uAlphaTest.w;
     }
 

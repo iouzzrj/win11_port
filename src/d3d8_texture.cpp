@@ -37,12 +37,16 @@ struct CachedTexture {
     size_t                    maxReadableBytes;
     bool                      dirty;
     bool                      isRenderTarget;
-    bool                      isCubeAtlas;
+    bool                      isCube;
+    bool                      isVolume;
     uint32_t                  width;
     uint32_t                  height;
+    uint32_t                  depth;
+    uint32_t                  mipLevels;
     uint32_t                  texWidth;
     uint32_t                  texHeight;
     ID3D11Texture2D*          tex2D;
+    ID3D11Texture3D*          tex3D;
     ID3D11ShaderResourceView* srv;
     ID3D11RenderTargetView*   rtv;
 };
@@ -51,9 +55,12 @@ static std::vector<CachedTexture> g_texCache;
 
 static void MarkTextureDirtyByData(uint32_t dataPtr) {
     for (size_t i = 0; i < g_texCache.size(); ++i) {
-        if (g_texCache[i].dataPtr == dataPtr || reinterpret_cast<uint32_t>(g_texCache[i].xboxTex) == dataPtr) {
-            g_texCache[i].dirty = true;
-            g_texCache[i].isRenderTarget = false;
+        CachedTexture& c = g_texCache[i];
+        uint32_t endPtr = c.dataPtr + static_cast<uint32_t>(c.maxReadableBytes ? c.maxReadableBytes : 1u);
+        if ((dataPtr >= c.dataPtr && dataPtr < endPtr) ||
+            reinterpret_cast<uint32_t>(c.xboxTex) == dataPtr) {
+            c.dirty = true;
+            c.isRenderTarget = false;
         }
     }
 }
@@ -376,6 +383,36 @@ static void DecodeSingleXboxSurfaceToBGRA8(
     }
 }
 
+// Computes the byte size of a single mip level in an Xbox swizzled/DXT container,
+// matching FindSurfaceWithinTexture@PixelJar@D3D (0x006B7030..0x006B7058).
+static size_t ComputeXboxMipByteSize(uint32_t logW, uint32_t logH, uint32_t logD, uint32_t xboxFmt, uint32_t bitsPerPixel) {
+    bool isDxt = (xboxFmt == 0x0Cu || xboxFmt == 0x0Eu || xboxFmt == 0x0Fu);
+    uint32_t minLog = isDxt ? 2u : 0u;
+    uint32_t effW = (logW > minLog) ? logW : minLog;
+    uint32_t effH = (logH > minLog) ? logH : minLog;
+    return ((size_t)1u << (effW + effH + logD)) * bitsPerPixel / 8u;
+}
+
+static void GenerateBoxMip2D(const uint32_t* src, uint32_t srcW, uint32_t srcH, uint32_t* dst, uint32_t dstW, uint32_t dstH) {
+    for (uint32_t y = 0; y < dstH; ++y) {
+        uint32_t sy0 = (y * 2 < srcH) ? (y * 2) : (srcH - 1);
+        uint32_t sy1 = (y * 2 + 1 < srcH) ? (y * 2 + 1) : sy0;
+        for (uint32_t x = 0; x < dstW; ++x) {
+            uint32_t sx0 = (x * 2 < srcW) ? (x * 2) : (srcW - 1);
+            uint32_t sx1 = (x * 2 + 1 < srcW) ? (x * 2 + 1) : sx0;
+            uint32_t p00 = src[sy0 * srcW + sx0];
+            uint32_t p10 = src[sy0 * srcW + sx1];
+            uint32_t p01 = src[sy1 * srcW + sx0];
+            uint32_t p11 = src[sy1 * srcW + sx1];
+            uint32_t b = ((p00 & 0xFFu) + (p10 & 0xFFu) + (p01 & 0xFFu) + (p11 & 0xFFu) + 2u) >> 2;
+            uint32_t g = (((p00 >> 8) & 0xFFu) + ((p10 >> 8) & 0xFFu) + ((p01 >> 8) & 0xFFu) + ((p11 >> 8) & 0xFFu) + 2u) >> 2;
+            uint32_t r = (((p00 >> 16) & 0xFFu) + ((p10 >> 16) & 0xFFu) + ((p01 >> 16) & 0xFFu) + ((p11 >> 16) & 0xFFu) + 2u) >> 2;
+            uint32_t a = (((p00 >> 24) & 0xFFu) + ((p10 >> 24) & 0xFFu) + ((p01 >> 24) & 0xFFu) + ((p11 >> 24) & 0xFFu) + 2u) >> 2;
+            dst[y * dstW + x] = (a << 24) | (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
 static void UploadXboxTextureToD3D11(CachedTexture& entry, const XboxPixelContainer* pTex) {
     if (!g_d3dDevice || !g_d3dCtx) return;
 
@@ -394,6 +431,19 @@ static void UploadXboxTextureToD3D11(CachedTexture& entry, const XboxPixelContai
     bool isCubeMap = (pTex->Format & kXboxTexFormatCubemapMask) != 0u;
     bool isVolume  = (((pTex->Format >> kXboxTexFormatDimShift) & kXboxTexFormatDimMask) == kXboxTexDimensionVolume);
     uint32_t depth = isVolume ? (1u << ((pTex->Format >> kXboxTexFormatDepthShift) & 0x0Fu)) : 1u;
+    if (!isSwizzled) {
+        isCubeMap = false;
+        isVolume  = false;
+        depth     = 1u;
+        levels    = 1u;
+    }
+
+    uint32_t maxDim = (w > h) ? w : h;
+    if (depth > maxDim) maxDim = depth;
+    uint32_t maxPossibleMips = 1u;
+    while ((1u << maxPossibleMips) <= maxDim) ++maxPossibleMips;
+    if (levels > maxPossibleMips) levels = maxPossibleMips;
+    if (levels == 0) levels = 1u;
 
     const uint8_t* srcData = reinterpret_cast<const uint8_t*>(pTex->Data);
     size_t maxReadable = GetReadableBytesAt(srcData);
@@ -409,103 +459,266 @@ static void UploadXboxTextureToD3D11(CachedTexture& entry, const XboxPixelContai
         default: bpp = 4; break;
     }
     uint32_t bitsPerPixel = isDxt ? ((xboxFmt == 0x0C) ? 4u : 8u) : (bpp * 8u);
-    size_t sliceBytes = isDxt
+    size_t baseSliceBytes = isDxt
         ? ((size_t)((w + 3u) / 4u) * ((h + 3u) / 4u) * ((xboxFmt == 0x0C) ? 8u : 16u))
         : ((size_t)(linearPitch ? linearPitch : (w * bpp)) * h);
-    if (sliceBytes > maxReadable) return;
+    if (baseSliceBytes > maxReadable) return;
 
-    uint32_t atlasW = w;
-    uint32_t atlasH = h;
-    bool isCubeAtlas = false;
-    std::vector<uint32_t> bgraPixels;
+    uint32_t baseLogW = (pTex->Format >> 20) & 0x0Fu;
+    uint32_t baseLogH = (pTex->Format >> 24) & 0x0Fu;
+    uint32_t baseLogD = isVolume ? ((pTex->Format >> 28) & 0x0Fu) : 0u;
 
-    if (isCubeMap && (w * kXboxCubemapFaceCount) <= 8192u) {
-        atlasW = w * kXboxCubemapFaceCount;
-        atlasH = h;
-        isCubeAtlas = true;
-        bgraPixels.assign((size_t)atlasW * atlasH, 0xFFFFFFFFu);
+    entry.width     = w;
+    entry.height    = h;
+    entry.depth     = depth;
+    entry.mipLevels = levels;
+    entry.isCube    = isCubeMap;
+    entry.isVolume  = (isVolume && depth > 1u);
 
+    // ------------------------------------------------------------------------
+    // Case 1: True Hardware Cubemap (ID3D11Texture2D ArraySize=6, TEXTURECUBE)
+    // ------------------------------------------------------------------------
+    if (isCubeMap) {
         size_t faceStride = ComputeXboxCubemapFaceStride(pTex->Format, xboxFmt, levels, bitsPerPixel);
-        std::vector<uint32_t> facePixels[kXboxCubemapFaceCount];
         bool faceNonZero[kXboxCubemapFaceCount] = {};
         int firstNonZeroFace = -1;
 
         for (uint32_t face = 0; face < kXboxCubemapFaceCount; ++face) {
-            facePixels[face].assign((size_t)w * h, 0u);
             size_t faceOff = (size_t)face * faceStride;
-            if (faceOff + sliceBytes <= maxReadable) {
+            if (faceOff + baseSliceBytes <= maxReadable) {
                 const uint8_t* faceSrc = srcData + faceOff;
-                for (size_t k = 0; k < sliceBytes; k += 4) {
+                for (size_t k = 0; k + 4 <= baseSliceBytes; k += 4) {
                     if (*reinterpret_cast<const uint32_t*>(faceSrc + k) != 0u) {
                         faceNonZero[face] = true;
                         break;
                     }
                 }
-                if (faceNonZero[face]) {
-                    DecodeSingleXboxSurfaceToBGRA8(faceSrc, w, h, xboxFmt, isSwizzled, linearPitch, false, 1u, 0u, facePixels[face].data());
-                    if (firstNonZeroFace < 0) firstNonZeroFace = (int)face;
+                if (faceNonZero[face] && firstNonZeroFace < 0) {
+                    firstNonZeroFace = (int)face;
                 }
             }
         }
         if (firstNonZeroFace < 0) {
-            DecodeSingleXboxSurfaceToBGRA8(srcData, w, h, xboxFmt, isSwizzled, linearPitch, false, 1u, 0u, facePixels[0].data());
             firstNonZeroFace = 0;
             faceNonZero[0] = true;
         }
+
+        uint32_t totalSubres = kXboxCubemapFaceCount * levels;
+        std::vector<std::vector<uint32_t>> subresPixels(totalSubres);
+        std::vector<D3D11_SUBRESOURCE_DATA> initData(totalSubres);
+
         for (uint32_t face = 0; face < kXboxCubemapFaceCount; ++face) {
-            const uint32_t* srcFace = faceNonZero[face] ? facePixels[face].data() : facePixels[firstNonZeroFace].data();
-            for (uint32_t y = 0; y < h; ++y) {
-                memcpy(&bgraPixels[(size_t)y * atlasW + (size_t)face * w], &srcFace[(size_t)y * w], (size_t)w * sizeof(uint32_t));
+            uint32_t srcFaceIdx = faceNonZero[face] ? face : (uint32_t)firstNonZeroFace;
+            size_t faceBaseOff = (size_t)srcFaceIdx * faceStride;
+            size_t mipOff = 0;
+            uint32_t logW = baseLogW, logH = baseLogH;
+
+            for (uint32_t m = 0; m < levels; ++m) {
+                uint32_t mipW = (w >> m) ? (w >> m) : 1u;
+                uint32_t mipH = (h >> m) ? (h >> m) : 1u;
+                uint32_t subIdx = face * levels + m;
+                subresPixels[subIdx].assign((size_t)mipW * mipH, 0xFFFFFFFFu);
+
+                size_t mipBytes = ComputeXboxMipByteSize(logW, logH, 0u, xboxFmt, bitsPerPixel);
+                if (faceBaseOff + mipOff + mipBytes <= maxReadable) {
+                    DecodeSingleXboxSurfaceToBGRA8(
+                        srcData + faceBaseOff + mipOff, mipW, mipH, xboxFmt,
+                        isSwizzled, 0u, false, 1u, 0u, subresPixels[subIdx].data());
+                } else if (m > 0) {
+                    uint32_t prevW = (w >> (m - 1)) ? (w >> (m - 1)) : 1u;
+                    uint32_t prevH = (h >> (m - 1)) ? (h >> (m - 1)) : 1u;
+                    GenerateBoxMip2D(subresPixels[face * levels + (m - 1)].data(), prevW, prevH,
+                                     subresPixels[subIdx].data(), mipW, mipH);
+                }
+
+                initData[subIdx].pSysMem = subresPixels[subIdx].data();
+                initData[subIdx].SysMemPitch = mipW * 4u;
+                initData[subIdx].SysMemSlicePitch = 0u;
+
+                mipOff += mipBytes;
+                if (logW > 0) --logW;
+                if (logH > 0) --logH;
             }
         }
-    } else if (isVolume && depth > 1u && sliceBytes * depth <= maxReadable && (w * depth) <= 8192u) {
-        atlasW = w * depth;
-        atlasH = h;
-        bgraPixels.assign((size_t)atlasW * atlasH, 0xFFFFFFFFu);
-        std::vector<uint32_t> slicePixels((size_t)w * h, 0xFFFFFFFFu);
-        for (uint32_t z = 0; z < depth; ++z) {
-            const uint8_t* zSrc = (isDxt || !isSwizzled) ? (srcData + (size_t)z * sliceBytes) : srcData;
-            DecodeSingleXboxSurfaceToBGRA8(zSrc, w, h, xboxFmt, isSwizzled, linearPitch, !isDxt && isSwizzled, depth, z, slicePixels.data());
-            for (uint32_t y = 0; y < h; ++y) {
-                memcpy(&bgraPixels[(size_t)y * atlasW + (size_t)z * w], &slicePixels[(size_t)y * w], (size_t)w * sizeof(uint32_t));
+
+        if (!entry.tex2D || entry.tex3D || entry.texWidth != w || entry.texHeight != h) {
+            if (entry.rtv)   { entry.rtv->Release();   entry.rtv = nullptr; }
+            if (entry.srv)   { entry.srv->Release();   entry.srv = nullptr; }
+            if (entry.tex2D) { entry.tex2D->Release(); entry.tex2D = nullptr; }
+            if (entry.tex3D) { entry.tex3D->Release(); entry.tex3D = nullptr; }
+            entry.texWidth  = w;
+            entry.texHeight = h;
+
+            D3D11_TEXTURE2D_DESC td = {};
+            td.Width            = w;
+            td.Height           = h;
+            td.MipLevels        = levels;
+            td.ArraySize        = kXboxCubemapFaceCount;
+            td.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage            = D3D11_USAGE_DEFAULT;
+            td.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+            td.MiscFlags        = D3D11_RESOURCE_MISC_TEXTURECUBE;
+
+            if (SUCCEEDED(g_d3dDevice->CreateTexture2D(&td, initData.data(), &entry.tex2D))) {
+                D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+                srvDesc.Format                      = DXGI_FORMAT_B8G8R8A8_UNORM;
+                srvDesc.ViewDimension               = D3D11_SRV_DIMENSION_TEXTURECUBE;
+                srvDesc.TextureCube.MostDetailedMip = 0;
+                srvDesc.TextureCube.MipLevels       = levels;
+                g_d3dDevice->CreateShaderResourceView(entry.tex2D, &srvDesc, &entry.srv);
+            }
+        } else {
+            for (uint32_t face = 0; face < kXboxCubemapFaceCount; ++face) {
+                for (uint32_t m = 0; m < levels; ++m) {
+                    uint32_t mipW = (w >> m) ? (w >> m) : 1u;
+                    uint32_t subIdx = face * levels + m;
+                    g_d3dCtx->UpdateSubresource(entry.tex2D, subIdx, nullptr, subresPixels[subIdx].data(), mipW * 4u, 0u);
+                }
             }
         }
-    } else {
-        bgraPixels.assign((size_t)w * h, 0xFFFFFFFFu);
-        DecodeSingleXboxSurfaceToBGRA8(srcData, w, h, xboxFmt, isSwizzled, linearPitch, false, 1u, 0u, bgraPixels.data());
+        entry.dirty = false;
+        return;
     }
 
-    entry.width = w;
-    entry.height = h;
-    entry.isCubeAtlas = isCubeAtlas;
+    // ------------------------------------------------------------------------
+    // Case 2: True Hardware 3D Volume Texture (ID3D11Texture3D, TEXTURE3D)
+    // ------------------------------------------------------------------------
+    if (entry.isVolume) {
+        std::vector<std::vector<uint32_t>> mipPixels(levels);
+        std::vector<D3D11_SUBRESOURCE_DATA> initData(levels);
+        size_t mipOff = 0;
+        uint32_t logW = baseLogW, logH = baseLogH, logD = baseLogD;
 
-    if (!entry.tex2D || entry.texWidth != atlasW || entry.texHeight != atlasH) {
+        for (uint32_t m = 0; m < levels; ++m) {
+            uint32_t mipW = (w >> m) ? (w >> m) : 1u;
+            uint32_t mipH = (h >> m) ? (h >> m) : 1u;
+            uint32_t mipD = (depth >> m) ? (depth >> m) : 1u;
+            mipPixels[m].assign((size_t)mipW * mipH * mipD, 0xFFFFFFFFu);
+
+            size_t mipBytes = ComputeXboxMipByteSize(logW, logH, logD, xboxFmt, bitsPerPixel);
+            size_t sliceBytesMip = ComputeXboxMipByteSize(logW, logH, 0u, xboxFmt, bitsPerPixel);
+
+            if (mipOff + mipBytes <= maxReadable) {
+                const uint8_t* mipSrc = srcData + mipOff;
+                for (uint32_t z = 0; z < mipD; ++z) {
+                    const uint8_t* zSrc = (isDxt || !isSwizzled) ? (mipSrc + (size_t)z * sliceBytesMip) : mipSrc;
+                    uint32_t* dstSlice = &mipPixels[m][(size_t)z * mipW * mipH];
+                    DecodeSingleXboxSurfaceToBGRA8(
+                        zSrc, mipW, mipH, xboxFmt, isSwizzled, 0u,
+                        !isDxt && isSwizzled, mipD, z, dstSlice);
+                }
+            }
+
+            initData[m].pSysMem          = mipPixels[m].data();
+            initData[m].SysMemPitch      = mipW * 4u;
+            initData[m].SysMemSlicePitch = mipW * mipH * 4u;
+
+            mipOff += mipBytes;
+            if (logW > 0) --logW;
+            if (logH > 0) --logH;
+            if (logD > 0) --logD;
+        }
+
+        if (!entry.tex3D || entry.tex2D || entry.texWidth != w || entry.texHeight != h) {
+            if (entry.rtv)   { entry.rtv->Release();   entry.rtv = nullptr; }
+            if (entry.srv)   { entry.srv->Release();   entry.srv = nullptr; }
+            if (entry.tex2D) { entry.tex2D->Release(); entry.tex2D = nullptr; }
+            if (entry.tex3D) { entry.tex3D->Release(); entry.tex3D = nullptr; }
+            entry.texWidth  = w;
+            entry.texHeight = h;
+
+            D3D11_TEXTURE3D_DESC td3 = {};
+            td3.Width     = w;
+            td3.Height    = h;
+            td3.Depth     = depth;
+            td3.MipLevels = levels;
+            td3.Format    = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td3.Usage     = D3D11_USAGE_DEFAULT;
+            td3.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+            if (SUCCEEDED(g_d3dDevice->CreateTexture3D(&td3, initData.data(), &entry.tex3D))) {
+                D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+                srvDesc.Format                    = DXGI_FORMAT_B8G8R8A8_UNORM;
+                srvDesc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE3D;
+                srvDesc.Texture3D.MostDetailedMip = 0;
+                srvDesc.Texture3D.MipLevels       = levels;
+                g_d3dDevice->CreateShaderResourceView(entry.tex3D, &srvDesc, &entry.srv);
+            }
+        } else {
+            for (uint32_t m = 0; m < levels; ++m) {
+                uint32_t mipW = (w >> m) ? (w >> m) : 1u;
+                uint32_t mipH = (h >> m) ? (h >> m) : 1u;
+                g_d3dCtx->UpdateSubresource(entry.tex3D, m, nullptr, mipPixels[m].data(), mipW * 4u, mipW * mipH * 4u);
+            }
+        }
+        entry.dirty = false;
+        return;
+    }
+
+    // ------------------------------------------------------------------------
+    // Case 3: Standard 2D Texture with Full Mip Chain (ID3D11Texture2D)
+    // ------------------------------------------------------------------------
+    std::vector<std::vector<uint32_t>> mipPixels(levels);
+    std::vector<D3D11_SUBRESOURCE_DATA> initData(levels);
+    size_t mipOff = 0;
+    uint32_t logW = baseLogW, logH = baseLogH;
+
+    for (uint32_t m = 0; m < levels; ++m) {
+        uint32_t mipW = (w >> m) ? (w >> m) : 1u;
+        uint32_t mipH = (h >> m) ? (h >> m) : 1u;
+        mipPixels[m].assign((size_t)mipW * mipH, 0xFFFFFFFFu);
+
+        size_t mipBytes = isSwizzled
+            ? ComputeXboxMipByteSize(logW, logH, 0u, xboxFmt, bitsPerPixel)
+            : baseSliceBytes;
+
+        if (mipOff + mipBytes <= maxReadable) {
+            DecodeSingleXboxSurfaceToBGRA8(
+                srcData + mipOff, mipW, mipH, xboxFmt,
+                isSwizzled, (m == 0) ? linearPitch : 0u, false, 1u, 0u, mipPixels[m].data());
+        } else if (m > 0) {
+            uint32_t prevW = (w >> (m - 1)) ? (w >> (m - 1)) : 1u;
+            uint32_t prevH = (h >> (m - 1)) ? (h >> (m - 1)) : 1u;
+            GenerateBoxMip2D(mipPixels[m - 1].data(), prevW, prevH, mipPixels[m].data(), mipW, mipH);
+        }
+
+        initData[m].pSysMem          = mipPixels[m].data();
+        initData[m].SysMemPitch      = mipW * 4u;
+        initData[m].SysMemSlicePitch = 0u;
+
+        mipOff += mipBytes;
+        if (logW > 0) --logW;
+        if (logH > 0) --logH;
+    }
+
+    if (!entry.tex2D || entry.tex3D || entry.texWidth != w || entry.texHeight != h) {
         if (entry.rtv)   { entry.rtv->Release();   entry.rtv = nullptr; }
         if (entry.srv)   { entry.srv->Release();   entry.srv = nullptr; }
         if (entry.tex2D) { entry.tex2D->Release(); entry.tex2D = nullptr; }
-        entry.texWidth = atlasW;
-        entry.texHeight = atlasH;
+        if (entry.tex3D) { entry.tex3D->Release(); entry.tex3D = nullptr; }
+        entry.texWidth  = w;
+        entry.texHeight = h;
 
         D3D11_TEXTURE2D_DESC td = {};
-        td.Width = atlasW;
-        td.Height = atlasH;
-        td.MipLevels = 1;
-        td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.Width            = w;
+        td.Height           = h;
+        td.MipLevels        = levels;
+        td.ArraySize        = 1;
+        td.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
         td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        td.Usage            = D3D11_USAGE_DEFAULT;
+        td.BindFlags        = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 
-        D3D11_SUBRESOURCE_DATA initData = {};
-        initData.pSysMem = bgraPixels.data();
-        initData.SysMemPitch = atlasW * 4;
-
-        if (SUCCEEDED(g_d3dDevice->CreateTexture2D(&td, &initData, &entry.tex2D))) {
+        if (SUCCEEDED(g_d3dDevice->CreateTexture2D(&td, initData.data(), &entry.tex2D))) {
             g_d3dDevice->CreateShaderResourceView(entry.tex2D, nullptr, &entry.srv);
             g_d3dDevice->CreateRenderTargetView(entry.tex2D, nullptr, &entry.rtv);
         }
     } else if (entry.tex2D) {
-        g_d3dCtx->UpdateSubresource(entry.tex2D, 0, nullptr, bgraPixels.data(), atlasW * 4, 0);
+        for (uint32_t m = 0; m < levels; ++m) {
+            uint32_t mipW = (w >> m) ? (w >> m) : 1u;
+            g_d3dCtx->UpdateSubresource(entry.tex2D, m, nullptr, mipPixels[m].data(), mipW * 4u, 0u);
+        }
     }
     entry.dirty = false;
 }
@@ -601,10 +814,13 @@ static CachedTexture* GetOrCreateRenderTargetEntry(XboxPixelContainer* pTex) {
     return &g_texCache.back();
 }
 
-ID3D11ShaderResourceView* GetOrCreateD3D11SRV(XboxPixelContainer* pTex, float* outUScale, float* outVScale, bool* outIsCube) {
-    if (outUScale) *outUScale = 1.0f;
-    if (outVScale) *outVScale = 1.0f;
-    if (outIsCube) *outIsCube = false;
+ID3D11ShaderResourceView* GetOrCreateD3D11SRV(
+    XboxPixelContainer* pTex, float* outUScale, float* outVScale, bool* outIsCube, bool* outIsVolume)
+{
+    if (outUScale)   *outUScale   = 1.0f;
+    if (outVScale)   *outVScale   = 1.0f;
+    if (outIsCube)   *outIsCube   = false;
+    if (outIsVolume) *outIsVolume = false;
     if (!pTex || !pTex->Data || (uintptr_t)pTex->Data < 0x00400000) return nullptr;
 
     // Check if pTex is the Xbox main backbuffer (bound as a source texture by bloom/blur/refraction passes)
@@ -647,7 +863,8 @@ ID3D11ShaderResourceView* GetOrCreateD3D11SRV(XboxPixelContainer* pTex, float* o
     for (size_t i = 0; i < g_texCache.size(); ++i) {
         CachedTexture& c = g_texCache[i];
         if (c.dataPtr == pTex->Data && c.width == w && c.height == h) {
-            if (outIsCube) *outIsCube = c.isCubeAtlas;
+            if (outIsCube)   *outIsCube   = c.isCube;
+            if (outIsVolume) *outIsVolume = c.isVolume;
             if (c.isRenderTarget) {
                 return (c.rtv && c.rtv == g_curActiveRTV) ? nullptr : c.srv;
             }
@@ -659,7 +876,8 @@ ID3D11ShaderResourceView* GetOrCreateD3D11SRV(XboxPixelContainer* pTex, float* o
                     if (c.dirty || c.contentHash != curHash) {
                         c.contentHash = curHash;
                         UploadXboxTextureToD3D11(c, pTex);
-                        if (outIsCube) *outIsCube = c.isCubeAtlas;
+                        if (outIsCube)   *outIsCube   = c.isCube;
+                        if (outIsVolume) *outIsVolume = c.isVolume;
                     }
                 }
                 return c.srv;
@@ -681,7 +899,8 @@ ID3D11ShaderResourceView* GetOrCreateD3D11SRV(XboxPixelContainer* pTex, float* o
     entry.maxReadableBytes = maxReadable;
     entry.dirty = true;
     UploadXboxTextureToD3D11(entry, pTex);
-    if (outIsCube) *outIsCube = entry.isCubeAtlas;
+    if (outIsCube)   *outIsCube   = entry.isCube;
+    if (outIsVolume) *outIsVolume = entry.isVolume;
     g_texCache.push_back(entry);
     return entry.srv;
 }
@@ -701,9 +920,9 @@ static void ApplyRenderTargetSurfaceD3D11(XboxPixelContainer* pRenderTarget, Xbo
     (void)pZStencil;
     if (!g_d3dCtx) return;
 
-    // Unbind PS shader resources before switching RTV to avoid D3D11 SRV/RTV hazard
-    ID3D11ShaderResourceView* nullSrvs[4] = { nullptr, nullptr, nullptr, nullptr };
-    g_d3dCtx->PSSetShaderResources(0, 4, nullSrvs);
+    // Unbind PS shader resources (2D t0..t3, Cube t4..t7, Volume t8..t11) before switching RTV
+    ID3D11ShaderResourceView* nullSrvs[12] = {};
+    g_d3dCtx->PSSetShaderResources(0, 12, nullSrvs);
 
     XboxPixelContainer* mainBB0 = *reinterpret_cast<XboxPixelContainer**>(ADDR_MAIN_BACKBUFFER_PTR);
     XboxPixelContainer* mainBB1 = *reinterpret_cast<XboxPixelContainer**>(ADDR_D3D_DEVICE + 0x1A14);
@@ -787,7 +1006,6 @@ static void __stdcall Bridge_D3DDevice_CopyRects(
     XboxPixelContainer* pSourceSurface, const RECT* pSourceRectsArray,
     UINT cRects, XboxPixelContainer* pDestinationSurface, const POINT* pDestPointsArray)
 {
-    (void)pSourceRectsArray; (void)cRects; (void)pDestPointsArray;
     if (!pSourceSurface || !pDestinationSurface || !pSourceSurface->Data || !pDestinationSurface->Data) return;
 
     uint32_t sw = 0, sh = 0, slev = 1, sfmt = 0, spitch = 0;
@@ -798,52 +1016,154 @@ static void __stdcall Bridge_D3DDevice_CopyRects(
     bool dswiz = false;
     DecodeXboxTextureFormat(pDestinationSurface, &dw, &dh, &dlev, &dfmt, &dswiz, &dpitch);
 
-    if (sw == dw && sh == dh && pSourceSurface->Data != pDestinationSurface->Data) {
-        // Check if source or destination is a GPU render target or the main backbuffer
-        ID3D11Texture2D* srcGpuTex = nullptr;
-        XboxPixelContainer* mainBB0 = *reinterpret_cast<XboxPixelContainer**>(ADDR_MAIN_BACKBUFFER_PTR);
-        XboxPixelContainer* mainBB1 = *reinterpret_cast<XboxPixelContainer**>(ADDR_D3D_DEVICE + 0x1A14);
-        XboxPixelContainer* mainBB2 = *reinterpret_cast<XboxPixelContainer**>(ADDR_D3D_DEVICE + 0x1A18);
-        XboxPixelContainer* mainBB3 = *reinterpret_cast<XboxPixelContainer**>(ADDR_D3D_DEVICE + 0x1A1C);
-        if (pSourceSurface == mainBB0 || pSourceSurface == mainBB1 ||
-            pSourceSurface == mainBB2 || pSourceSurface == mainBB3 ||
-            (mainBB0 && pSourceSurface->Data == mainBB0->Data) ||
-            (mainBB1 && pSourceSurface->Data == mainBB1->Data))
-        {
-            srcGpuTex = g_backBufferTex;
-        } else {
-            for (size_t i = 0; i < g_texCache.size(); ++i) {
-                if (g_texCache[i].dataPtr == pSourceSurface->Data && g_texCache[i].width == sw && g_texCache[i].height == sh) {
-                    if (g_texCache[i].isRenderTarget) {
-                        srcGpuTex = g_texCache[i].tex2D;
-                    }
-                    break;
+    if (sw == 0 || sh == 0 || dw == 0 || dh == 0) return;
+
+    // Matching _D3DDevice_CopyRects@20 (0x006B0F40..0x006B1155):
+    // When pSourceRectsArray == NULL or cRects == 0, default to 1 full-surface rect {0, 0, sw, sh}.
+    // When pDestPointsArray == NULL, each rect's destination point defaults to {srcRect.left, srcRect.top}.
+    RECT defaultRect = { 0, 0, static_cast<LONG>(sw), static_cast<LONG>(sh) };
+    const RECT* rects = (pSourceRectsArray && cRects > 0) ? pSourceRectsArray : &defaultRect;
+    UINT rectCount    = (pSourceRectsArray && cRects > 0) ? cRects : 1u;
+
+    // Check if source is a GPU render target or the main backbuffer
+    ID3D11Texture2D* srcGpuTex = nullptr;
+    XboxPixelContainer* mainBB0 = *reinterpret_cast<XboxPixelContainer**>(ADDR_MAIN_BACKBUFFER_PTR);
+    XboxPixelContainer* mainBB1 = *reinterpret_cast<XboxPixelContainer**>(ADDR_D3D_DEVICE + 0x1A14);
+    XboxPixelContainer* mainBB2 = *reinterpret_cast<XboxPixelContainer**>(ADDR_D3D_DEVICE + 0x1A18);
+    XboxPixelContainer* mainBB3 = *reinterpret_cast<XboxPixelContainer**>(ADDR_D3D_DEVICE + 0x1A1C);
+    if (pSourceSurface == mainBB0 || pSourceSurface == mainBB1 ||
+        pSourceSurface == mainBB2 || pSourceSurface == mainBB3 ||
+        (mainBB0 && pSourceSurface->Data == mainBB0->Data) ||
+        (mainBB1 && pSourceSurface->Data == mainBB1->Data))
+    {
+        srcGpuTex = g_backBufferTex;
+    } else {
+        for (size_t i = 0; i < g_texCache.size(); ++i) {
+            if (g_texCache[i].dataPtr == pSourceSurface->Data && g_texCache[i].width == sw && g_texCache[i].height == sh) {
+                if (g_texCache[i].isRenderTarget || g_texCache[i].tex2D) {
+                    srcGpuTex = g_texCache[i].tex2D;
+                }
+                break;
+            }
+        }
+    }
+
+    bool gpuCopied = false;
+    if (srcGpuTex && g_d3dCtx && pSourceSurface->Data != pDestinationSurface->Data) {
+        CachedTexture* dstEntry = GetOrCreateRenderTargetEntry(pDestinationSurface);
+        if (dstEntry && dstEntry->tex2D) {
+            bool isFullCopy = (rectCount == 1u &&
+                               rects[0].left <= 0 && rects[0].top <= 0 &&
+                               rects[0].right >= static_cast<LONG>(sw) && rects[0].bottom >= static_cast<LONG>(sh) &&
+                               (!pDestPointsArray || (pDestPointsArray[0].x == 0 && pDestPointsArray[0].y == 0)) &&
+                               sw == dw && sh == dh);
+            if (isFullCopy) {
+                g_d3dCtx->CopyResource(dstEntry->tex2D, srcGpuTex);
+            } else {
+                for (UINT i = 0; i < rectCount; ++i) {
+                    LONG l = rects[i].left;
+                    LONG t = rects[i].top;
+                    LONG r = rects[i].right;
+                    LONG b = rects[i].bottom;
+                    LONG dx = pDestPointsArray ? pDestPointsArray[i].x : l;
+                    LONG dy = pDestPointsArray ? pDestPointsArray[i].y : t;
+
+                    if (l < 0) { dx -= l; l = 0; }
+                    if (t < 0) { dy -= t; t = 0; }
+                    if (dx < 0) { l -= dx; dx = 0; }
+                    if (dy < 0) { t -= dy; dy = 0; }
+                    if (r > static_cast<LONG>(sw)) r = static_cast<LONG>(sw);
+                    if (b > static_cast<LONG>(sh)) b = static_cast<LONG>(sh);
+
+                    LONG wRect = r - l;
+                    LONG hRect = b - t;
+                    if (dx + wRect > static_cast<LONG>(dw)) wRect = static_cast<LONG>(dw) - dx;
+                    if (dy + hRect > static_cast<LONG>(dh)) hRect = static_cast<LONG>(dh) - dy;
+                    if (wRect <= 0 || hRect <= 0) continue;
+
+                    D3D11_BOX srcBox = {};
+                    srcBox.left   = static_cast<UINT>(l);
+                    srcBox.top    = static_cast<UINT>(t);
+                    srcBox.front  = 0u;
+                    srcBox.right  = static_cast<UINT>(l + wRect);
+                    srcBox.bottom = static_cast<UINT>(t + hRect);
+                    srcBox.back   = 1u;
+                    g_d3dCtx->CopySubresourceRegion(
+                        dstEntry->tex2D, 0u, static_cast<UINT>(dx), static_cast<UINT>(dy), 0u,
+                        srcGpuTex, 0u, &srcBox);
                 }
             }
+            gpuCopied = true;
         }
+    }
 
-        if (srcGpuTex && g_d3dCtx) {
-            CachedTexture* dstEntry = GetOrCreateRenderTargetEntry(pDestinationSurface);
-            if (dstEntry && dstEntry->tex2D) {
-                g_d3dCtx->CopyResource(dstEntry->tex2D, srcGpuTex);
-                return;
+    if (gpuCopied) {
+        return;
+    }
+
+    // CPU surface copy (swizzled/unswizzled/linear sub-rectangle copy)
+    uint32_t bpp = 4;
+    switch (sfmt) {
+        case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x2E: bpp = 1; break;
+        case 0x02: case 0x03: case 0x04: case 0x05: case 0x11: case 0x12:
+        case 0x1A: case 0x1B: case 0x1C: case 0x1D: case 0x20: case 0x24:
+        case 0x25: case 0x27: case 0x28: case 0x2D: bpp = 2; break;
+        default: bpp = 4; break;
+    }
+
+    typedef void (__stdcall *PFN_XGSwizzleRect)(
+        const void* pSource, uint32_t Pitch, const RECT* pRect,
+        void* pDest, uint32_t Width, uint32_t Height, const POINT* pPoint, uint32_t BytesPerPixel);
+    PFN_XGSwizzleRect fnSwiz = reinterpret_cast<PFN_XGSwizzleRect>(ADDR_XG_SWIZZLE_RECT);
+
+    uint32_t srcRowPitch = spitch ? spitch : (sw * bpp);
+    uint32_t dstRowPitch = dpitch ? dpitch : (dw * bpp);
+    const uint8_t* srcBytes = reinterpret_cast<const uint8_t*>(pSourceSurface->Data);
+    uint8_t* dstBytes       = reinterpret_cast<uint8_t*>(pDestinationSurface->Data);
+
+    for (UINT i = 0; i < rectCount; ++i) {
+        RECT r = rects[i];
+        POINT pt = pDestPointsArray ? pDestPointsArray[i] : POINT{ r.left, r.top };
+
+        if (r.left < 0) { pt.x -= r.left; r.left = 0; }
+        if (r.top  < 0) { pt.y -= r.top;  r.top  = 0; }
+        if (pt.x   < 0) { r.left -= pt.x; pt.x   = 0; }
+        if (pt.y   < 0) { r.top  -= pt.y; pt.y   = 0; }
+        if (r.right  > static_cast<LONG>(sw)) r.right  = static_cast<LONG>(sw);
+        if (r.bottom > static_cast<LONG>(sh)) r.bottom = static_cast<LONG>(sh);
+        if (pt.x + (r.right - r.left) > static_cast<LONG>(dw)) r.right  = r.left + (static_cast<LONG>(dw) - pt.x);
+        if (pt.y + (r.bottom - r.top) > static_cast<LONG>(dh)) r.bottom = r.top  + (static_cast<LONG>(dh) - pt.y);
+        if (r.right <= r.left || r.bottom <= r.top) continue;
+
+        if (!sswiz && dswiz) {
+            fnSwiz(srcBytes, srcRowPitch, &r, dstBytes, dw, dh, &pt, bpp);
+        } else if (sswiz && !dswiz) {
+            g_pfnXGUnswizzleRect(srcBytes, sw, sh, &r, dstBytes, dstRowPitch, &pt, bpp);
+        } else if (sswiz && dswiz) {
+            if (r.left == 0 && r.top == 0 && r.right == static_cast<LONG>(sw) && r.bottom == static_cast<LONG>(sh) &&
+                pt.x == 0 && pt.y == 0 && sw == dw && sh == dh && srcBytes != dstBytes)
+            {
+                memcpy(dstBytes, srcBytes, (size_t)sw * sh * bpp);
+            } else {
+                uint32_t rw = static_cast<uint32_t>(r.right - r.left);
+                uint32_t rh = static_cast<uint32_t>(r.bottom - r.top);
+                std::vector<uint8_t> tmp((size_t)rw * rh * bpp);
+                POINT zeroPt = { 0, 0 };
+                RECT  tmpRect = { 0, 0, static_cast<LONG>(rw), static_cast<LONG>(rh) };
+                g_pfnXGUnswizzleRect(srcBytes, sw, sh, &r, tmp.data(), rw * bpp, &zeroPt, bpp);
+                fnSwiz(tmp.data(), rw * bpp, &tmpRect, dstBytes, dw, dh, &pt, bpp);
+            }
+        } else {
+            uint32_t rw = static_cast<uint32_t>(r.right - r.left);
+            uint32_t rh = static_cast<uint32_t>(r.bottom - r.top);
+            for (uint32_t y = 0; y < rh; ++y) {
+                const uint8_t* sRow = srcBytes + (size_t)(r.top + y) * srcRowPitch + (size_t)r.left * bpp;
+                uint8_t*       dRow = dstBytes + (size_t)(pt.y + y)  * dstRowPitch + (size_t)pt.x   * bpp;
+                memmove(dRow, sRow, (size_t)rw * bpp);
             }
         }
-
-        uint32_t bpp = (sfmt == 0x06 || sfmt == 0x07 || sfmt == 0x1E || sfmt == 0x1F) ? 4 : 2;
-        if (!sswiz && dswiz) {
-            typedef void (__stdcall *PFN_XGSwizzleRect)(
-                const void* pSource, uint32_t Pitch, const RECT* pRect,
-                void* pDest, uint32_t Width, uint32_t Height, const POINT* pPoint, uint32_t BytesPerPixel);
-            PFN_XGSwizzleRect fnSwiz = reinterpret_cast<PFN_XGSwizzleRect>(ADDR_XG_SWIZZLE_RECT);
-            fnSwiz(reinterpret_cast<const void*>(pSourceSurface->Data), spitch ? spitch : sw * bpp, nullptr,
-                   reinterpret_cast<void*>(pDestinationSurface->Data), dw, dh, nullptr, bpp);
-        } else {
-            size_t bytes = (spitch ? spitch : sw * bpp) * sh;
-            memcpy(reinterpret_cast<void*>(pDestinationSurface->Data), reinterpret_cast<const void*>(pSourceSurface->Data), bytes);
-        }
-        MarkTextureDirtyByData(pDestinationSurface->Data);
     }
+    MarkTextureDirtyByData(pDestinationSurface->Data);
 }
 
 void InitXboxD3D8TextureBridges() {

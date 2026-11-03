@@ -31,6 +31,9 @@ ID3D11DepthStencilView*   g_curActiveDSV      = nullptr;
 void*                     g_curOffscreenRT    = nullptr;
 float                     g_gamma             = 1.0f;
 float                     g_brightness        = 1.0f;
+ID3D11Texture2D*          g_gammaLutTex       = nullptr;
+ID3D11ShaderResourceView* g_gammaLutSRV       = nullptr;
+bool                      g_hasGammaRamp      = false;
 
 ID3D11VertexShader*       g_vs                = nullptr;
 ID3D11PixelShader*        g_ps                = nullptr;
@@ -100,6 +103,10 @@ static D3D11_BLEND MapXboxBlendD3D11(uint32_t v, bool isAlpha) {
         case 0x0306: case 9:  b = D3D11_BLEND_DEST_COLOR; break;
         case 0x0307: case 10: b = D3D11_BLEND_INV_DEST_COLOR; break;
         case 0x0308: case 11: b = D3D11_BLEND_SRC_ALPHA_SAT; break;
+        case 0x8001: case 14: b = D3D11_BLEND_BLEND_FACTOR; break;     // D3DBLEND_CONSTANTCOLOR
+        case 0x8002: case 15: b = D3D11_BLEND_INV_BLEND_FACTOR; break; // D3DBLEND_INVCONSTANTCOLOR
+        case 0x8003:          b = D3D11_BLEND_BLEND_FACTOR; break;     // D3DBLEND_CONSTANTALPHA
+        case 0x8004:          b = D3D11_BLEND_INV_BLEND_FACTOR; break; // D3DBLEND_INVCONSTANTALPHA
         default:              b = D3D11_BLEND_ONE; break;
     }
     if (isAlpha) {
@@ -221,27 +228,36 @@ ID3D11DepthStencilState* GetDepthState(
 }
 
 struct CachedRastState {
-    uint32_t               key;
+    uint64_t               key;
     ID3D11RasterizerState* state;
 };
 static std::vector<CachedRastState> g_rastCache;
 bool g_scissorEnabled = false;
 
-ID3D11RasterizerState* GetRastState(uint32_t cullMode, uint32_t fillMode, uint32_t zBias, bool scissor) {
-    uint32_t key = (cullMode & 0xFFFFu) | ((fillMode & 0xFFu) << 16) | ((zBias & 0x3Fu) << 24) | (scissor ? 0x80000000u : 0u);
+ID3D11RasterizerState* GetRastState(uint32_t cullMode, uint32_t fillMode, uint32_t zBias, bool scissor, uint32_t frontFace) {
+    bool frontCCW = (frontFace == 0x0901u || frontFace == 2u);
+    uint64_t key = (uint64_t)(cullMode & 0xFFFFu) |
+                   ((uint64_t)(fillMode & 0xFFFFu) << 16) |
+                   ((uint64_t)(zBias & 0xFFu) << 32) |
+                   (scissor ? (1ULL << 40) : 0ULL) |
+                   (frontCCW ? (1ULL << 41) : 0ULL);
     for (size_t i = 0; i < g_rastCache.size(); ++i) {
         if (g_rastCache[i].key == key) return g_rastCache[i].state;
     }
     D3D11_RASTERIZER_DESC desc = {};
-    desc.FillMode = (fillMode == 0x1B01 || fillMode == 2) ? D3D11_FILL_WIREFRAME : D3D11_FILL_SOLID;
-    if (cullMode == 0 || cullMode == 1) {
+    desc.FillMode = (fillMode == 0x1B01u || fillMode == 2u) ? D3D11_FILL_WIREFRAME : D3D11_FILL_SOLID;
+    desc.FrontCounterClockwise = frontCCW ? TRUE : FALSE;
+
+    // Matching _D3DDevice_SetRenderState_CullMode@4 (0x006AEFE0..0x006AF036):
+    // In Xbox D3D8, D3DCULL_CW (0x900) always culls clockwise triangles and D3DCULL_CCW (0x901)
+    // always culls counter-clockwise triangles; NV2A compares CullMode against FrontFace (0x006C0838)
+    // and selects FRONT (0x404) when equal, or BACK (0x405) when unequal.
+    if (cullMode == 0u || cullMode == 1u) {
         desc.CullMode = D3D11_CULL_NONE;
-    } else if (cullMode == 0x0900 || cullMode == 2) {
-        desc.CullMode = D3D11_CULL_FRONT;
     } else {
-        desc.CullMode = D3D11_CULL_BACK;
+        bool cullCCW = (cullMode == 0x0901u || cullMode == 3u);
+        desc.CullMode = (cullCCW == frontCCW) ? D3D11_CULL_FRONT : D3D11_CULL_BACK;
     }
-    desc.FrontCounterClockwise = FALSE;
     desc.DepthBias = -((INT)(int32_t)zBias) * 16;
     desc.SlopeScaledDepthBias = -((float)(int32_t)zBias) * 0.25f;
     desc.DepthClipEnable = TRUE;
@@ -254,37 +270,89 @@ ID3D11RasterizerState* GetRastState(uint32_t cullMode, uint32_t fillMode, uint32
 }
 
 struct CachedSamplerState {
-    uint32_t            key;
+    uint64_t            key;
     uint32_t            borderColor;
+    uint32_t            lodBiasBits;
     ID3D11SamplerState* state;
 };
 static std::vector<CachedSamplerState> g_samplerCache;
 
 static D3D11_TEXTURE_ADDRESS_MODE MapXboxAddress(uint32_t v) {
     switch (v) {
-        case kXboxTexAddressWrap:   return D3D11_TEXTURE_ADDRESS_WRAP;
-        case kXboxTexAddressMirror: return D3D11_TEXTURE_ADDRESS_MIRROR;
-        case kXboxTexAddressClamp:  return D3D11_TEXTURE_ADDRESS_CLAMP;
-        case kXboxTexAddressBorder: return D3D11_TEXTURE_ADDRESS_BORDER;
-        default:                    return D3D11_TEXTURE_ADDRESS_WRAP;
+        case kXboxTexAddressWrap:       return D3D11_TEXTURE_ADDRESS_WRAP;
+        case kXboxTexAddressMirror:     return D3D11_TEXTURE_ADDRESS_MIRROR;
+        case kXboxTexAddressClamp:      return D3D11_TEXTURE_ADDRESS_CLAMP;
+        case kXboxTexAddressBorder:     return D3D11_TEXTURE_ADDRESS_BORDER;
+        case kXboxTexAddressClampToEdge:return D3D11_TEXTURE_ADDRESS_CLAMP;
+        default:                        return D3D11_TEXTURE_ADDRESS_WRAP;
     }
 }
 
-ID3D11SamplerState* GetSamplerState(uint32_t addrU, uint32_t addrV, uint32_t magFilter, uint32_t borderColor) {
-    uint32_t key = (addrU & 0xFu) | ((addrV & 0xFu) << 4) | ((magFilter & 0xFu) << 8);
-    uint32_t effBorder = (addrU == kXboxTexAddressBorder || addrV == kXboxTexAddressBorder) ? borderColor : 0u;
+ID3D11SamplerState* GetSamplerState(
+    uint32_t addrU, uint32_t addrV, uint32_t magFilter, uint32_t borderColor,
+    uint32_t minFilter, uint32_t mipFilter, uint32_t maxAniso,
+    uint32_t maxMipLevel, uint32_t mipmapLodBiasBits, uint32_t addrW)
+{
+    if (minFilter == 0xFFFFFFFFu) minFilter = magFilter;
+    if (addrW == 0u) addrW = kXboxTexAddressWrap;
+
+    uint64_t key = (uint64_t)(addrU & 0xFu) |
+                   ((uint64_t)(addrV & 0xFu) << 4) |
+                   ((uint64_t)(addrW & 0xFu) << 8) |
+                   ((uint64_t)(magFilter & 0xFu) << 12) |
+                   ((uint64_t)(minFilter & 0xFu) << 16) |
+                   ((uint64_t)(mipFilter & 0xFu) << 20) |
+                   ((uint64_t)(maxAniso & 0xFFu) << 24) |
+                   ((uint64_t)(maxMipLevel & 0xFFu) << 32);
+
+    uint32_t effBorder = (addrU == kXboxTexAddressBorder ||
+                          addrV == kXboxTexAddressBorder ||
+                          addrW == kXboxTexAddressBorder) ? borderColor : 0u;
+
     for (size_t i = 0; i < g_samplerCache.size(); ++i) {
-        if (g_samplerCache[i].key == key && g_samplerCache[i].borderColor == effBorder) {
+        if (g_samplerCache[i].key == key &&
+            g_samplerCache[i].borderColor == effBorder &&
+            g_samplerCache[i].lodBiasBits == mipmapLodBiasBits)
+        {
             return g_samplerCache[i].state;
         }
     }
+
     D3D11_SAMPLER_DESC desc = {};
-    desc.Filter = (magFilter == kXboxTexFilterPoint) ? D3D11_FILTER_MIN_MAG_MIP_POINT : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    if ((minFilter == kXboxTexFilterAnisotropic || magFilter == kXboxTexFilterAnisotropic) && maxAniso > 1u) {
+        desc.Filter = D3D11_FILTER_ANISOTROPIC;
+        desc.MaxAnisotropy = (maxAniso > 16u) ? 16u : maxAniso;
+    } else {
+        bool minLin = (minFilter >= kXboxTexFilterLinear);
+        bool magLin = (magFilter >= kXboxTexFilterLinear);
+        bool mipLin = (mipFilter >= kXboxTexFilterLinear);
+        uint32_t fMask = (minLin ? 4u : 0u) | (magLin ? 2u : 0u) | (mipLin ? 1u : 0u);
+        switch (fMask) {
+            case 0u: desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT; break;
+            case 1u: desc.Filter = D3D11_FILTER_MIN_MAG_POINT_MIP_LINEAR; break;
+            case 2u: desc.Filter = D3D11_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT; break;
+            case 3u: desc.Filter = D3D11_FILTER_MIN_POINT_MAG_MIP_LINEAR; break;
+            case 4u: desc.Filter = D3D11_FILTER_MIN_LINEAR_MAG_MIP_POINT; break;
+            case 5u: desc.Filter = D3D11_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR; break;
+            case 6u: desc.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT; break;
+            default: desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR; break;
+        }
+        desc.MaxAnisotropy = 1u;
+    }
+
     desc.AddressU = MapXboxAddress(addrU);
     desc.AddressV = MapXboxAddress(addrV);
-    desc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    desc.AddressW = MapXboxAddress(addrW);
     desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
-    desc.MaxLOD = D3D11_FLOAT32_MAX;
+
+    float lodBias = 0.0f;
+    memcpy(&lodBias, &mipmapLodBiasBits, 4);
+    if (!(lodBias >= -15.99f && lodBias <= 15.99f)) lodBias = 0.0f;
+    desc.MipLODBias = lodBias;
+
+    desc.MinLOD = static_cast<float>(maxMipLevel & 0x0Fu);
+    desc.MaxLOD = (mipFilter == kXboxTexFilterNone) ? desc.MinLOD : D3D11_FLOAT32_MAX;
+
     if (effBorder != 0u) {
         desc.BorderColor[0] = ((effBorder >> 16) & 0xFFu) * (1.0f / 255.0f);
         desc.BorderColor[1] = ((effBorder >> 8)  & 0xFFu) * (1.0f / 255.0f);
@@ -294,8 +362,24 @@ ID3D11SamplerState* GetSamplerState(uint32_t addrU, uint32_t addrV, uint32_t mag
 
     ID3D11SamplerState* st = nullptr;
     g_d3dDevice->CreateSamplerState(&desc, &st);
-    g_samplerCache.push_back({ key, effBorder, st });
+    g_samplerCache.push_back({ key, effBorder, mipmapLodBiasBits, st });
     return st;
+}
+
+ID3D11SamplerState* GetStageSamplerState(uint32_t stage) {
+    if (stage >= 4u) stage = 0u;
+    const uint32_t* ts = &reinterpret_cast<const uint32_t*>(ADDR_D3D_TEXTURESTATE)[stage * XBOX_D3DTSS_MAX];
+    uint32_t addrU       = ts[XBOX_D3DTSS_ADDRESSU]      ? ts[XBOX_D3DTSS_ADDRESSU]      : kXboxTexAddressWrap;
+    uint32_t addrV       = ts[XBOX_D3DTSS_ADDRESSV]      ? ts[XBOX_D3DTSS_ADDRESSV]      : kXboxTexAddressWrap;
+    uint32_t addrW       = ts[XBOX_D3DTSS_ADDRESSW]      ? ts[XBOX_D3DTSS_ADDRESSW]      : kXboxTexAddressWrap;
+    uint32_t magFilter   = ts[XBOX_D3DTSS_MAGFILTER]     ? ts[XBOX_D3DTSS_MAGFILTER]     : kXboxTexFilterLinear;
+    uint32_t minFilter   = ts[XBOX_D3DTSS_MINFILTER]     ? ts[XBOX_D3DTSS_MINFILTER]     : kXboxTexFilterLinear;
+    uint32_t mipFilter   = ts[XBOX_D3DTSS_MIPFILTER];    // 0 = D3DTEXF_NONE, 1 = POINT, 2 = LINEAR
+    uint32_t maxMipLevel = ts[XBOX_D3DTSS_MAXMIPLEVEL];
+    uint32_t lodBiasBits = ts[XBOX_D3DTSS_MIPMAPLODBIAS];
+    uint32_t maxAniso    = ts[XBOX_D3DTSS_MAXANISOTROPY] ? ts[XBOX_D3DTSS_MAXANISOTROPY] : 1u;
+    uint32_t borderColor = ts[XBOX_D3DTSS_BORDERCOLOR];
+    return GetSamplerState(addrU, addrV, magFilter, borderColor, minFilter, mipFilter, maxAniso, maxMipLevel, lodBiasBits, addrW);
 }
 
 // ============================================================================
@@ -317,6 +401,20 @@ static void __fastcall Bridge_D3DDevice_SetRenderState_Simple(uint32_t encodedRe
 static void __stdcall Bridge_D3DDevice_SetRenderStateNotInline(uint32_t State, uint32_t Value) {
     if (State < XBOX_D3DRS_MAX) {
         reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE)[State] = Value;
+        if (State == XBOX_D3DRS_PSTEXTUREMODES) {
+            *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x790) = Value;
+            *reinterpret_cast<uint32_t*>(ADDR_D3D_DIRTYFLAGS) |= 0x4000u;
+        } else if (State == XBOX_D3DRS_ZBIAS) {
+            uint32_t* rs = reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE);
+            float fBias = -static_cast<float>(static_cast<int32_t>(Value));
+            float fSlope = fBias * 0.25f;
+            uint32_t enable = (Value != 0) ? 1u : 0u;
+            memcpy(&rs[77], &fSlope, 4);
+            memcpy(&rs[78], &fBias, 4);
+            rs[79] = enable;
+            rs[80] = enable;
+            rs[81] = enable;
+        }
     }
 }
 
@@ -350,26 +448,23 @@ static void __stdcall Bridge_D3DDevice_SetTextureState_ColorKeyColor(uint32_t St
     }
 }
 
-static void __stdcall Bridge_D3DDevice_SetRenderState_FogColor(uint32_t Value) {
-    reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE)[XBOX_D3DRS_FOGCOLOR] = Value;
+// Generic template for Complex RenderStates (136..165) in g_ComplexRenderStateFunctionTable (0x006BE438)
+template <uint32_t StateIdx>
+static void __stdcall Bridge_D3DDevice_SetRenderState_Complex(uint32_t Value) {
+    reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE)[StateIdx] = Value;
+    if (StateIdx == XBOX_D3DRS_VERTEXBLEND || StateIdx == XBOX_D3DRS_TWOSIDEDLIGHTING || StateIdx == XBOX_D3DRS_NORMALIZENORMALS) {
+        *reinterpret_cast<uint32_t*>(ADDR_D3D_DIRTYFLAGS) |= 0x200u;
+    }
 }
 
-static void __stdcall Bridge_D3DDevice_SetRenderState_FillMode(uint32_t Value) {
-    reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE)[XBOX_D3DRS_FILLMODE] = Value;
+// RS 136: _D3DDevice_SetRenderState_PSTextureModes@4 (0x006AEBE0)
+static void __stdcall Bridge_D3DDevice_SetRenderState_PSTextureModes(uint32_t Value) {
+    *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x790) = Value;
+    *reinterpret_cast<uint32_t*>(ADDR_D3D_DIRTYFLAGS) |= 0x4000u;
+    reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE)[XBOX_D3DRS_PSTEXTUREMODES] = Value;
 }
 
-static void __stdcall Bridge_D3DDevice_SetRenderState_ZEnable(uint32_t Value) {
-    reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE)[XBOX_D3DRS_ZENABLE] = Value;
-}
-
-static void __stdcall Bridge_D3DDevice_SetRenderState_CullMode(uint32_t Value) {
-    reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE)[XBOX_D3DRS_CULLMODE] = Value;
-}
-
-static void __stdcall Bridge_D3DDevice_SetRenderState_TextureFactor(uint32_t Value) {
-    reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE)[XBOX_D3DRS_TEXTUREFACTOR] = Value;
-}
-
+// RS 149: _D3DDevice_SetRenderState_ZBias@4 (0x006AF220)
 static void __stdcall Bridge_D3DDevice_SetRenderState_ZBias(uint32_t Value) {
     uint32_t* rs = reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE);
     float fBias = -static_cast<float>(static_cast<int32_t>(Value));
@@ -381,14 +476,6 @@ static void __stdcall Bridge_D3DDevice_SetRenderState_ZBias(uint32_t Value) {
     rs[80] = enable;             // D3DRS_WIREFRAMEOFFSETENABLE (0x006C0730)
     rs[81] = enable;             // D3DRS_SOLIDOFFSETENABLE (0x006C0734)
     rs[XBOX_D3DRS_ZBIAS] = Value;// D3DRS_ZBIAS (0x006C0844)
-}
-
-static void __stdcall Bridge_D3DDevice_SetRenderState_StencilEnable(uint32_t Value) {
-    reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE)[XBOX_D3DRS_STENCILENABLE] = Value;
-}
-
-static void __stdcall Bridge_D3DDevice_SetRenderState_StencilFail(uint32_t Value) {
-    reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE)[XBOX_D3DRS_STENCILFAIL] = Value;
 }
 
 // ============================================================================
@@ -513,11 +600,12 @@ static HRESULT __stdcall Bridge_D3DDevice_GetVisibilityTestResult(
 // Clear, Top-Right In-Game OSD Overlay (FPS), Swap (Present) & Gamma
 // ============================================================================
 
+static ID3D11Buffer* g_clearVB = nullptr;
+
 static void __stdcall Bridge_D3DDevice_Clear(
     DWORD Count, const void* pRects, DWORD Flags, DWORD Color, float Z, DWORD Stencil)
 {
-    (void)Count; (void)pRects;
-    if (!g_d3dCtx) return;
+    if (!g_d3dCtx || !g_d3dDevice) return;
 
     uint32_t clearFlags = Flags;
     if (clearFlags == 0) clearFlags = 0xF1u;
@@ -525,18 +613,141 @@ static void __stdcall Bridge_D3DDevice_Clear(
     ID3D11RenderTargetView* rtv = g_curActiveRTV ? g_curActiveRTV : g_rtv;
     ID3D11DepthStencilView* dsv = g_curActiveDSV ? g_curActiveDSV : g_dsv;
 
-    if ((clearFlags & 0x000000F0u) && rtv) {
-        float rgba[4];
-        UnpackD3DColor(Color, &rgba[0], &rgba[1], &rgba[2], &rgba[3]);
-        g_d3dCtx->ClearRenderTargetView(rtv, rgba);
-        if (rtv == g_rtv) g_backBufferDirty = true;
+    float vpW = 640.0f, vpH = 480.0f;
+    if (g_curOffscreenRT) {
+        uint32_t rw = 0, rh = 0, rlev = 1, rfmt = 0, rpitch = 0;
+        bool rswiz = false;
+        DecodeXboxTextureFormat(reinterpret_cast<const XboxPixelContainer*>(g_curOffscreenRT), &rw, &rh, &rlev, &rfmt, &rswiz, &rpitch);
+        if (rw > 0 && rh > 0) { vpW = (float)rw; vpH = (float)rh; }
     }
-    if ((clearFlags & 0x00000003u) && dsv) {
-        UINT dsFlags = 0;
-        if (clearFlags & 0x01u) dsFlags |= D3D11_CLEAR_DEPTH;
-        if (clearFlags & 0x02u) dsFlags |= D3D11_CLEAR_STENCIL;
-        g_d3dCtx->ClearDepthStencilView(dsv, dsFlags, Z, (UINT8)(Stencil & 0xFF));
+
+    const RECT* rects = reinterpret_cast<const RECT*>(pRects);
+    bool isFullRect = (Count == 0 || !rects);
+    if (!isFullRect && Count == 1) {
+        if (rects[0].left <= 0 && rects[0].top <= 0 &&
+            rects[0].right >= (LONG)vpW && rects[0].bottom >= (LONG)vpH) {
+            isFullRect = true;
+        }
     }
+
+    uint32_t targetMask = clearFlags & 0x000000F0u;
+    bool isPartialChannel = (targetMask != 0u && targetMask != 0x000000F0u);
+
+    if (isFullRect && !isPartialChannel) {
+        if (targetMask && rtv) {
+            float rgba[4];
+            UnpackD3DColor(Color, &rgba[0], &rgba[1], &rgba[2], &rgba[3]);
+            g_d3dCtx->ClearRenderTargetView(rtv, rgba);
+            if (rtv == g_rtv) g_backBufferDirty = true;
+        }
+        if ((clearFlags & 0x00000003u) && dsv) {
+            UINT dsFlags = 0;
+            if (clearFlags & 0x01u) dsFlags |= D3D11_CLEAR_DEPTH;
+            if (clearFlags & 0x02u) dsFlags |= D3D11_CLEAR_STENCIL;
+            g_d3dCtx->ClearDepthStencilView(dsv, dsFlags, Z, (UINT8)(Stencil & 0xFF));
+        }
+        return;
+    }
+
+    // Sub-rectangle or partial-channel clear via screen-space quad draw
+    if (!g_vs || !g_ps || !g_cbPerDraw || !g_inputLayout) return;
+
+    RECT fullDefaultRect = { 0, 0, (LONG)vpW, (LONG)vpH };
+    if (Count == 0 || !rects) {
+        rects = &fullDefaultRect;
+        Count = 1;
+    }
+
+    float r = 0.0f, g = 0.0f, b = 0.0f, a = 0.0f;
+    UnpackD3DColor(Color, &r, &g, &b, &a);
+
+    uint32_t writeMask = 0u;
+    if (clearFlags & 0x40u) writeMask |= 1u; // D3DCLEAR_TARGET_R -> R
+    if (clearFlags & 0x20u) writeMask |= 2u; // D3DCLEAR_TARGET_G -> G
+    if (clearFlags & 0x10u) writeMask |= 4u; // D3DCLEAR_TARGET_B -> B
+    if (clearFlags & 0x80u) writeMask |= 8u; // D3DCLEAR_TARGET_A -> A
+
+    bool clearZ = (clearFlags & 0x01u) != 0u && (dsv != nullptr);
+    bool clearS = (clearFlags & 0x02u) != 0u && (dsv != nullptr);
+
+    if (!g_clearVB) {
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth      = 4 * sizeof(UnifiedVertex);
+        bd.Usage          = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags      = D3D11_BIND_VERTEX_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(g_d3dDevice->CreateBuffer(&bd, nullptr, &g_clearVB))) return;
+    }
+
+    PerDrawCBData cb = {};
+    cb.viewport[0]    = 0.0f;
+    cb.viewport[1]    = 0.0f;
+    cb.viewport[2]    = vpW;
+    cb.viewport[3]    = vpH;
+    cb.stage0Ops[0]   = 2u; // D3DTOP_SELECTARG1
+    cb.stage0Ops[1]   = 0u; // D3DTA_DIFFUSE
+    cb.stage0Alpha[0] = 2u; // D3DTOP_SELECTARG1
+    cb.stage0Alpha[1] = 0u; // D3DTA_DIFFUSE
+    cb.flags[0]       = 1u; // isRhw = 1
+    cb.alphaTest[2]   = 1.0f;
+    cb.alphaTest[3]   = 1.0f;
+
+    D3D11_MAPPED_SUBRESOURCE mappedCB = {};
+    if (SUCCEEDED(g_d3dCtx->Map(g_cbPerDraw, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedCB))) {
+        memcpy(mappedCB.pData, &cb, sizeof(cb));
+        g_d3dCtx->Unmap(g_cbPerDraw, 0);
+    }
+
+    ID3D11BlendState*        bs = GetBlendState(0u, 2u, 1u, 1u, writeMask);
+    ID3D11DepthStencilState* ds = GetDepthState(
+        clearZ ? 1u : 0u, clearZ ? 1u : 0u, 8u /* ALWAYS */,
+        clearS ? 1u : 0u, 3u /* REPLACE */, 3u /* REPLACE */, 3u /* REPLACE */,
+        8u /* ALWAYS */, 0xFFu, clearS ? 0xFFu : 0x00u);
+    ID3D11RasterizerState*   rs = GetRastState(0u, 3u, 0u, false, 0x0900u);
+
+    float blendFactor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    g_d3dCtx->OMSetRenderTargets(1, rtv ? &rtv : nullptr, dsv);
+    g_d3dCtx->OMSetBlendState(bs, blendFactor, 0xFFFFFFFFu);
+    g_d3dCtx->OMSetDepthStencilState(ds, Stencil & 0xFFu);
+    g_d3dCtx->RSSetState(rs);
+
+    D3D11_VIEWPORT vp11 = { 0.0f, 0.0f, vpW, vpH, 0.0f, 1.0f };
+    g_d3dCtx->RSSetViewports(1, &vp11);
+
+    g_d3dCtx->IASetInputLayout(g_inputLayout);
+    UINT stride = sizeof(UnifiedVertex);
+    UINT offset = 0;
+    g_d3dCtx->IASetVertexBuffers(0, 1, &g_clearVB, &stride, &offset);
+    g_d3dCtx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+
+    g_d3dCtx->VSSetShader(g_vs, nullptr, 0);
+    g_d3dCtx->VSSetConstantBuffers(0, 1, &g_cbPerDraw);
+    ID3D11PixelShader* clearPS = GetPixelShaderPermutation(0u);
+    g_d3dCtx->PSSetShader(clearPS ? clearPS : g_ps, nullptr, 0);
+    g_d3dCtx->PSSetConstantBuffers(0, 1, &g_cbPerDraw);
+
+    for (DWORD i = 0; i < Count; ++i) {
+        float x0 = (float)rects[i].left;
+        float y0 = (float)rects[i].top;
+        float x1 = (float)rects[i].right;
+        float y1 = (float)rects[i].bottom;
+        if (x1 <= x0 || y1 <= y0) continue;
+
+        UnifiedVertex quad[4] = {};
+        quad[0] = { x0, y0, Z, 1.0f, 0,0,1, r,g,b,a };
+        quad[1] = { x1, y0, Z, 1.0f, 0,0,1, r,g,b,a };
+        quad[2] = { x0, y1, Z, 1.0f, 0,0,1, r,g,b,a };
+        quad[3] = { x1, y1, Z, 1.0f, 0,0,1, r,g,b,a };
+
+        D3D11_MAPPED_SUBRESOURCE mappedVB = {};
+        if (SUCCEEDED(g_d3dCtx->Map(g_clearVB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedVB))) {
+            memcpy(mappedVB.pData, quad, sizeof(quad));
+            g_d3dCtx->Unmap(g_clearVB, 0);
+            g_d3dCtx->Draw(4, 0);
+        }
+    }
+
+    if (writeMask && rtv == g_rtv) g_backBufferDirty = true;
 }
 
 static ID3D11Texture2D*          g_osdTex           = nullptr;
@@ -754,7 +965,7 @@ void DrawOsdOverlayOnBackbuffer() {
 
     ID3D11BlendState*        bs  = GetBlendState(1u, 5u /* SRCALPHA */, 6u /* INVSRCALPHA */, 1u /* ADD */, 0x0Fu);
     ID3D11DepthStencilState* ds  = GetDepthState(0u, 0u, 8u, 0u, 1u, 1u, 1u, 8u, 0xFFu, 0xFFu);
-    ID3D11RasterizerState*   rs  = GetRastState(0u, 3u, 0u, false);
+    ID3D11RasterizerState*   rs  = GetRastState(0u, 3u, 0u, false, 0x0900u);
     ID3D11SamplerState*      smp = GetSamplerState(kXboxTexAddressClamp, kXboxTexAddressClamp, kXboxTexFilterPoint, 0u);
 
     float blendFactor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
@@ -807,10 +1018,36 @@ static void __stdcall Bridge_D3DDevice_Swap(DWORD Flags) {
     UpdateXboxAudioTick();
 }
 
-// ?rlMain_SetGamma@@YAXMM@Z (0x005F4280)
-static void __cdecl Bridge_rlMain_SetGamma(float gamma, float brightness) {
-    if (gamma > 0.2f && gamma < 4.0f) g_gamma = gamma;
-    if (brightness > 0.1f && brightness < 4.0f) g_brightness = brightness;
+static void UpdateGammaLutTexture(const uint8_t* pRamp) {
+    if (!g_d3dDevice || !g_d3dCtx || !pRamp) return;
+    uint32_t lutPixels[256];
+    for (uint32_t i = 0; i < 256; ++i) {
+        uint32_t r = pRamp[i];
+        uint32_t g = pRamp[256 + i];
+        uint32_t b = pRamp[512 + i];
+        lutPixels[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
+    }
+    if (!g_gammaLutTex) {
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width            = 256;
+        td.Height           = 1;
+        td.MipLevels        = 1;
+        td.ArraySize        = 1;
+        td.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage            = D3D11_USAGE_DEFAULT;
+        td.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+
+        D3D11_SUBRESOURCE_DATA initData = {};
+        initData.pSysMem     = lutPixels;
+        initData.SysMemPitch = 256 * 4;
+        if (SUCCEEDED(g_d3dDevice->CreateTexture2D(&td, &initData, &g_gammaLutTex))) {
+            g_d3dDevice->CreateShaderResourceView(g_gammaLutTex, nullptr, &g_gammaLutSRV);
+        }
+    } else {
+        g_d3dCtx->UpdateSubresource(g_gammaLutTex, 0, nullptr, lutPixels, 256 * 4, 0);
+    }
+    g_hasGammaRamp = true;
 }
 
 // _D3DDevice_SetGammaRamp@8 (0x006B0310)
@@ -818,10 +1055,9 @@ static void __stdcall Bridge_D3DDevice_SetGammaRamp(DWORD Flags, const uint8_t* 
     (void)Flags;
     if (pRamp) {
         memcpy(reinterpret_cast<void*>(ADDR_D3D_DEVICE + 0x1A2C), pRamp, 768);
-        // Sample mid-gray (index 128) from the 256-entry ramp to infer gamma/brightness
+        UpdateGammaLutTexture(pRamp);
         float midR = pRamp[128] * (1.0f / 255.0f);
         if (midR > 0.05f && midR < 0.95f) {
-            // 0.5^(1/gamma) = midR -> gamma = ln(0.5)/ln(midR)
             float inferredGamma = -0.693147f / logf(midR);
             if (inferredGamma >= 0.4f && inferredGamma <= 2.5f) {
                 g_gamma = inferredGamma;
@@ -830,11 +1066,33 @@ static void __stdcall Bridge_D3DDevice_SetGammaRamp(DWORD Flags, const uint8_t* 
     }
 }
 
+// ?rlMain_SetGamma@@YAXMM@Z (0x005F4280)
+static void __cdecl Bridge_rlMain_SetGamma(float gamma, float brightness) {
+    if (gamma > 0.2f && gamma < 4.0f) g_gamma = gamma;
+    if (brightness > 0.1f && brightness < 4.0f) g_brightness = brightness;
+
+    // Matching rlMain_SetGamma (0x005F4280..0x005F4335):
+    // Build the 256-entry D3DGAMMARAMP table (pow(i/255, 1/gamma) * brightness * 255)
+    // and submit it through Bridge_D3DDevice_SetGammaRamp.
+    float invGamma = (g_gamma > 0.001f) ? (1.0f / g_gamma) : 1.0f;
+    uint8_t ramp[768];
+    for (uint32_t i = 0; i < 256; ++i) {
+        float v = powf((float)i * (1.0f / 255.0f), invGamma) * g_brightness * 255.0f;
+        int32_t iv = (int32_t)(v + 0.5f);
+        if (iv < 0) iv = 0;
+        if (iv > 255) iv = 255;
+        ramp[i]       = (uint8_t)iv;
+        ramp[256 + i] = (uint8_t)iv;
+        ramp[512 + i] = (uint8_t)iv;
+    }
+    Bridge_D3DDevice_SetGammaRamp(0, ramp);
+}
+
 // ============================================================================
 // Device Creation (_Direct3D_CreateDevice@24 at 0x006BCD20)
 // ============================================================================
 
-static constexpr uint32_t kNumPsPermutations = 29u; // 0 = fixed-function, 1..28 = aPixelShaders[0..27]
+static constexpr uint32_t kNumPsPermutations = 30u; // 0 = fixed-function, 1..28 = aPixelShaders[0..27], 29 = dynamic RC
 static ID3D11PixelShader* g_psPermutations[kNumPsPermutations] = {};
 
 ID3D11PixelShader* GetPixelShaderPermutation(uint32_t psMode) {
@@ -962,6 +1220,16 @@ bool InitD3D11HostDevice() {
     D3D11_VIEWPORT vp = { 0.0f, 0.0f, 640.0f, 480.0f, 0.0f, 1.0f };
     g_d3dCtx->RSSetViewports(1, &vp);
 
+    // Initialize identity 256x1 Gamma LUT texture
+    uint8_t identRamp[768];
+    for (uint32_t i = 0; i < 256; ++i) {
+        identRamp[i]       = (uint8_t)i;
+        identRamp[256 + i] = (uint8_t)i;
+        identRamp[512 + i] = (uint8_t)i;
+    }
+    UpdateGammaLutTexture(identRamp);
+    g_hasGammaRamp = false;
+
     // Compile HLSL Vertex & Pixel Shaders
     ID3DBlob* vsBlob = nullptr;
     ID3DBlob* psBlob = nullptr;
@@ -978,8 +1246,10 @@ bool InitD3D11HostDevice() {
             { "TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT,       0, 52, D3D11_INPUT_PER_VERTEX_DATA, 0 },
             { "TEXCOORD", 2, DXGI_FORMAT_R32G32_FLOAT,       0, 60, D3D11_INPUT_PER_VERTEX_DATA, 0 },
             { "TEXCOORD", 3, DXGI_FORMAT_R32G32_FLOAT,       0, 68, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD", 4, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 76, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "COLOR",    1, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 92, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         };
-        g_d3dDevice->CreateInputLayout(ied, 7, vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), &g_inputLayout);
+        g_d3dDevice->CreateInputLayout(ied, 9, vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), &g_inputLayout);
         vsBlob->Release();
     }
     if (errBlob) { errBlob->Release(); errBlob = nullptr; }
@@ -1125,14 +1395,38 @@ void InitXboxD3D8() {
     InstallBridge(0x006AF590, &Bridge_D3DDevice_SetTextureState_BumpEnv);           // _D3DDevice_SetTextureState_BumpEnv@12
     InstallBridge(kAddrD3DDeviceSetTextureStateBorderColor,   &Bridge_D3DDevice_SetTextureState_BorderColor);   // _D3DDevice_SetTextureState_BorderColor@8
     InstallBridge(kAddrD3DDeviceSetTextureStateColorKeyColor, &Bridge_D3DDevice_SetTextureState_ColorKeyColor); // _D3DDevice_SetTextureState_ColorKeyColor@8
-    InstallBridge(0x006AEF90, &Bridge_D3DDevice_SetRenderState_FogColor);           // _D3DDevice_SetRenderState_FogColor@4
-    InstallBridge(0x006AEFE0, &Bridge_D3DDevice_SetRenderState_CullMode);           // _D3DDevice_SetRenderState_CullMode@4
-    InstallBridge(0x006AF0D0, &Bridge_D3DDevice_SetRenderState_TextureFactor);      // _D3DDevice_SetRenderState_TextureFactor@4
-    InstallBridge(0x006AF220, &Bridge_D3DDevice_SetRenderState_ZBias);              // _D3DDevice_SetRenderState_ZBias@4
-    InstallBridge(0x006AF300, &Bridge_D3DDevice_SetRenderState_FillMode);           // _D3DDevice_SetRenderState_FillMode@4
-    InstallBridge(0x006AFE60, &Bridge_D3DDevice_SetRenderState_ZEnable);            // _D3DDevice_SetRenderState_ZEnable@4
-    InstallBridge(0x006AFEF0, &Bridge_D3DDevice_SetRenderState_StencilEnable);      // _D3DDevice_SetRenderState_StencilEnable@4
-    InstallBridge(0x006AFF80, &Bridge_D3DDevice_SetRenderState_StencilFail);        // _D3DDevice_SetRenderState_StencilFail@4
+
+    // Bridge all 30 Complex RenderStates (136..165) from g_ComplexRenderStateFunctionTable (0x006BE438)
+    InstallBridge(0x006AEBE0, &Bridge_D3DDevice_SetRenderState_PSTextureModes);     // 136: PSTextureModes
+    InstallBridge(0x006AF430, &Bridge_D3DDevice_SetRenderState_Complex<137>);       // 137: VertexBlend
+    InstallBridge(0x006AEF90, &Bridge_D3DDevice_SetRenderState_Complex<138>);       // 138: FogColor
+    InstallBridge(0x006AF300, &Bridge_D3DDevice_SetRenderState_Complex<139>);       // 139: FillMode
+    InstallBridge(0x006AF350, &Bridge_D3DDevice_SetRenderState_Complex<140>);       // 140: BackFillMode
+    InstallBridge(0x006AF3B0, &Bridge_D3DDevice_SetRenderState_Complex<141>);       // 141: TwoSidedLighting
+    InstallBridge(0x006AF090, &Bridge_D3DDevice_SetRenderState_Complex<142>);       // 142: NormalizeNormals
+    InstallBridge(0x006AFE60, &Bridge_D3DDevice_SetRenderState_Complex<143>);       // 143: ZEnable
+    InstallBridge(0x006AFEF0, &Bridge_D3DDevice_SetRenderState_Complex<144>);       // 144: StencilEnable
+    InstallBridge(0x006AFF80, &Bridge_D3DDevice_SetRenderState_Complex<145>);       // 145: StencilFail
+    InstallBridge(0x006AF050, &Bridge_D3DDevice_SetRenderState_Complex<146>);       // 146: FrontFace
+    InstallBridge(0x006AEFE0, &Bridge_D3DDevice_SetRenderState_Complex<147>);       // 147: CullMode
+    InstallBridge(0x006AF0D0, &Bridge_D3DDevice_SetRenderState_Complex<148>);       // 148: TextureFactor
+    InstallBridge(0x006AF220, &Bridge_D3DDevice_SetRenderState_ZBias);              // 149: ZBias
+    InstallBridge(0x006AF2A0, &Bridge_D3DDevice_SetRenderState_Complex<150>);       // 150: LogicOp
+    InstallBridge(0x006AEF10, &Bridge_D3DDevice_SetRenderState_Complex<151>);       // 151: EdgeAntiAlias
+    InstallBridge(0x006B01C0, &Bridge_D3DDevice_SetRenderState_Complex<152>);       // 152: MultiSampleAntiAlias
+    InstallBridge(0x006B0240, &Bridge_D3DDevice_SetRenderState_Complex<153>);       // 153: MultiSampleMask
+    InstallBridge(0x006B0160, &Bridge_D3DDevice_SetRenderState_Complex<154>);       // 154: MultiSampleMode
+    InstallBridge(0x006B0190, &Bridge_D3DDevice_SetRenderState_Complex<155>);       // 155: MultiSampleRenderTargetMode
+    InstallBridge(0x006AEF50, &Bridge_D3DDevice_SetRenderState_Complex<156>);       // 156: ShadowFunc
+    InstallBridge(0x006AF130, &Bridge_D3DDevice_SetRenderState_Complex<157>);       // 157: LineWidth
+    InstallBridge(0x006B0290, &Bridge_D3DDevice_SetRenderState_Complex<158>);       // 158: SampleAlpha
+    InstallBridge(0x006AF1A0, &Bridge_D3DDevice_SetRenderState_Complex<159>);       // 159: Dxt1NoiseEnable
+    InstallBridge(0x006AFFF0, &Bridge_D3DDevice_SetRenderState_Complex<160>);       // 160: YuvEnable
+    InstallBridge(0x006B0020, &Bridge_D3DDevice_SetRenderState_Complex<161>);       // 161: OcclusionCullEnable
+    InstallBridge(0x006B0090, &Bridge_D3DDevice_SetRenderState_Complex<162>);       // 162: StencilCullEnable
+    InstallBridge(0x006B0100, &Bridge_D3DDevice_SetRenderState_Complex<163>);       // 163: RopZCmpAlwaysRead
+    InstallBridge(0x006B0120, &Bridge_D3DDevice_SetRenderState_Complex<164>);       // 164: RopZRead
+    InstallBridge(0x006B0140, &Bridge_D3DDevice_SetRenderState_Complex<165>);       // 165: DoNotCullUncompressed
 
     // 6. Bridge Hardware Visibility Test (Occlusion Query) & Fence functions
     InstallBridge(0x006B1B70, &Bridge_D3DDevice_BeginVisibilityTest);               // _D3DDevice_BeginVisibilityTest@0

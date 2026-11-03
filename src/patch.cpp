@@ -42,25 +42,8 @@ void PatchRet(uint32_t xboxVA, uint16_t stackBytes, uint32_t retVal, bool setEax
 }
 
 // ============================================================================
-// Path Translation & Xbox Vertex Shader Remapping
+// Path Translation
 // ============================================================================
-
-struct ShaderRemapEntry {
-    const char* xboxSubstr;
-    const char* pcFile;
-};
-
-static const ShaderRemapEntry kShaderRemaps[] = {
-    { "SpecularRigid.xvu",       "DefaultRigid.xvu" },
-    { "SpecularSkinned.xvu",     "DefaultSkinned.xvu" },
-    { "SpecularSkinnedSoft.xvu", "DefaultSkinnedSoft.xvu" },
-    { "shield0.xvu",             "shieldRigid0.xvu" },
-    { "shield1.xvu",             "shieldRigid1.xvu" },
-    { "shield2.xvu",             "shieldRigid2.xvu" },
-    { "shield3.xvu",             "shieldRigid3.xvu" },
-    { "ScreenUVScale.xvu",       "screenHaze.xvu" },
-    { "heatshimmer.xvu",         "heatShimmer0.xvu" },
-};
 
 void EnsureDirExists(const char* dirPath) {
     char tmp[MAX_PATH];
@@ -80,31 +63,6 @@ void EnsureDirExists(const char* dirPath) {
 void TranslateXboxPath(const char* xboxPath, char* outWinPath, size_t outMaxLen) {
     if (!xboxPath || !xboxPath[0]) {
         outWinPath[0] = '\0';
-        return;
-    }
-
-    // Check if this is an Xbox vertex/pixel shader path: "...\VertexShaders\xbox\<name>"
-    const char* vsXbox = strstr(xboxPath, "VertexShaders\\xbox\\");
-    if (!vsXbox) vsXbox = strstr(xboxPath, "VertexShaders/xbox/");
-    if (!vsXbox) vsXbox = strstr(xboxPath, "vertexshaders\\xbox\\");
-    if (vsXbox) {
-        const char* fileName = vsXbox + strlen("VertexShaders\\xbox\\");
-        snprintf(outWinPath, outMaxLen, "%s\\VertexShaders\\XBox\\%s", g_gameRootDir, fileName);
-        if (GetFileAttributesA(outWinPath) != INVALID_FILE_ATTRIBUTES) {
-            return;
-        }
-        const char* mappedName = fileName;
-        for (size_t i = 0; i < sizeof(kShaderRemaps) / sizeof(kShaderRemaps[0]); ++i) {
-            if (_stricmp(fileName, kShaderRemaps[i].xboxSubstr) == 0) {
-                mappedName = kShaderRemaps[i].pcFile;
-                break;
-            }
-        }
-        snprintf(outWinPath, outMaxLen, "%s\\VertexShaders\\%s", g_gameRootDir, mappedName);
-        if (GetFileAttributesA(outWinPath) != INVALID_FILE_ATTRIBUTES) {
-            return;
-        }
-        snprintf(outWinPath, outMaxLen, "%s\\VertexShaders\\XBox\\%s", g_gameRootDir, mappedName);
         return;
     }
 

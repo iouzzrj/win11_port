@@ -31,25 +31,60 @@ bool GetXboxVertexShaderDecl(uint32_t handle, XboxShaderDeclInfo* outDecl) {
     return false;
 }
 
+// Matches the 0xFC-byte Xbox D3D8 pixel shader struct created by _D3DDevice_CreatePixelShader@8 (0x006B3C60):
+//   +0x00: uint32_t RefCount (= 1)
+//   +0x04: uint32_t Flags    (= 1 for CreatePixelShader, 0 for SetPixelShaderProgram wrapper at CDevice+0x924)
+//   +0x08: XboxPixelShaderDef* pPSDef (points to +0x0C, or external D3DPIXELSHADERDEF*)
+//   +0x0C: XboxPixelShaderDef def (240 bytes)
 struct XboxPixelShaderObject {
-    int32_t  engineType; // 0..27 if from aPixelShaders[0..27] at 0x007D1214, else 0
-    uint8_t  defBytes[240];
+    uint32_t           refCount;
+    uint32_t           flags;
+    XboxPixelShaderDef* pPSDef;
+    XboxPixelShaderDef def;
+    int32_t            engineType; // 0..27 if from aPixelShaders[0..27] at 0x007D1214, else -1
 };
+
+static const XboxPixelShaderDef* GetHandlePSDef(uint32_t handle, int32_t* outEngineType = nullptr) {
+    if (outEngineType) *outEngineType = -1;
+    if (handle < 0x00400000u) return nullptr;
+    if (handle == (ADDR_D3D_DEVICE + 0x924u)) {
+        return *reinterpret_cast<const XboxPixelShaderDef* const*>(handle + 0x08u);
+    }
+    const XboxPixelShaderObject* obj = reinterpret_cast<const XboxPixelShaderObject*>(handle);
+    if (outEngineType) *outEngineType = obj->engineType;
+    return obj->pPSDef ? obj->pPSDef : &obj->def;
+}
+
+static uint32_t PackFloat4ToD3DColor(const float* rgba) {
+    auto toByte = [](float v) -> uint32_t {
+        if (v <= 0.0f) return 0u;
+        if (v >= 1.0f) return 255u;
+        return static_cast<uint32_t>(v * 255.0f + 0.5f);
+    };
+    uint32_t r = toByte(rgba[0]);
+    uint32_t g = toByte(rgba[1]);
+    uint32_t b = toByte(rgba[2]);
+    uint32_t a = toByte(rgba[3]);
+    return (a << 24) | (r << 16) | (g << 8) | b;
+}
 
 static HRESULT __stdcall Bridge_D3DDevice_CreatePixelShader(const void* pShaderDef, DWORD* pHandle) {
     if (!pHandle) return E_INVALIDARG;
     XboxPixelShaderObject* obj = reinterpret_cast<XboxPixelShaderObject*>(calloc(1, sizeof(XboxPixelShaderObject)));
     if (!obj) return E_OUTOFMEMORY;
-    obj->engineType = 0;
+    obj->refCount   = 1u;
+    obj->flags      = 1u;
+    obj->pPSDef     = &obj->def;
+    obj->engineType = -1;
     if (pShaderDef) {
-        memcpy(obj->defBytes, pShaderDef, 240);
+        memcpy(&obj->def, pShaderDef, sizeof(XboxPixelShaderDef));
     }
     uintptr_t hAddr = reinterpret_cast<uintptr_t>(pHandle);
     if (hAddr >= ADDR_PIXEL_SHADERS_TABLE && hAddr < ADDR_PIXEL_SHADERS_TABLE + 28 * 8) {
-        obj->engineType = (int32_t)((hAddr - ADDR_PIXEL_SHADERS_TABLE) / 8);
+        obj->engineType = static_cast<int32_t>((hAddr - ADDR_PIXEL_SHADERS_TABLE) / 8);
     }
     if (obj->engineType >= 0 && obj->engineType < 28) {
-        GetPixelShaderPermutation((uint32_t)(obj->engineType + 1));
+        GetPixelShaderPermutation(static_cast<uint32_t>(obj->engineType + 1));
     }
     *pHandle = reinterpret_cast<DWORD>(obj);
     return S_OK;
@@ -58,39 +93,70 @@ static HRESULT __stdcall Bridge_D3DDevice_CreatePixelShader(const void* pShaderD
 static HRESULT __stdcall Bridge_D3DDevice_SetPixelShader(DWORD Handle) {
     g_currentPsHandle = Handle;
     *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x784) = Handle;
-    if (Handle != 0 && Handle >= 0x00400000) {
-        const XboxPixelShaderObject* obj = reinterpret_cast<const XboxPixelShaderObject*>(Handle);
-        g_currentPsType = obj->engineType;
-        // Load embedded def cN constants from D3DPIXELSHADERDEF (PSC0Mapping=dwords[57], PSC1Mapping=dwords[58])
-        const uint32_t* dwords = reinterpret_cast<const uint32_t*>(obj->defBytes);
-        uint32_t c0Map = dwords[57];
-        uint32_t c1Map = dwords[58];
-        for (int s = 0; s < 8; ++s) {
-            uint32_t r0 = (c0Map >> (s * 4)) & 0xFu;
-            if (r0 < 8 && dwords[10 + s] != 0) {
-                uint32_t c = dwords[10 + s];
-                g_psConstants[r0][0] = ((c >> 16) & 0xFFu) * (1.0f / 255.0f);
-                g_psConstants[r0][1] = ((c >> 8)  & 0xFFu) * (1.0f / 255.0f);
-                g_psConstants[r0][2] = (c         & 0xFFu) * (1.0f / 255.0f);
-                g_psConstants[r0][3] = ((c >> 24) & 0xFFu) * (1.0f / 255.0f);
+    uint32_t* xboxRS = reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE);
+
+    if (Handle != 0 && Handle >= 0x00400000u) {
+        int32_t engType = -1;
+        const XboxPixelShaderDef* pDef = GetHandlePSDef(Handle, &engType);
+        g_currentPsType = (engType >= 0 && engType < 28) ? engType : 28;
+        if (pDef) {
+            const uint32_t* dwords = reinterpret_cast<const uint32_t*>(pDef);
+            // Synchronize D3DPIXELSHADERDEF into _D3D__RenderState[0..56] & PSTextureModes (136),
+            // matching _D3DDevice_SetPixelShader@4 (0x006B3CF0).
+            for (uint32_t i = 0; i <= 53; ++i) {
+                xboxRS[i] = dwords[i];
             }
-            uint32_t r1 = (c1Map >> (s * 4)) & 0xFu;
-            if (r1 < 8 && dwords[18 + s] != 0) {
-                uint32_t c = dwords[18 + s];
-                g_psConstants[r1][0] = ((c >> 16) & 0xFFu) * (1.0f / 255.0f);
-                g_psConstants[r1][1] = ((c >> 8)  & 0xFFu) * (1.0f / 255.0f);
-                g_psConstants[r1][2] = (c         & 0xFFu) * (1.0f / 255.0f);
-                g_psConstants[r1][3] = ((c >> 24) & 0xFFu) * (1.0f / 255.0f);
+            xboxRS[XBOX_D3DRS_PSTEXTUREMODES] = dwords[54];
+            *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x790) = dwords[54];
+            xboxRS[55] = dwords[55]; // PSDotMapping
+            xboxRS[56] = dwords[56]; // PSInputTexture
+
+            // Load embedded def cN constants from D3DPIXELSHADERDEF unconditionally (including 0x00000000!):
+            // PSC0Mapping=dwords[57], PSC1Mapping=dwords[58], PSFinalCombinerConstants=dwords[59].
+            uint32_t c0Map = dwords[57];
+            uint32_t c1Map = dwords[58];
+            uint32_t fcMap = dwords[59];
+            for (int s = 0; s < 8; ++s) {
+                uint32_t r0 = (c0Map >> (s * 4)) & 0xFu;
+                if (r0 < 8u) {
+                    uint32_t c = dwords[10 + s];
+                    UnpackD3DColor(c, &g_psConstants[r0][0], &g_psConstants[r0][1], &g_psConstants[r0][2], &g_psConstants[r0][3]);
+                }
+                uint32_t r1 = (c1Map >> (s * 4)) & 0xFu;
+                if (r1 < 8u) {
+                    uint32_t c = dwords[18 + s];
+                    UnpackD3DColor(c, &g_psConstants[r1][0], &g_psConstants[r1][1], &g_psConstants[r1][2], &g_psConstants[r1][3]);
+                }
+            }
+            uint32_t fc0Reg = fcMap & 0xFu;
+            if (fc0Reg < 8u) {
+                uint32_t c = dwords[43];
+                UnpackD3DColor(c, &g_psConstants[fc0Reg][0], &g_psConstants[fc0Reg][1], &g_psConstants[fc0Reg][2], &g_psConstants[fc0Reg][3]);
+            }
+            uint32_t fc1Reg = (fcMap >> 4) & 0xFu;
+            if (fc1Reg < 8u) {
+                uint32_t c = dwords[44];
+                UnpackD3DColor(c, &g_psConstants[fc1Reg][0], &g_psConstants[fc1Reg][1], &g_psConstants[fc1Reg][2], &g_psConstants[fc1Reg][3]);
             }
         }
     } else {
         g_currentPsType = -1;
+        xboxRS[XBOX_D3DRS_PSCOMBINERCOUNT] = 0u;
     }
     return S_OK;
 }
 
-static void __stdcall Bridge_D3DDevice_SetPixelShaderProgram(DWORD Handle) {
-    Bridge_D3DDevice_SetPixelShader(Handle);
+// _D3DDevice_SetPixelShaderProgram@4 (0x006B3CB0):
+// Takes a direct pointer to a D3DPIXELSHADERDEF (or NULL), wraps it in CDevice+0x924, and calls SetPixelShader.
+static void __stdcall Bridge_D3DDevice_SetPixelShaderProgram(const XboxPixelShaderDef* pPSDef) {
+    if (pPSDef) {
+        *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x924) = 1u;
+        *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x928) = 0u;
+        *reinterpret_cast<const XboxPixelShaderDef**>(ADDR_D3D_DEVICE + 0x92C) = pPSDef;
+        Bridge_D3DDevice_SetPixelShader(ADDR_D3D_DEVICE + 0x924u);
+    } else {
+        Bridge_D3DDevice_SetPixelShader(0u);
+    }
 }
 
 static HRESULT __stdcall Bridge_D3DDevice_SetPixelShaderConstant(DWORD Register, const void* pConstantData, DWORD ConstantCount) {
@@ -98,8 +164,648 @@ static HRESULT __stdcall Bridge_D3DDevice_SetPixelShaderConstant(DWORD Register,
         DWORD cnt = ConstantCount;
         if (Register + cnt > 8) cnt = 8 - Register;
         memcpy(&g_psConstants[Register][0], pConstantData, cnt * 16);
+        memcpy(reinterpret_cast<void*>(ADDR_D3D_DEVICE + 0x894 + Register * 16), pConstantData, cnt * 16);
+
+        // Also synchronize mapped register combiner constant slots in _D3D__RenderState[10..25, 43..44],
+        // matching _D3DDevice_SetPixelShaderConstant@12 (0x006B3EF0).
+        const XboxPixelShaderDef* pDef = GetHandlePSDef(g_currentPsHandle);
+        if (pDef) {
+            uint32_t* xboxRS = reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE);
+            uint32_t c0Map = pDef->PSC0Mapping;
+            uint32_t c1Map = pDef->PSC1Mapping;
+            uint32_t fcMap = pDef->PSFinalCombinerConstants;
+            for (DWORD r = Register; r < Register + cnt; ++r) {
+                uint32_t packed = PackFloat4ToD3DColor(g_psConstants[r]);
+                for (int s = 0; s < 8; ++s) {
+                    if (((c0Map >> (s * 4)) & 0xFu) == r) xboxRS[10 + s] = packed;
+                    if (((c1Map >> (s * 4)) & 0xFu) == r) xboxRS[18 + s] = packed;
+                }
+                if ((fcMap & 0xFu) == r)         xboxRS[43] = packed;
+                if (((fcMap >> 4) & 0xFu) == r)  xboxRS[44] = packed;
+            }
+        }
     }
     return S_OK;
+}
+
+// ============================================================================
+// General NV2A Register Combiner (D3DPIXELSHADERDEF / _D3D__RenderState[0..56, 136])
+// Decompiler to HLSL ps_4_0 & Constant Populator
+// ============================================================================
+
+void PopulateRegisterCombinerConstants(PerDrawCBData* cb) {
+    if (!cb) return;
+    const uint32_t* xboxRS = reinterpret_cast<const uint32_t*>(ADDR_D3D_RENDERSTATE);
+    const XboxPixelShaderDef* pDef = GetHandlePSDef(g_currentPsHandle);
+
+    uint32_t combCountFlags = xboxRS[XBOX_D3DRS_PSCOMBINERCOUNT];
+    bool sepC0 = (combCountFlags & 0x1000u)  != 0u;
+    bool sepC1 = (combCountFlags & 0x10000u) != 0u;
+    uint32_t c0Map = pDef ? pDef->PSC0Mapping : 0xFFFFFFFFu;
+    uint32_t c1Map = pDef ? pDef->PSC1Mapping : 0xFFFFFFFFu;
+    uint32_t fcMap = pDef ? pDef->PSFinalCombinerConstants : 0xFFFFFFFFu;
+
+    for (int s = 0; s < 8; ++s) {
+        int effS0 = sepC0 ? s : 0;
+        uint32_t r0 = (c0Map >> (effS0 * 4)) & 0xFu;
+        if (r0 < 8u && PackFloat4ToD3DColor(g_psConstants[r0]) == xboxRS[10 + effS0]) {
+            memcpy(cb->rcStageC0[s], g_psConstants[r0], 16);
+        } else {
+            UnpackD3DColor(xboxRS[10 + effS0], &cb->rcStageC0[s][0], &cb->rcStageC0[s][1], &cb->rcStageC0[s][2], &cb->rcStageC0[s][3]);
+        }
+
+        int effS1 = sepC1 ? s : 0;
+        uint32_t r1 = (c1Map >> (effS1 * 4)) & 0xFu;
+        if (r1 < 8u && PackFloat4ToD3DColor(g_psConstants[r1]) == xboxRS[18 + effS1]) {
+            memcpy(cb->rcStageC1[s], g_psConstants[r1], 16);
+        } else {
+            UnpackD3DColor(xboxRS[18 + effS1], &cb->rcStageC1[s][0], &cb->rcStageC1[s][1], &cb->rcStageC1[s][2], &cb->rcStageC1[s][3]);
+        }
+    }
+
+    uint32_t fc0Reg = fcMap & 0xFu;
+    if (fc0Reg < 8u && PackFloat4ToD3DColor(g_psConstants[fc0Reg]) == xboxRS[43]) {
+        memcpy(cb->rcFinalConst[0], g_psConstants[fc0Reg], 16);
+    } else {
+        UnpackD3DColor(xboxRS[43], &cb->rcFinalConst[0][0], &cb->rcFinalConst[0][1], &cb->rcFinalConst[0][2], &cb->rcFinalConst[0][3]);
+    }
+
+    uint32_t fc1Reg = (fcMap >> 4) & 0xFu;
+    if (fc1Reg < 8u && PackFloat4ToD3DColor(g_psConstants[fc1Reg]) == xboxRS[44]) {
+        memcpy(cb->rcFinalConst[1], g_psConstants[fc1Reg], 16);
+    } else {
+        UnpackD3DColor(xboxRS[44], &cb->rcFinalConst[1][0], &cb->rcFinalConst[1][1], &cb->rcFinalConst[1][2], &cb->rcFinalConst[1][3]);
+    }
+}
+
+struct CachedRegCombinerPS {
+    uint64_t           hash;
+    ID3D11PixelShader* ps;
+};
+static std::vector<CachedRegCombinerPS> g_rcPsCache;
+
+static void FormatRcInputExpr(
+    uint8_t byteVal, bool isAlpha, int stageIdx, bool isFinalCombiner,
+    char* outBuf, size_t outSize)
+{
+    uint32_t reg  = byteVal & 0x0Fu;
+    uint32_t chan = (byteVal >> 4) & 0x01u;
+    uint32_t map  = (byteVal >> 5) & 0x07u;
+
+    char regStr[64];
+    switch (reg) {
+        case 0x0u: snprintf(regStr, sizeof(regStr), "float4(0.0f,0.0f,0.0f,0.0f)"); break;
+        case 0x1u:
+            if (isFinalCombiner) snprintf(regStr, sizeof(regStr), "uRcFinalConst[0]");
+            else                 snprintf(regStr, sizeof(regStr), "uRcStageC0[%d]", stageIdx);
+            break;
+        case 0x2u:
+            if (isFinalCombiner) snprintf(regStr, sizeof(regStr), "uRcFinalConst[1]");
+            else                 snprintf(regStr, sizeof(regStr), "uRcStageC1[%d]", stageIdx);
+            break;
+        case 0x3u: snprintf(regStr, sizeof(regStr), "fogReg");  break;
+        case 0x4u: snprintf(regStr, sizeof(regStr), "v0");      break;
+        case 0x5u: snprintf(regStr, sizeof(regStr), "v1");      break;
+        case 0x8u: snprintf(regStr, sizeof(regStr), "t0");      break;
+        case 0x9u: snprintf(regStr, sizeof(regStr), "t1");      break;
+        case 0xAu: snprintf(regStr, sizeof(regStr), "t2");      break;
+        case 0xBu: snprintf(regStr, sizeof(regStr), "t3");      break;
+        case 0xCu: snprintf(regStr, sizeof(regStr), "r0");      break;
+        case 0xDu: snprintf(regStr, sizeof(regStr), "r1");      break;
+        case 0xEu: snprintf(regStr, sizeof(regStr), "sumReg");  break;
+        case 0xFu: snprintf(regStr, sizeof(regStr), "efProd");  break;
+        default:   snprintf(regStr, sizeof(regStr), "float4(0.0f,0.0f,0.0f,0.0f)"); break;
+    }
+
+    char compStr[80];
+    if (isAlpha) {
+        snprintf(compStr, sizeof(compStr), "(%s).%s", regStr, chan ? "a" : "b");
+    } else {
+        snprintf(compStr, sizeof(compStr), "(%s).%s", regStr, chan ? "aaa" : "rgb");
+    }
+
+    switch (map) {
+        case 0u: // UNSIGNED_IDENTITY: max(0, x)
+            snprintf(outBuf, outSize, "max(%s, 0.0f)", compStr);
+            break;
+        case 1u: // UNSIGNED_INVERT: 1 - clamp(x, 0, 1)
+            snprintf(outBuf, outSize, "(1.0f - saturate(%s))", compStr);
+            break;
+        case 2u: // EXPAND_NORMAL: 2 * max(0, x) - 1
+            snprintf(outBuf, outSize, "(2.0f * max(%s, 0.0f) - 1.0f)", compStr);
+            break;
+        case 3u: // EXPAND_NEGATE: 1 - 2 * max(0, x)
+            snprintf(outBuf, outSize, "(1.0f - 2.0f * max(%s, 0.0f))", compStr);
+            break;
+        case 4u: // HALFBIAS_NORMAL: max(0, x) - 0.5
+            snprintf(outBuf, outSize, "(max(%s, 0.0f) - 0.5f)", compStr);
+            break;
+        case 5u: // HALFBIAS_NEGATE: 0.5 - max(0, x)
+            snprintf(outBuf, outSize, "(0.5f - max(%s, 0.0f))", compStr);
+            break;
+        case 6u: // SIGNED_IDENTITY: x
+            snprintf(outBuf, outSize, "(%s)", compStr);
+            break;
+        case 7u: // SIGNED_NEGATE: -x
+            snprintf(outBuf, outSize, "(-(%s))", compStr);
+            break;
+        default:
+            snprintf(outBuf, outSize, "(%s)", compStr);
+            break;
+    }
+}
+
+static const char* GetRcDestRegName(uint32_t dstNibble) {
+    switch (dstNibble & 0x0Fu) {
+        case 0x4u: return "v0";
+        case 0x5u: return "v1";
+        case 0x8u: return "t0";
+        case 0x9u: return "t1";
+        case 0xAu: return "t2";
+        case 0xBu: return "t3";
+        case 0xCu: return "r0";
+        case 0xDu: return "r1";
+        default:   return nullptr;
+    }
+}
+
+static void FormatRcScaleBias(const char* expr, uint32_t outWord, char* outBuf, size_t outSize) {
+    uint32_t scale = (outWord >> 15) & 0x03u;
+    uint32_t bias  = (outWord >> 17) & 0x01u;
+    const char* scaleMul = "";
+    if (scale == 1u)      scaleMul = " * 2.0f";
+    else if (scale == 2u) scaleMul = " * 4.0f";
+    else if (scale == 3u) scaleMul = " * 0.5f";
+
+    if (bias != 0u) {
+        snprintf(outBuf, outSize, "clamp(((%s) - 0.5f)%s, -1.0f, 1.0f)", expr, scaleMul);
+    } else {
+        snprintf(outBuf, outSize, "clamp((%s)%s, -1.0f, 1.0f)", expr, scaleMul);
+    }
+}
+
+// Decompiles the active NV2A Register Combiner state in _D3D__RenderState[0..56, 136] into HLSL ps_4_0
+static std::string DecompileRegisterCombinersToHLSL(const uint32_t* xboxRS) {
+    uint32_t psTexModes = xboxRS[XBOX_D3DRS_PSTEXTUREMODES];
+    uint32_t dotMapping = xboxRS[XBOX_D3DRS_PSDOTMAPPING];
+    uint32_t inputTex   = xboxRS[XBOX_D3DRS_PSINPUTTEXTURE];
+    uint32_t cmpMode    = xboxRS[XBOX_D3DRS_PSCOMPAREMODE];
+    uint32_t combCount  = xboxRS[XBOX_D3DRS_PSCOMBINERCOUNT] & 0x0Fu;
+    if (combCount == 0u) combCount = 1u;
+    if (combCount > 8u)  combCount = 8u;
+    bool muxMsb = (xboxRS[XBOX_D3DRS_PSCOMBINERCOUNT] & 0x0100u) != 0u;
+
+    std::string s;
+    s.reserve(8192);
+    s += "cbuffer PerDrawCB : register(b0) {\n"
+         "    float4 uWvpRow0; float4 uWvpRow1; float4 uWvpRow2; float4 uWvpRow3;\n"
+         "    float4 uViewport; float4 uTFactor;\n"
+         "    uint4  uStage0Ops; uint4 uStage0Alpha;\n"
+         "    uint4  uStage1Ops; uint4 uStage1Alpha;\n"
+         "    uint4  uStage2Ops; uint4 uStage2Alpha;\n"
+         "    uint4  uStage3Ops; uint4  uStage3Alpha;\n"
+         "    uint4  uFlags; float4 uAlphaTest;\n"
+         "    float4 uUvScale01; float4 uUvScale23;\n"
+         "    float4 uBumpParams; float4 uFogParams; float4 uFogColor;\n"
+         "    float4 uPsConst0; float4 uPsConst1; float4 uPsConst2; float4 uPsConst3;\n"
+         "    float4 uPsConst4; float4 uPsConst5; float4 uPsConst6; float4 uPsConst7;\n"
+         "    float4 uWorldRow0; float4 uWorldRow1; float4 uWorldRow2; float4 uWorldRow3;\n"
+         "    uint4  uLightCount;\n"
+         "    float4 uLightPosType[8]; float4 uLightDirRange[8];\n"
+         "    float4 uLightAttenSpot[8]; float4 uLightSpotParams[8];\n"
+         "    float4 uLightDiffuse[8]; float4 uLightAmbient[8]; float4 uLightSpecular[8];\n"
+         "    float4 uEyePosWorld; float4 uMatBackDiffAmb; float4 uMatBackSpec;\n"
+         "    uint4  uStageColorKeyOp; float4 uStageColorKeyColor[4];\n"
+         "    uint4  uStageColorSign; float4 uBumpLuminance;\n"
+         "    float4 uScissorRects[8];\n"
+         "    float4 uRcStageC0[8]; float4 uRcStageC1[8]; float4 uRcFinalConst[2];\n"
+         "};\n"
+         "Texture2D    tex0 : register(t0); Texture2D    tex1 : register(t1);\n"
+         "Texture2D    tex2 : register(t2); Texture2D    tex3 : register(t3);\n"
+         "TextureCube  cubeTex0 : register(t4); TextureCube  cubeTex1 : register(t5);\n"
+         "TextureCube  cubeTex2 : register(t6); TextureCube  cubeTex3 : register(t7);\n"
+         "Texture3D    volTex0  : register(t8); Texture3D    volTex1  : register(t9);\n"
+         "Texture3D    volTex2  : register(t10); Texture3D   volTex3  : register(t11);\n"
+         "Texture2D    gammaLutTex : register(t12);\n"
+         "SamplerState smp0 : register(s0); SamplerState smp1 : register(s1);\n"
+         "SamplerState smp2 : register(s2); SamplerState smp3 : register(s3);\n"
+         "struct PSIn {\n"
+         "    float4 pos    : SV_POSITION;\n"
+         "    float4 color  : COLOR0;\n"
+         "    float4 uv0    : TEXCOORD0;\n"
+         "    float4 uv1    : TEXCOORD1;\n"
+         "    float4 uv2    : TEXCOORD2;\n"
+         "    float4 uv3    : TEXCOORD3;\n"
+         "    float2 eyeDist: TEXCOORD4;\n"
+         "    float3 norm   : TEXCOORD5;\n"
+         "};\n"
+         "float4 SampleStageTex(uint stageIdx, Texture2D tex2d, TextureCube texCube, Texture3D texVol, SamplerState smp, float4 uv, bool isCube, bool isVol) {\n"
+         "    float4 c;\n"
+         "    if (isCube) { c = texCube.Sample(smp, uv.xyz); }\n"
+         "    else if (isVol) { c = texVol.Sample(smp, uv.xyz); }\n"
+         "    else { c = tex2d.Sample(smp, uv.xy); }\n"
+         "    uint ckOp = uStageColorKeyOp[stageIdx];\n"
+         "    if (ckOp != 0u) {\n"
+         "        float4 ckCol = uStageColorKeyColor[stageIdx];\n"
+         "        bool matchRgb = all(abs(c.rgb - ckCol.rgb) < (1.5f / 255.0f));\n"
+         "        if (ckOp == 1u && matchRgb) c.a = 0.0f;\n"
+         "        else if (ckOp == 2u && matchRgb && abs(c.a - ckCol.a) < (1.5f / 255.0f)) c = 0.0f;\n"
+         "        else if (ckOp == 3u && matchRgb) discard;\n"
+         "    }\n"
+         "    if (((uFlags.y >> (16u + stageIdx)) & 1u) != 0u && c.a < (0.5f / 255.0f)) discard;\n"
+         "    uint cSign = uStageColorSign[stageIdx];\n"
+         "    if (cSign != 0u) {\n"
+         "        if ((cSign & 0x20u) != 0u) c.r = c.r * 2.0f - 1.0f;\n"
+         "        if ((cSign & 0x40u) != 0u) c.g = c.g * 2.0f - 1.0f;\n"
+         "        if ((cSign & 0x80u) != 0u) c.b = c.b * 2.0f - 1.0f;\n"
+         "        if ((cSign & 0x10u) != 0u) c.a = c.a * 2.0f - 1.0f;\n"
+         "    }\n"
+         "    return c;\n"
+         "}\n"
+         "float3 MapDotVec(float4 t, uint dm) {\n"
+         "    if (dm == 0u) return t.rgb;\n"
+         "    if (dm == 1u) return (t.rgb - 128.0f / 255.0f) * (255.0f / 127.0f);\n"
+         "    return t.rgb * 2.0f - 1.0f;\n"
+         "}\n"
+         "float4 PSMain(PSIn input) : SV_TARGET {\n"
+         "    uint scissorCount = (uFlags.x >> 4u) & 0x0Fu;\n"
+         "    if (scissorCount > 0u) {\n"
+         "        bool insideAny = false;\n"
+         "        [unroll] for (uint si = 0u; si < 8u; ++si) {\n"
+         "            if (si < scissorCount) {\n"
+         "                float4 sr = uScissorRects[si];\n"
+         "                if (input.pos.x >= sr.x && input.pos.x < sr.z && input.pos.y >= sr.y && input.pos.y < sr.w) insideAny = true;\n"
+         "            }\n"
+         "        }\n"
+         "        if (((uFlags.x & 4u) != 0u) ? insideAny : !insideAny) discard;\n"
+         "    }\n"
+         "    uint texMask  = uFlags.y & 0x0Fu;\n"
+         "    uint cubeMask = (uFlags.y >> 4u) & 0x0Fu;\n"
+         "    uint projMask = (uFlags.y >> 8u) & 0x0Fu;\n"
+         "    uint volMask  = (uFlags.y >> 12u) & 0x0Fu;\n"
+         "    float4 uv0 = input.uv0, uv1 = input.uv1, uv2 = input.uv2, uv3 = input.uv3;\n"
+         "    float4 t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, t3 = 0.0f;\n"
+         "    float3 dotVec = 0.0f;\n";
+
+    char line[512];
+    // 1. Emit 4-stage NV2A Texture Addressing Modes (PSTextureModes)
+    for (int st = 0; st < 4; ++st) {
+        uint32_t tm = (psTexModes >> (st * 5)) & 0x1Fu;
+        uint32_t inSt = 0u;
+        if (st == 1)      inSt = 0u;
+        else if (st == 2) inSt = (inputTex >> 16) & 1u;
+        else if (st == 3) inSt = (inputTex >> 20) & 3u;
+        if (inSt >= (uint32_t)st) inSt = (st > 0) ? (uint32_t)(st - 1) : 0u;
+        uint32_t dm = (st > 0) ? ((dotMapping >> ((st - 1) * 4)) & 0x07u) : 0u;
+        uint32_t cm = (cmpMode >> (st * 4)) & 0x0Fu;
+
+        switch (tm) {
+            case 0x00u: // PS_TEXTUREMODES_NONE
+                snprintf(line, sizeof(line), "    t%d = float4(0.0f, 0.0f, 0.0f, 0.0f);\n", st);
+                s += line;
+                break;
+            case 0x01u: // PS_TEXTUREMODES_PROJECT2D
+            case 0x02u: // PS_TEXTUREMODES_PROJECT3D
+            case 0x03u: // PS_TEXTUREMODES_CUBEMAP
+                snprintf(line, sizeof(line),
+                    "    if ((texMask & %uu) != 0u) {\n"
+                    "        float4 uvs = uv%d;\n"
+                    "        if ((projMask & %uu) != 0u && abs(uvs.w) > 1e-5f) uvs.xyz /= uvs.w;\n"
+                    "        t%d = SampleStageTex(%uu, tex%d, cubeTex%d, volTex%d, smp%d, uvs, (cubeMask & %uu) != 0u || %uu == 3u, (volMask & %uu) != 0u || %uu == 2u);\n"
+                    "    }\n",
+                    1u << st, st, 1u << st, st, st, st, st, st, st, 1u << st, tm, 1u << st, tm);
+                s += line;
+                break;
+            case 0x04u: // PS_TEXTUREMODES_PASSTHRU
+                snprintf(line, sizeof(line), "    t%d = saturate(uv%d);\n", st, st);
+                s += line;
+                break;
+            case 0x05u: // PS_TEXTUREMODES_CLIPPLANE
+                snprintf(line, sizeof(line),
+                    "    if (((%uu & 1u) != 0u ? (uv%d.x < 0.0f) : (uv%d.x >= 0.0f)) ||\n"
+                    "        ((%uu & 2u) != 0u ? (uv%d.y < 0.0f) : (uv%d.y >= 0.0f)) ||\n"
+                    "        ((%uu & 4u) != 0u ? (uv%d.z < 0.0f) : (uv%d.z >= 0.0f)) ||\n"
+                    "        ((%uu & 8u) != 0u ? (uv%d.w < 0.0f) : (uv%d.w >= 0.0f))) discard;\n",
+                    cm, st, st, cm, st, st, cm, st, st, cm, st, st);
+                s += line;
+                break;
+            case 0x06u: // PS_TEXTUREMODES_BUMPENVMAP
+            case 0x07u: // PS_TEXTUREMODES_BUMPENVMAPLUMINANCE
+                snprintf(line, sizeof(line),
+                    "    if ((texMask & %uu) != 0u) {\n"
+                    "        float2 bd = MapDotVec(t%u, %uu).xy;\n"
+                    "        float4 buv = uv%d;\n"
+                    "        buv.xy += float2(bd.x * uBumpParams.x + bd.y * uBumpParams.z, bd.x * uBumpParams.y + bd.y * uBumpParams.w);\n"
+                    "        t%d = SampleStageTex(%uu, tex%d, cubeTex%d, volTex%d, smp%d, buv, (cubeMask & %uu) != 0u, (volMask & %uu) != 0u);\n"
+                    "        if (%uu == 7u) t%d.rgb *= saturate(t%u.b * uBumpLuminance.x + uBumpLuminance.y);\n"
+                    "    }\n",
+                    1u << st, inSt, dm, st, st, st, st, st, st, st, 1u << st, 1u << st, tm, st, inSt);
+                s += line;
+                break;
+            case 0x0Fu: // PS_TEXTUREMODES_DPNDNT_AR (texreg2ar)
+                snprintf(line, sizeof(line),
+                    "    if ((texMask & %uu) != 0u) t%d = SampleStageTex(%uu, tex%d, cubeTex%d, volTex%d, smp%d, float4(t%u.ar, 0.0f, 0.0f), false, false);\n",
+                    1u << st, st, st, st, st, st, st, inSt);
+                s += line;
+                break;
+            case 0x10u: // PS_TEXTUREMODES_DPNDNT_GB (texreg2gb)
+                snprintf(line, sizeof(line),
+                    "    if ((texMask & %uu) != 0u) t%d = SampleStageTex(%uu, tex%d, cubeTex%d, volTex%d, smp%d, float4(t%u.gb, 0.0f, 0.0f), false, false);\n",
+                    1u << st, st, st, st, st, st, st, inSt);
+                s += line;
+                break;
+            case 0x11u: // PS_TEXTUREMODES_DOTPRODUCT (texm3x2pad / texm3x3pad)
+                snprintf(line, sizeof(line),
+                    "    { float dp = dot(uv%d.xyz, MapDotVec(t%u, %uu)); dotVec.%s = dp; t%d = dp.xxxx; }\n",
+                    st, inSt, dm, (st == 1) ? "x" : ((st == 2) ? "y" : "z"), st);
+                s += line;
+                break;
+            case 0x09u: // PS_TEXTUREMODES_DOT_ST (texm3x2tex)
+                snprintf(line, sizeof(line),
+                    "    { float dp = dot(uv%d.xyz, MapDotVec(t%u, %uu)); dotVec.y = dp;\n"
+                    "      if ((texMask & %uu) != 0u) t%d = SampleStageTex(%uu, tex%d, cubeTex%d, volTex%d, smp%d, float4(dotVec.xy, 0.0f, 0.0f), false, false); }\n",
+                    st, inSt, dm, 1u << st, st, st, st, st, st, st);
+                s += line;
+                break;
+            case 0x0Du: // PS_TEXTUREMODES_DOT_STR_3D
+            case 0x0Eu: // PS_TEXTUREMODES_DOT_STR_CUBE (texm3x3tex)
+                snprintf(line, sizeof(line),
+                    "    { float dp = dot(uv%d.xyz, MapDotVec(t%u, %uu)); dotVec.z = dp;\n"
+                    "      if ((texMask & %uu) != 0u) t%d = SampleStageTex(%uu, tex%d, cubeTex%d, volTex%d, smp%d, float4(dotVec.xyz, 1.0f), (cubeMask & %uu) != 0u || %uu == 14u, (volMask & %uu) != 0u || %uu == 13u); }\n",
+                    st, inSt, dm, 1u << st, st, st, st, st, st, st, 1u << st, tm, 1u << st, tm);
+                s += line;
+                break;
+            case 0x0Bu: // PS_TEXTUREMODES_DOT_RFLCT_DIFF
+            case 0x0Cu: // PS_TEXTUREMODES_DOT_RFLCT_SPEC (texm3x3vspec)
+            case 0x12u: // PS_TEXTUREMODES_DOT_RFLCT_SPEC_CONST (texm3x3spec)
+                snprintf(line, sizeof(line),
+                    "    { float dp = dot(uv%d.xyz, MapDotVec(t%u, %uu));\n"
+                    "      if (%d == 2) dotVec.y = dp; else dotVec.z = dp;\n"
+                    "      float3 Np = (dot(dotVec, dotVec) > 1e-6f) ? normalize(dotVec) : float3(0.0f, 0.0f, 1.0f);\n"
+                    "      float3 Vw = (%uu == 18u) ? uRcStageC0[0].xyz : float3(uv1.w, uv2.w, uv3.w);\n"
+                    "      float3 R  = (%uu == 11u) ? Np : ((dot(Vw, Vw) > 1e-6f) ? reflect(-normalize(Vw), Np) : Np);\n"
+                    "      if ((texMask & %uu) != 0u) t%d = ((cubeMask & %uu) != 0u) ? cubeTex%d.Sample(smp%d, R) : tex%d.Sample(smp%d, float2(R.x * 0.5f + 0.5f, 0.5f - R.y * 0.5f)); }\n",
+                    st, inSt, dm, st, tm, tm, 1u << st, st, 1u << st, st, st, st, st);
+                s += line;
+                break;
+            default:
+                snprintf(line, sizeof(line),
+                    "    if ((texMask & %uu) != 0u) t%d = SampleStageTex(%uu, tex%d, cubeTex%d, volTex%d, smp%d, uv%d, (cubeMask & %uu) != 0u, (volMask & %uu) != 0u);\n",
+                    1u << st, st, st, st, st, st, st, st, 1u << st, 1u << st);
+                s += line;
+                break;
+        }
+    }
+
+    // 2. Initialize Register Combiner registers
+    s += "    float fogFactor = 1.0f;\n"
+         "    if (uFogParams.x > 0.5f && (uFlags.x & 1u) == 0u) {\n"
+         "        float d = input.eyeDist.x;\n"
+         "        if (uFogParams.x > 3.5f) fogFactor = saturate(d);\n"
+         "        else if (uFogParams.x > 2.5f) fogFactor = saturate((uFogParams.z - d) / max(uFogParams.z - uFogParams.y, 0.001f));\n"
+         "        else if (uFogParams.x < 1.5f) fogFactor = saturate(exp(-d * uFogParams.w));\n"
+         "        else { float df = d * uFogParams.w; fogFactor = saturate(exp(-(df * df))); }\n"
+         "    }\n"
+         "    float4 fogReg = float4(uFogColor.rgb, fogFactor);\n"
+         "    float4 v0 = input.color;\n"
+         "    float4 v1 = float4(input.norm, 1.0f);\n"
+         "    float4 r0 = float4(t0.a, t0.a, t0.a, t0.a);\n"
+         "    float4 r1 = float4(0.0f, 0.0f, 0.0f, 0.0f);\n"
+         "    float4 sumReg = float4(0.0f, 0.0f, 0.0f, 0.0f);\n"
+         "    float4 efProd = float4(0.0f, 0.0f, 0.0f, 0.0f);\n";
+
+    // 3. Emit General Combiner Stages 0 .. combCount-1
+    for (uint32_t st = 0; st < combCount; ++st) {
+        uint32_t rgbIn    = xboxRS[XBOX_D3DRS_PSRGBINPUTS0    + st];
+        uint32_t alphaIn  = xboxRS[XBOX_D3DRS_PSALPHAINPUTS0  + st];
+        uint32_t rgbOut   = xboxRS[XBOX_D3DRS_PSRGBOUTPUTS0   + st];
+        uint32_t alphaOut = xboxRS[XBOX_D3DRS_PSALPHAOUTPUTS0 + st];
+
+        char cA[160], cB[160], cC[160], cD[160];
+        FormatRcInputExpr((uint8_t)((rgbIn >> 24) & 0xFFu), false, (int)st, false, cA, sizeof(cA));
+        FormatRcInputExpr((uint8_t)((rgbIn >> 16) & 0xFFu), false, (int)st, false, cB, sizeof(cB));
+        FormatRcInputExpr((uint8_t)((rgbIn >> 8)  & 0xFFu), false, (int)st, false, cC, sizeof(cC));
+        FormatRcInputExpr((uint8_t)( rgbIn        & 0xFFu), false, (int)st, false, cD, sizeof(cD));
+
+        char aA[160], aB[160], aC[160], aD[160];
+        FormatRcInputExpr((uint8_t)((alphaIn >> 24) & 0xFFu), true, (int)st, false, aA, sizeof(aA));
+        FormatRcInputExpr((uint8_t)((alphaIn >> 16) & 0xFFu), true, (int)st, false, aB, sizeof(aB));
+        FormatRcInputExpr((uint8_t)((alphaIn >> 8)  & 0xFFu), true, (int)st, false, aC, sizeof(aC));
+        FormatRcInputExpr((uint8_t)( alphaIn        & 0xFFu), true, (int)st, false, aD, sizeof(aD));
+
+        bool abDot  = ((rgbOut >> 12) & 1u) != 0u;
+        bool cdDot  = ((rgbOut >> 13) & 1u) != 0u;
+        bool rgbMux = ((rgbOut >> 14) & 1u) != 0u;
+        bool alpMux = ((alphaOut >> 14) & 1u) != 0u;
+
+        s += "    {\n";
+        snprintf(line, sizeof(line), "        float3 rgbA = %s, rgbB = %s, rgbC = %s, rgbD = %s;\n", cA, cB, cC, cD);
+        s += line;
+        snprintf(line, sizeof(line), "        float  alpA = %s, alpB = %s, alpC = %s, alpD = %s;\n", aA, aB, aC, aD);
+        s += line;
+        snprintf(line, sizeof(line), "        float3 rawAB_rgb = %s;\n", abDot ? "dot(rgbA, rgbB).xxx" : "(rgbA * rgbB)");
+        s += line;
+        snprintf(line, sizeof(line), "        float3 rawCD_rgb = %s;\n", cdDot ? "dot(rgbC, rgbD).xxx" : "(rgbC * rgbD)");
+        s += line;
+        if (rgbMux) {
+            snprintf(line, sizeof(line), "        float3 rawSum_rgb = (%s) ? rawCD_rgb : rawAB_rgb;\n",
+                     muxMsb ? "(r0.a >= 0.5f)" : "(((int)(saturate(r0.a) * 255.0f + 0.5f) & 1) != 0)");
+        } else {
+            snprintf(line, sizeof(line), "        float3 rawSum_rgb = rawAB_rgb + rawCD_rgb;\n");
+        }
+        s += line;
+
+        s += "        float rawAB_a = alpA * alpB;\n"
+             "        float rawCD_a = alpC * alpD;\n";
+        if (alpMux) {
+            snprintf(line, sizeof(line), "        float rawSum_a = (%s) ? rawCD_a : rawAB_a;\n",
+                     muxMsb ? "(r0.a >= 0.5f)" : "(((int)(saturate(r0.a) * 255.0f + 0.5f) & 1) != 0)");
+        } else {
+            snprintf(line, sizeof(line), "        float rawSum_a = rawAB_a + rawCD_a;\n");
+        }
+        s += line;
+
+        char scaledAB_rgb[128], scaledCD_rgb[128], scaledSum_rgb[128];
+        FormatRcScaleBias("rawAB_rgb",  rgbOut, scaledAB_rgb,  sizeof(scaledAB_rgb));
+        FormatRcScaleBias("rawCD_rgb",  rgbOut, scaledCD_rgb,  sizeof(scaledCD_rgb));
+        FormatRcScaleBias("rawSum_rgb", rgbOut, scaledSum_rgb, sizeof(scaledSum_rgb));
+
+        char scaledAB_a[128], scaledCD_a[128], scaledSum_a[128];
+        FormatRcScaleBias("rawAB_a",  alphaOut, scaledAB_a,  sizeof(scaledAB_a));
+        FormatRcScaleBias("rawCD_a",  alphaOut, scaledCD_a,  sizeof(scaledCD_a));
+        FormatRcScaleBias("rawSum_a", alphaOut, scaledSum_a, sizeof(scaledSum_a));
+
+        if (const char* dst = GetRcDestRegName(rgbOut & 0xFu)) {
+            snprintf(line, sizeof(line), "        %s.rgb = %s;\n", dst, scaledAB_rgb);
+            s += line;
+        }
+        if (const char* dst = GetRcDestRegName((rgbOut >> 4) & 0xFu)) {
+            snprintf(line, sizeof(line), "        %s.rgb = %s;\n", dst, scaledCD_rgb);
+            s += line;
+        }
+        if (const char* dst = GetRcDestRegName((rgbOut >> 8) & 0xFu)) {
+            snprintf(line, sizeof(line), "        %s.rgb = %s;\n", dst, scaledSum_rgb);
+            s += line;
+        }
+
+        if (const char* dst = GetRcDestRegName(alphaOut & 0xFu)) {
+            snprintf(line, sizeof(line), "        %s.a = %s;\n", dst, scaledAB_a);
+            s += line;
+        }
+        if (const char* dst = GetRcDestRegName((alphaOut >> 4) & 0xFu)) {
+            snprintf(line, sizeof(line), "        %s.a = %s;\n", dst, scaledCD_a);
+            s += line;
+        }
+        if (const char* dst = GetRcDestRegName((alphaOut >> 8) & 0xFu)) {
+            snprintf(line, sizeof(line), "        %s.a = %s;\n", dst, scaledSum_a);
+            s += line;
+        }
+        s += "    }\n";
+    }
+
+    // 4. Emit Final Combiner (PSFinalCombinerInputsABCD = RS[8], PSFinalCombinerInputsEFG = RS[9])
+    uint32_t fcABCD = xboxRS[XBOX_D3DRS_PSFINALCOMBINERINPUTSABCD];
+    uint32_t fcEFG  = xboxRS[XBOX_D3DRS_PSFINALCOMBINERINPUTSEFG];
+    if (fcABCD != 0u || fcEFG != 0u) {
+        bool clampSum = (fcEFG & 0x80u) != 0u;
+        snprintf(line, sizeof(line), "    sumReg = %s;\n", clampSum ? "saturate(r0 + v1)" : "(r0 + v1)");
+        s += line;
+
+        char fcE[160], fcF[160], fcA[160], fcB[160], fcC[160], fcD[160], fcG[160];
+        FormatRcInputExpr((uint8_t)((fcEFG  >> 24) & 0xFFu), false, 8, true, fcE, sizeof(fcE));
+        FormatRcInputExpr((uint8_t)((fcEFG  >> 16) & 0xFFu), false, 8, true, fcF, sizeof(fcF));
+        snprintf(line, sizeof(line), "    efProd = float4((%s) * (%s), 1.0f);\n", fcE, fcF);
+        s += line;
+
+        FormatRcInputExpr((uint8_t)((fcABCD >> 24) & 0xFFu), false, 8, true, fcA, sizeof(fcA));
+        FormatRcInputExpr((uint8_t)((fcABCD >> 16) & 0xFFu), false, 8, true, fcB, sizeof(fcB));
+        FormatRcInputExpr((uint8_t)((fcABCD >> 8)  & 0xFFu), false, 8, true, fcC, sizeof(fcC));
+        FormatRcInputExpr((uint8_t)( fcABCD        & 0xFFu), false, 8, true, fcD, sizeof(fcD));
+        FormatRcInputExpr((uint8_t)((fcEFG  >> 8)  & 0xFFu), true,  8, true, fcG, sizeof(fcG));
+
+        snprintf(line, sizeof(line),
+            "    float3 finalA = %s, finalB = %s, finalC = %s, finalD = %s;\n"
+            "    float4 current;\n"
+            "    current.rgb = saturate(finalA * finalB + (1.0f - finalA) * finalC + finalD);\n"
+            "    current.a   = saturate(%s);\n",
+            fcA, fcB, fcC, fcD, fcG);
+        s += line;
+    } else {
+        s += "    float4 current = saturate(r0);\n";
+    }
+
+    // 5. Alpha Test, Fog (if not already consumed in final combiner), and Gamma Ramp LUT
+    bool fcUsesFog =
+        (((fcABCD >> 24) & 0xFu) == 0x3u) ||
+        (((fcABCD >> 16) & 0xFu) == 0x3u) ||
+        (((fcABCD >> 8)  & 0xFu) == 0x3u) ||
+        (( fcABCD        & 0xFu) == 0x3u) ||
+        (((fcEFG  >> 8)  & 0xFu) == 0x3u);
+
+    s += "    if (uFlags.z != 0u) {\n"
+         "        uint fn = (uint)uAlphaTest.x; float refVal = uAlphaTest.y; bool passAlpha = true;\n"
+         "        if (fn == 1u) passAlpha = false;\n"
+         "        else if (fn == 2u) passAlpha = (current.a < refVal - 0.001f);\n"
+         "        else if (fn == 3u) passAlpha = (abs(current.a - refVal) < 0.004f);\n"
+         "        else if (fn == 4u) passAlpha = (current.a <= refVal + 0.001f);\n"
+         "        else if (fn == 5u) passAlpha = (current.a > refVal + 0.001f);\n"
+         "        else if (fn == 6u) passAlpha = (abs(current.a - refVal) >= 0.004f);\n"
+         "        else if (fn == 7u) passAlpha = (current.a >= refVal - 0.001f);\n"
+         "        if (!passAlpha) discard;\n"
+         "    }\n";
+
+    if (!fcUsesFog) {
+        s += "    if (uFogParams.x > 0.5f && (uFlags.x & 1u) == 0u) {\n"
+             "        if (uFogColor.w > 0.5f) current.rgb *= fogFactor;\n"
+             "        else current.rgb = lerp(current.rgb, uFogColor.rgb, 1.0f - fogFactor);\n"
+             "    }\n";
+    }
+
+    s += "    if ((uFlags.x & 2u) != 0u) {\n"
+         "        int3 lutIdx = clamp(int3(saturate(current.rgb) * 255.0f + 0.5f), 0, 255);\n"
+         "        current.rgb = float3(gammaLutTex.Load(int3(lutIdx.r, 0, 0)).r,\n"
+         "                             gammaLutTex.Load(int3(lutIdx.g, 0, 0)).g,\n"
+         "                             gammaLutTex.Load(int3(lutIdx.b, 0, 0)).b);\n"
+         "    } else if (uAlphaTest.z > 0.1f && (abs(uAlphaTest.z - 1.0f) > 0.01f || abs(uAlphaTest.w - 1.0f) > 0.01f)) {\n"
+         "        current.rgb = pow(max(current.rgb, 0.0f), 1.0f / uAlphaTest.z) * uAlphaTest.w;\n"
+         "    }\n"
+         "    return current;\n"
+         "}\n";
+    return s;
+}
+
+static bool IsRegisterCombinerStateUnmodifiedFromDef(const uint32_t* xboxRS, const XboxPixelShaderDef* pDef) {
+    if (!pDef) return false;
+    const uint32_t* dwords = reinterpret_cast<const uint32_t*>(pDef);
+    for (int i = 0; i <= 9; ++i)   if (xboxRS[i] != dwords[i]) return false;
+    for (int i = 26; i <= 42; ++i) if (xboxRS[i] != dwords[i]) return false;
+    for (int i = 45; i <= 53; ++i) if (xboxRS[i] != dwords[i]) return false;
+    if (xboxRS[XBOX_D3DRS_PSTEXTUREMODES] != dwords[54]) return false;
+    if (xboxRS[55] != dwords[55] || xboxRS[56] != dwords[56]) return false;
+    return true;
+}
+
+ID3D11PixelShader* GetActiveRegisterCombinerPS() {
+    if (!g_d3dDevice) return g_ps;
+    const uint32_t* xboxRS = reinterpret_cast<const uint32_t*>(ADDR_D3D_RENDERSTATE);
+
+    if (g_currentPsHandle != 0) {
+        int32_t engType = -1;
+        const XboxPixelShaderDef* pDef = GetHandlePSDef(g_currentPsHandle, &engType);
+        if (engType >= 0 && engType < 28 && IsRegisterCombinerStateUnmodifiedFromDef(xboxRS, pDef)) {
+            return GetPixelShaderPermutation(static_cast<uint32_t>(engType + 1));
+        }
+    } else if ((xboxRS[XBOX_D3DRS_PSCOMBINERCOUNT] & 0x0Fu) == 0u) {
+        return GetPixelShaderPermutation(0u);
+    }
+
+    // Compute 64-bit FNV-1a hash of the active NV2A Register Combiner structure in _D3D__RenderState
+    uint64_t h = 14695981039346656037ULL;
+    auto mix = [&](uint32_t v) {
+        h ^= v;
+        h *= 1099511628211ULL;
+    };
+    uint32_t combCount = xboxRS[XBOX_D3DRS_PSCOMBINERCOUNT] & 0x0Fu;
+    if (combCount == 0u) combCount = 1u;
+    if (combCount > 8u)  combCount = 8u;
+    for (uint32_t i = 0; i < combCount; ++i) {
+        mix(xboxRS[XBOX_D3DRS_PSALPHAINPUTS0  + i]);
+        mix(xboxRS[XBOX_D3DRS_PSALPHAOUTPUTS0 + i]);
+        mix(xboxRS[XBOX_D3DRS_PSRGBINPUTS0    + i]);
+        mix(xboxRS[XBOX_D3DRS_PSRGBOUTPUTS0   + i]);
+    }
+    mix(xboxRS[XBOX_D3DRS_PSFINALCOMBINERINPUTSABCD]);
+    mix(xboxRS[XBOX_D3DRS_PSFINALCOMBINERINPUTSEFG]);
+    mix(xboxRS[XBOX_D3DRS_PSCOMPAREMODE]);
+    mix(xboxRS[XBOX_D3DRS_PSCOMBINERCOUNT]);
+    mix(xboxRS[XBOX_D3DRS_PSTEXTUREMODES]);
+    mix(xboxRS[XBOX_D3DRS_PSDOTMAPPING]);
+    mix(xboxRS[XBOX_D3DRS_PSINPUTTEXTURE]);
+
+    for (size_t i = 0; i < g_rcPsCache.size(); ++i) {
+        if (g_rcPsCache[i].hash == h) {
+            return g_rcPsCache[i].ps;
+        }
+    }
+
+    std::string hlsl = DecompileRegisterCombinersToHLSL(xboxRS);
+    ID3DBlob* psBlob  = nullptr;
+    ID3DBlob* errBlob = nullptr;
+    ID3D11PixelShader* compiledPS = nullptr;
+    HRESULT hr = D3DCompile(
+        hlsl.data(), hlsl.size(), "XboxRegCombinerPS",
+        nullptr, nullptr, "PSMain", "ps_4_0",
+        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &errBlob);
+    if (SUCCEEDED(hr) && psBlob) {
+        g_d3dDevice->CreatePixelShader(
+            psBlob->GetBufferPointer(), psBlob->GetBufferSize(),
+            nullptr, &compiledPS);
+        psBlob->Release();
+    }
+    if (errBlob) errBlob->Release();
+    if (!compiledPS) compiledPS = g_ps;
+    g_rcPsCache.push_back({ h, compiledPS });
+    return compiledPS;
 }
 
 struct XboxDeclElem {
@@ -445,13 +1151,17 @@ static std::string DecompileXvuToHLSL(const XboxDeclElem* elems, uint32_t numEle
         if (writesOFog) {
             s += "    o.eyeDist = float2(max(oFog.x, 0.0f), 1.0f);\n";
         } else {
-            s += "    o.eyeDist = float2(0.0f, 1.0f);\n";
+            s += "    o.eyeDist = float2(max(clipPos.w, 0.0f), 1.0f);\n";
         }
     } else {
         s += "    o.pos = float4(((r12.x - uViewport.x) / max(uViewport.z, 1.0f)) * 2.0f - 1.0f,\n"
              "                   1.0f - ((r12.y - uViewport.y) / max(uViewport.w, 1.0f)) * 2.0f,\n"
-             "                   saturate(r12.z), 1.0f);\n"
-             "    o.eyeDist = float2(0.0f, 1.0f);\n";
+             "                   saturate(r12.z), 1.0f);\n";
+        if (writesOFog) {
+            s += "    o.eyeDist = float2(max(oFog.x, 0.0f), 1.0f);\n";
+        } else {
+            s += "    o.eyeDist = float2(0.0f, 1.0f);\n";
+        }
     }
     s += "    o.color = saturate(oD0);\n"
          "    o.uv0   = float4(oT0.xy * uUvScale01.xy, oT0.zw);\n"
@@ -472,6 +1182,17 @@ static std::string DecompileXvuToHLSL(const XboxDeclElem* elems, uint32_t numEle
     s += "    return o;\n"
          "}\n";
     return s;
+}
+
+static uint8_t GetXboxDeclTypeComponentCount(uint32_t xType) {
+    switch (xType) {
+        case 0x12: return 1; // FLOAT1
+        case 0x22:
+        case 0x24:
+        case 0x25: return 2; // FLOAT2 / SHORT2 / NORMSHORT2
+        case 0x32: return 3; // FLOAT3
+        default:   return 4; // FLOAT4 / D3DCOLOR / SHORT4
+    }
 }
 
 static HRESULT __stdcall Bridge_D3DDevice_CreateVertexShader(
@@ -508,6 +1229,7 @@ static HRESULT __stdcall Bridge_D3DDevice_CreateVertexShader(
                     uint32_t reg = tok & 0x1F;
                     uint32_t xType = (tok >> 16) & 0xFF;
                     uint32_t byteSize = GetXboxDeclTypeByteSize(xType);
+                    uint8_t compCount = GetXboxDeclTypeComponentCount(xType);
                     if (curStream < 2 && reg < 16 && numElems < 16) {
                         elems[numElems].stream = (uint8_t)curStream;
                         elems[numElems].reg    = (uint8_t)reg;
@@ -523,10 +1245,11 @@ static HRESULT __stdcall Bridge_D3DDevice_CreateVertexShader(
                                 case 0:  info.hasPos  = true; info.offPos  = curOffset; break;
                                 case 2:  info.hasNorm = true; info.offNorm = curOffset; break;
                                 case 3:  info.hasDiff = true; info.offDiff = curOffset; break;
-                                case 9:  info.hasUv0  = true; info.offUv0  = curOffset; break;
-                                case 10: info.hasUv1  = true; info.offUv1  = curOffset; break;
-                                case 11: info.hasUv2  = true; info.offUv2  = curOffset; break;
-                                case 12: info.hasUv3  = true; info.offUv3  = curOffset; break;
+                                case 4:  info.hasSpec = true; info.offSpec = curOffset; break;
+                                case 9:  info.hasUv0  = true; info.offUv0  = curOffset; info.dimUv[0] = compCount; break;
+                                case 10: info.hasUv1  = true; info.offUv1  = curOffset; info.dimUv[1] = compCount; break;
+                                case 11: info.hasUv2  = true; info.offUv2  = curOffset; info.dimUv[2] = compCount; break;
+                                case 12: info.hasUv3  = true; info.offUv3  = curOffset; info.dimUv[3] = compCount; break;
                                 default: break;
                             }
                         } else if (curStream == 1 && reg == 3) {
@@ -539,10 +1262,10 @@ static HRESULT __stdcall Bridge_D3DDevice_CreateVertexShader(
                             case 0:  info.hasPos  = true; info.offPos  = curOffset; break;
                             case 1:  info.hasNorm = true; info.offNorm = curOffset; break;
                             case 2:  info.hasDiff = true; info.offDiff = curOffset; break;
-                            case 3:  info.hasUv0  = true; info.offUv0  = curOffset; break;
-                            case 4:  info.hasUv1  = true; info.offUv1  = curOffset; break;
-                            case 5:  info.hasUv2  = true; info.offUv2  = curOffset; break;
-                            case 6:  info.hasUv3  = true; info.offUv3  = curOffset; break;
+                            case 3:  info.hasUv0  = true; info.offUv0  = curOffset; info.dimUv[0] = compCount; break;
+                            case 4:  info.hasUv1  = true; info.offUv1  = curOffset; info.dimUv[1] = compCount; break;
+                            case 5:  info.hasUv2  = true; info.offUv2  = curOffset; info.dimUv[2] = compCount; break;
+                            case 6:  info.hasUv3  = true; info.offUv3  = curOffset; info.dimUv[3] = compCount; break;
                             case 10: info.hasRhw  = true; info.offRhw  = curOffset; break;
                             default: break;
                         }
@@ -552,6 +1275,20 @@ static HRESULT __stdcall Bridge_D3DDevice_CreateVertexShader(
                 if (curStream < 2) {
                     info.streamStrides[curStream] = curOffset;
                 }
+            }
+        }
+    }
+
+    if (pFunction && (pFunction[0] & 0xFFFFu) == 0x2078u) {
+        uint32_t instCount = (pFunction[0] >> 16) & 0xFFFFu;
+        for (uint32_t i = 0; i < instCount; ++i) {
+            uint32_t w3 = pFunction[1 + i * 4 + 3];
+            uint32_t outMask  = (w3 >> 12) & 0xFu;
+            uint32_t outWrite = (w3 >> 11) & 1u;
+            uint32_t outReg   = (w3 >> 3)  & 0xFFu;
+            if (outWrite != 0u && outMask != 0u && outReg == 5u) {
+                info.writesOFog = true;
+                break;
             }
         }
     }
@@ -600,11 +1337,8 @@ static HRESULT __stdcall Bridge_D3DDevice_CreateVertexShader(
     return S_OK;
 }
 
-int32_t g_activeCustomVS = 0; // 0=none, 1=Cloak, 2=ScreenEffect, 3=Membrane, 4=Sight, 5=Shield, 6=Teleport, 7=MotionBlur, 8=BumpEnv, 9=Envmap
-
 void __stdcall Bridge_D3DDevice_SetVertexShader(uint32_t Handle) {
     g_currentVsHandle = Handle;
-    g_activeCustomVS  = 0;
     *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x794) = 0x006C2F20;
     *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x798) = Handle;
     *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x79C) = 0;
@@ -639,12 +1373,8 @@ static void __fastcall Bridge_D3DDevice_SetVertexShaderConstantNotInline(int32_t
 }
 
 // ============================================================================
-// CPU Skinning Bridges (cShader::VertexSetup* -> cMeshGroup::RenderSetup*)
+// CPU Skinning Bridges (cMeshGroup::RenderSetupWeightedSkin / BlendWeightedSkin)
 // ============================================================================
-
-typedef uint32_t (__thiscall *PFN_MeshGroup_RenderSetup)(void* pMeshGroup, void* pModelInst, uint32_t lod);
-static PFN_MeshGroup_RenderSetup g_fnRenderSetupRigid   = reinterpret_cast<PFN_MeshGroup_RenderSetup>(0x006056A0);
-static PFN_MeshGroup_RenderSetup g_fnRenderSetupSkinned = reinterpret_cast<PFN_MeshGroup_RenderSetup>(0x006071C0);
 
 // Replacement for cMeshGroup::RenderSetupWeightedSkin (0x00606E50) and RenderSetupBlendWeightedSkin (0x00607390).
 // Fixes the stack-aliasing bug in Ghost.exe's unused CPU fallback where Bone 1's normal overwrote Bone 0's normal
@@ -769,43 +1499,11 @@ static uint32_t Host_RenderSetupWeightedSkin(uint8_t* pMeshGroup, uint8_t* pMode
 const uint32_t* g_curPrelitColors        = nullptr;
 uint32_t        g_curPrelitBaseVertex    = 0;
 bool            g_curPrelitUseCustomBase = false;
-const float*    g_curTangentBasis        = nullptr;
-uint32_t        g_curTangentBaseVertex   = 0;
-float           g_cloakDistort           = 16.0f;
-float           g_cloakC35[4]            = { 1.0f, 0.0f, 0.0f, 0.5f };
-float           g_shieldC35x             = 1.0f;
-float           g_teleportC32[2]         = { 1.0f / 640.0f, 1.0f / 480.0f };
-float           g_teleportC33x           = 0.0f;
-float           g_motionBlurVec[4]       = { 0.0f, 0.0f, 0.0f, 1.0f };
-float           g_embossScale            = 0.015f;
-float           g_specularScale          = 1.0f;
-float           g_detailUvScale[2]       = { 1.0f, 1.0f };
-Mat44           g_lightProjMat0          = { {{1,0,0,0}, {0,1,0,0}, {0,0,1,0}, {0,0,0,1}} };
-Mat44           g_lightProjMat1          = { {{1,0,0,0}, {0,1,0,0}, {0,0,1,0}, {0,0,0,1}} };
-
-static void SetupTangentStreamForMesh(const uint8_t* pMeshGroup, bool bindStream1) {
-    g_curTangentBasis      = nullptr;
-    g_curTangentBaseVertex = 0;
-    if (!pMeshGroup) return;
-    uint8_t lodIdx = pMeshGroup[0x50];
-    if (lodIdx >= 3) return;
-    const uint8_t* pModel = *reinterpret_cast<const uint8_t* const*>(pMeshGroup + 0x04);
-    if (!pModel) return;
-    XboxVertexBuffer* tangentVB = *reinterpret_cast<XboxVertexBuffer* const*>(pModel + lodIdx * 0x18 + 0x20);
-    if (tangentVB && tangentVB->Data) {
-        if (bindStream1) {
-            Bridge_D3DDevice_SetStreamSource(1, tangentVB, 0x24);
-        }
-        g_curTangentBasis      = reinterpret_cast<const float*>(tangentVB->Data);
-        g_curTangentBaseVertex = *reinterpret_cast<const uint32_t*>(pMeshGroup + 0x48);
-    }
-}
 
 static void SetupPrelitStreamForMesh(const uint8_t* pMeshGroup, const uint8_t* pModelInst) {
     g_curPrelitColors        = nullptr;
     g_curPrelitBaseVertex    = 0;
     g_curPrelitUseCustomBase = false;
-    SetupTangentStreamForMesh(pMeshGroup, false);
     if (pMeshGroup && pModelInst && (pModelInst[0x14] & 1) != 0) {
         uint8_t lodIdx = pMeshGroup[0x50];
         if (lodIdx < 3) {
@@ -821,7 +1519,6 @@ static void SetupPrelitStreamForMesh(const uint8_t* pMeshGroup, const uint8_t* p
 
 static uint32_t __fastcall Bridge_MeshGroup_RenderSetupWeightedSkin(uint8_t* pMeshGroup, void* edxUnused, uint8_t* pModelInst, uint32_t lod) {
     (void)edxUnused;
-    g_activeCustomVS = 0;
     uint32_t res = Host_RenderSetupWeightedSkin(pMeshGroup, pModelInst, lod, false);
     SetupPrelitStreamForMesh(pMeshGroup, pModelInst);
     return res;
@@ -829,7 +1526,6 @@ static uint32_t __fastcall Bridge_MeshGroup_RenderSetupWeightedSkin(uint8_t* pMe
 
 static uint32_t __fastcall Bridge_MeshGroup_RenderSetupBlendWeightedSkin(uint8_t* pMeshGroup, void* edxUnused, uint8_t* pModelInst, uint32_t lod) {
     (void)edxUnused;
-    g_activeCustomVS = 0;
     uint32_t res = Host_RenderSetupWeightedSkin(pMeshGroup, pModelInst, lod, true);
     SetupPrelitStreamForMesh(pMeshGroup, pModelInst);
     return res;
