@@ -567,12 +567,13 @@ ID3D11DepthStencilState* GetDepthState(
 ID3D11RasterizerState* GetRastState(uint32_t cullMode, uint32_t fillMode, uint32_t zBias, bool scissor, uint32_t frontFace = 0x0900u);
 ID3D11SamplerState* GetSamplerState(
     uint32_t addrU, uint32_t addrV, uint32_t magFilter, uint32_t borderColor,
-    uint32_t addrW = kXboxTexAddressWrap, uint32_t minFilter = 0xFFFFFFFFu,
-    uint32_t mipFilter = kXboxTexFilterNone, uint32_t mipLodBiasBits = 0u,
-    uint32_t maxMipLevel = 0u, uint32_t maxAnisotropy = 1u);
+    uint32_t minFilter = 0xFFFFFFFFu, uint32_t mipFilter = kXboxTexFilterNone,
+    uint32_t maxAniso = 1u, uint32_t maxMipLevel = 0u,
+    uint32_t mipmapLodBiasBits = 0u, uint32_t addrW = kXboxTexAddressWrap);
 ID3D11SamplerState* GetStageSamplerState(uint32_t stage);
 ID3D11PixelShader* GetPixelShaderPermutation(uint32_t psMode);
 void DrawOsdOverlayOnBackbuffer();
+void FlushXboxOverlayToBackbuffer();
 
 // d3d8_texture.cpp
 extern XboxPixelContainer* g_boundTextures[4];

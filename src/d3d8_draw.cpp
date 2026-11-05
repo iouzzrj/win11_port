@@ -175,22 +175,20 @@ static void __stdcall Bridge_D3DDevice_SetScissors(DWORD Count, BOOL bExclusive,
         for (uint32_t i = 0; i < g_scissorCount; ++i) {
             g_scissorRects[i] = pRects[i];
         }
-        *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0xB80) = g_scissorCount;
-        *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0xB84) = g_scissorExclusive ? 1u : 0u;
-        memcpy(reinterpret_cast<void*>(ADDR_D3D_DEVICE + 0xB88), g_scissorRects, g_scissorCount * sizeof(RECT));
+        memcpy(reinterpret_cast<void*>(ADDR_D3D_DEVICE + 0x1B80), g_scissorRects, g_scissorCount * sizeof(RECT));
+        *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x1C00) = g_scissorCount;
+        *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x1C04) = g_scissorExclusive ? 1u : 0u;
 
+        g_scissorEnabled = true;
         if (g_scissorCount == 1u && !g_scissorExclusive) {
-            g_scissorEnabled = true;
             g_d3dCtx->RSSetScissorRects(1, &g_scissorRects[0]);
-        } else {
-            // Multi-rect (Count > 1) and Exclusive scissors are evaluated per-pixel in PSMain
-            g_scissorEnabled = false;
         }
     } else {
         g_scissorCount     = 0;
         g_scissorExclusive = false;
         g_scissorEnabled   = false;
-        *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0xB80) = 0;
+        *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x1C00) = 0;
+        *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x1C04) = 0;
     }
 }
 
@@ -1033,7 +1031,8 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
         }
     }
 
-    uint32_t scCount = g_scissorEnabled ? g_scissorCount : 0u;
+    bool hwScissor = g_scissorEnabled && !g_scissorExclusive && (g_scissorCount == 1u);
+    uint32_t scCount = (g_scissorEnabled && !hwScissor) ? g_scissorCount : 0u;
     if (scCount > 8u) scCount = 8u;
     for (uint32_t si = 0; si < scCount; ++si) {
         cb.scissorRects[si][0] = (float)g_scissorRects[si].left;
@@ -1229,7 +1228,6 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
         xboxRS[XBOX_D3DRS_STENCILFUNC], xboxRS[XBOX_D3DRS_STENCILMASK], xboxRS[XBOX_D3DRS_STENCILWRITEMASK]);
     // Disable backface culling on RHW 2D UI quads; use Xbox CULLMODE=[147] and FRONTFACE=[146] for 3D
     uint32_t cull = isRhw ? 0 : xboxRS[XBOX_D3DRS_CULLMODE];
-    bool hwScissor = g_scissorEnabled && !g_scissorExclusive && (g_scissorCount == 1u);
     ID3D11RasterizerState* rs = GetRastState(
         cull, xboxRS[XBOX_D3DRS_FILLMODE], xboxRS[XBOX_D3DRS_ZBIAS], hwScissor, xboxRS[XBOX_D3DRS_FRONTFACE]);
 
@@ -1637,7 +1635,8 @@ static void SubmitXvuDrawD3D11(
         }
     }
 
-    uint32_t scCount = g_scissorEnabled ? g_scissorCount : 0u;
+    bool hwScissor = g_scissorEnabled && !g_scissorExclusive && (g_scissorCount == 1u);
+    uint32_t scCount = (g_scissorEnabled && !hwScissor) ? g_scissorCount : 0u;
     if (scCount > 8u) scCount = 8u;
     for (uint32_t si = 0; si < scCount; ++si) {
         cb.scissorRects[si][0] = (float)g_scissorRects[si].left;
@@ -1738,7 +1737,6 @@ static void SubmitXvuDrawD3D11(
         xboxRS[XBOX_D3DRS_STENCILZFAIL], xboxRS[XBOX_D3DRS_STENCILPASS],
         xboxRS[XBOX_D3DRS_STENCILFUNC], xboxRS[XBOX_D3DRS_STENCILMASK], xboxRS[XBOX_D3DRS_STENCILWRITEMASK]);
     uint32_t cull = decl.hasRhw ? 0 : xboxRS[XBOX_D3DRS_CULLMODE];
-    bool hwScissor = g_scissorEnabled && !g_scissorExclusive && (g_scissorCount == 1u);
     ID3D11RasterizerState* rs = GetRastState(
         cull, xboxRS[XBOX_D3DRS_FILLMODE], xboxRS[XBOX_D3DRS_ZBIAS], hwScissor, xboxRS[XBOX_D3DRS_FRONTFACE]);
 

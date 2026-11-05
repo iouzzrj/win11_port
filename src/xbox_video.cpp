@@ -136,48 +136,97 @@ static HRESULT __fastcall Bridge_cDivxVideo_Render(uint8_t* thisPtr, int dummyEd
 
 // ============================================================================
 // YUY2 Hardware Overlay Emulation for .vid Movies
+// Faithfully reproduces _D3DDevice_UpdateOverlay@20 (0x006B30D0),
+// _D3DDevice_EnableOverlay@4 (0x006B3250), and _D3DDevice_GetOverlayUpdateStatus@0 (0x006B30B0).
 // ============================================================================
 
-static std::vector<uint32_t> g_overlayPixels;
+static std::vector<uint32_t> g_overlayFrameBuf;
+static bool                  g_overlayEnabled = false;
+static bool                  g_overlayHasData = false;
 
 static void __stdcall Bridge_D3DDevice_EnableOverlay(BOOL bEnable) {
-    (void)bEnable;
+    // In Ghost.exe (0x006B3250), EnableOverlay stops active NV_PVIDEO_BUFFER ([esi+8704h] = 1)
+    // and resets the NV_PVIDEO overlay registers; the overlay only scans out after UpdateOverlay
+    // sets NV_PVIDEO_BUFFER = 1 ([esi+8700h] = 1) while enabled.
+    g_overlayEnabled = (bEnable != FALSE);
+    if (!g_overlayEnabled) {
+        g_overlayHasData = false;
+        *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x1C1C) = 0u;
+    }
 }
 
 static BOOL __stdcall Bridge_D3DDevice_GetOverlayUpdateStatus() {
-    return TRUE;
+    // In Ghost.exe (0x006B30B0): returns (pDevice->m_OverlaySwapCount != pDevice->m_SwapCount).
+    // Since FreeVideoAndResetGamma (0x0043B4B3) spins on this without calling Swap inside the loop
+    // (relying on Xbox hardware VBlank interrupt to advance m_SwapCount), advance m_SwapCount here
+    // so the Device state fields match and the spin loop completes cleanly.
+    uint32_t* pOverlaySwap = reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x2410);
+    uint32_t* pSwapCount   = reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x1DE8);
+    if (*pOverlaySwap == *pSwapCount) {
+        (*pSwapCount)++;
+    }
+    return (*pOverlaySwap != *pSwapCount) ? TRUE : FALSE;
+}
+
+void FlushXboxOverlayToBackbuffer() {
+    if (!g_overlayEnabled || !g_overlayHasData) return;
+    if (g_d3dDevice && g_d3dCtx && g_backBufferTex && g_overlayFrameBuf.size() == 640u * 480u) {
+        g_d3dCtx->UpdateSubresource(g_backBufferTex, 0, nullptr, g_overlayFrameBuf.data(), 640u * 4u, 0);
+    }
+    g_overlayHasData = false;
 }
 
 static void __stdcall Bridge_D3DDevice_UpdateOverlay(
     XboxPixelContainer* pSurface, const RECT* pSrcRect, const RECT* pDstRect,
     BOOL bColorKey, DWORD ColorKey)
 {
-    (void)pDstRect; (void)bColorKey; (void)ColorKey;
     if (!pSurface || !pSurface->Data) return;
 
-    uint32_t w = 0, h = 0, levels = 1, xboxFmt = 0, pitch = 0;
-    bool isSwizzled = false;
-    DecodeXboxTextureFormat(pSurface, &w, &h, &levels, &xboxFmt, &isSwizzled, &pitch);
-    if (pSrcRect && pSrcRect->right > pSrcRect->left && pSrcRect->bottom > pSrcRect->top) {
-        w = (uint32_t)(pSrcRect->right - pSrcRect->left);
-        h = (uint32_t)(pSrcRect->bottom - pSrcRect->top);
-    }
-    if (w == 0 || h == 0 || w > 2048 || h > 2048) return;
-    if (pitch == 0) pitch = w * 2;
+    // 1. Update D3DDevice overlay tracking fields (0x006B30D3..0x006B30E9)
+    uint32_t swapCount = *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x1DE8);
+    *reinterpret_cast<XboxPixelContainer**>(ADDR_D3D_DEVICE + 0x1C1C) = pSurface;
+    *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x2410)            = swapCount;
 
-    g_overlayPixels.resize(w * h);
-    const uint8_t* srcBase = reinterpret_cast<const uint8_t*>(pSurface->Data);
-    for (uint32_t y = 0; y < h; ++y) {
-        const uint8_t* sRow = srcBase + y * pitch;
-        uint32_t* dRow = &g_overlayPixels[y * w];
-        for (uint32_t x = 0; x < w; x += 2) {
+    uint32_t surfW = 0, surfH = 0, levels = 1, xboxFmt = 0, pitch = 0;
+    bool isSwizzled = false;
+    DecodeXboxTextureFormat(pSurface, &surfW, &surfH, &levels, &xboxFmt, &isSwizzled, &pitch);
+    if (surfW == 0 || surfH == 0 || surfW > 2048 || surfH > 2048) return;
+    if (pitch == 0) pitch = surfW * 2;
+
+    // 2. Extract pSrcRect & pDstRect (0x006B30F8..0x006B3165)
+    int32_t srcLeft = pSrcRect ? (pSrcRect->left & ~1) : 0;
+    int32_t srcTop  = pSrcRect ? (pSrcRect->top  & ~1) : 0;
+    int32_t srcW    = (pSrcRect && pSrcRect->right  > pSrcRect->left) ? (pSrcRect->right  - pSrcRect->left) : (int32_t)surfW;
+    int32_t srcH    = (pSrcRect && pSrcRect->bottom > pSrcRect->top)  ? (pSrcRect->bottom - pSrcRect->top)  : (int32_t)surfH;
+
+    int32_t dstLeft = pDstRect ? pDstRect->left : 0;
+    int32_t dstTop  = pDstRect ? pDstRect->top  : 0;
+    int32_t dstW    = (pDstRect && pDstRect->right  > pDstRect->left) ? (pDstRect->right  - pDstRect->left) : srcW;
+    int32_t dstH    = (pDstRect && pDstRect->bottom > pDstRect->top)  ? (pDstRect->bottom - pDstRect->top)  : srcH;
+
+    if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return;
+    if (srcLeft < 0) srcLeft = 0;
+    if (srcTop  < 0) srcTop  = 0;
+    if (srcLeft + srcW > (int32_t)surfW) srcW = (int32_t)surfW - srcLeft;
+    if (srcTop  + srcH > (int32_t)surfH) srcH = (int32_t)surfH - srcTop;
+    if (srcW <= 0 || srcH <= 0) return;
+
+    // 3. Decode source YUY2 (0x24) / UYVY (0x25) region to BGRA8
+    std::vector<uint32_t> decodedSrc((size_t)srcW * (size_t)srcH);
+    const uint8_t* srcBase = reinterpret_cast<const uint8_t*>(pSurface->Data)
+                           + (size_t)srcTop * pitch + (size_t)srcLeft * 2u;
+
+    for (int32_t y = 0; y < srcH; ++y) {
+        const uint8_t* sRow = srcBase + (size_t)y * pitch;
+        uint32_t* dRow = &decodedSrc[(size_t)y * (size_t)srcW];
+        for (int32_t x = 0; x < srcW; x += 2) {
             int y0, u, y1, v;
-            if (xboxFmt == 0x25) {
+            if (xboxFmt == 0x25) { // D3DFMT_UYVY
                 u  = (int)sRow[x * 2 + 0] - 128;
                 y0 = (int)sRow[x * 2 + 1];
                 v  = (int)sRow[x * 2 + 2] - 128;
                 y1 = (int)sRow[x * 2 + 3];
-            } else {
+            } else {               // D3DFMT_YUY2 (0x24)
                 y0 = (int)sRow[x * 2 + 0];
                 u  = (int)sRow[x * 2 + 1] - 128;
                 y1 = (int)sRow[x * 2 + 2];
@@ -192,7 +241,7 @@ static void __stdcall Bridge_D3DDevice_UpdateOverlay(
             b0 = b0 < 0 ? 0 : (b0 > 255 ? 255 : b0);
             dRow[x] = 0xFF000000u | ((uint32_t)r0 << 16) | ((uint32_t)g0 << 8) | (uint32_t)b0;
 
-            if (x + 1 < w) {
+            if (x + 1 < srcW) {
                 int r1 = y1 + ((359 * v) >> 8);
                 int g1 = y1 - ((88 * u + 183 * v) >> 8);
                 int b1 = y1 + ((454 * u) >> 8);
@@ -204,15 +253,36 @@ static void __stdcall Bridge_D3DDevice_UpdateOverlay(
         }
     }
 
-    if (g_d3dDevice && g_d3dCtx && g_swapChain && g_backBufferTex && w == 640 && h == 480) {
-        g_swapFrameCount++;
-        g_d3dCtx->UpdateSubresource(g_backBufferTex, 0, nullptr, g_overlayPixels.data(), w * 4, 0);
-        DrawOsdOverlayOnBackbuffer();
-        g_swapChain->Present(0, 0);
-        if (g_rtv && g_dsv) {
-            g_d3dCtx->OMSetRenderTargets(1, &g_rtv, g_dsv);
+    // 4. Scale into 640x480 overlay plane using NV_PVIDEO 12.20 fixed-point step ratios
+    // (0x006B3197..0x006B31F8: ds_dx = ((srcW - 1) << 20) / (dstW - 1), dt_dy = ((srcH - 1) << 20) / (dstH - 1))
+    uint32_t dsDx = (dstW > 1) ? (((uint32_t)(srcW - 1) << 20) / (uint32_t)(dstW - 1)) : 0x100000u;
+    uint32_t dtDy = (dstH > 1) ? (((uint32_t)(srcH - 1) << 20) / (uint32_t)(dstH - 1)) : 0x100000u;
+
+    g_overlayFrameBuf.assign(640u * 480u, (bColorKey != FALSE) ? (ColorKey | 0xFF000000u) : 0xFF000000u);
+    if (dstLeft == 0 && dstTop == 0 && dstW == 640 && dstH == 480 && srcW == 640 && srcH == 480) {
+        memcpy(g_overlayFrameBuf.data(), decodedSrc.data(), 640u * 480u * sizeof(uint32_t));
+    } else {
+        for (int32_t dy = 0; dy < dstH; ++dy) {
+            int32_t outY = dstTop + dy;
+            if (outY < 0 || outY >= 480) continue;
+            uint32_t sy = ((uint32_t)dy * dtDy) >> 20;
+            if (sy >= (uint32_t)srcH) sy = (uint32_t)(srcH - 1);
+            const uint32_t* sLine = &decodedSrc[(size_t)sy * (size_t)srcW];
+            uint32_t* dLine = &g_overlayFrameBuf[(size_t)outY * 640u];
+            for (int32_t dx = 0; dx < dstW; ++dx) {
+                int32_t outX = dstLeft + dx;
+                if (outX < 0 || outX >= 640) continue;
+                uint32_t sx = ((uint32_t)dx * dsDx) >> 20;
+                if (sx >= (uint32_t)srcW) sx = (uint32_t)(srcW - 1);
+                dLine[outX] = sLine[sx];
+            }
         }
     }
+
+    // Setting NV_PVIDEO_BUFFER = 1 ([esi+8700h] = 1 at 0x006B3233) activates the overlay plane
+    g_overlayEnabled = true;
+    g_overlayHasData = true;
+
     UpdateXboxKernelTick();
     UpdateXboxInputTick();
     UpdateXboxAudioTick();

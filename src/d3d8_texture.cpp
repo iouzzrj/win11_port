@@ -912,7 +912,7 @@ ID3D11ShaderResourceView* GetOrCreateD3D11SRV(
 static void __stdcall Bridge_D3DDevice_SetTexture(DWORD Stage, XboxPixelContainer* pTexture) {
     if (Stage < 4) {
         g_boundTextures[Stage] = pTexture;
-        *reinterpret_cast<XboxPixelContainer**>(ADDR_D3D_DEVICE + 0x1A58 + Stage * 4) = pTexture;
+        *reinterpret_cast<XboxPixelContainer**>(ADDR_D3D_DEVICE + 0x0F88 + Stage * 4) = pTexture;
     }
 }
 

@@ -996,14 +996,17 @@ void DrawOsdOverlayOnBackbuffer() {
     g_d3dCtx->PSSetShaderResources(0, 1, &nullSrv);
 }
 
-static void __stdcall Bridge_D3DDevice_Swap(DWORD Flags) {
+static DWORD __stdcall Bridge_D3DDevice_Swap(DWORD Flags) {
     (void)Flags;
     g_swapFrameCount++;
+    (*reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x1DE8))++;
+    uint32_t swapIdx = ++(*reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x2478));
     g_curOffscreenRT = nullptr;
     g_curActiveRTV   = g_rtv;
     g_curActiveDSV   = g_dsv;
     g_backBufferDirty = true;
 
+    FlushXboxOverlayToBackbuffer();
     DrawOsdOverlayOnBackbuffer();
 
     if (g_swapChain) {
@@ -1016,6 +1019,7 @@ static void __stdcall Bridge_D3DDevice_Swap(DWORD Flags) {
     UpdateXboxKernelTick();
     UpdateXboxInputTick();
     UpdateXboxAudioTick();
+    return swapIdx;
 }
 
 static void UpdateGammaLutTexture(const uint8_t* pRamp) {
@@ -1054,7 +1058,9 @@ static void UpdateGammaLutTexture(const uint8_t* pRamp) {
 static void __stdcall Bridge_D3DDevice_SetGammaRamp(DWORD Flags, const uint8_t* pRamp) {
     (void)Flags;
     if (pRamp) {
-        memcpy(reinterpret_cast<void*>(ADDR_D3D_DEVICE + 0x1A2C), pRamp, 768);
+        uint32_t swapIdx = (*reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x2478)) & 1u;
+        memcpy(reinterpret_cast<void*>(ADDR_D3D_DEVICE + 0x1E04 + swapIdx * 768u), pRamp, 768);
+        *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x240C) = swapIdx;
         UpdateGammaLutTexture(pRamp);
         float midR = pRamp[128] * (1.0f / 255.0f);
         if (midR > 0.05f && midR < 0.95f) {
