@@ -3,6 +3,8 @@
 #include "xbox_d3d8_types.h"
 #include <d3d11.h>
 #include <math.h>
+#include <stdio.h>
+#include <string>
 #include <vector>
 
 // ============================================================================
@@ -775,7 +777,7 @@ static void DecodeVerticesToUnified(
 }
 
 static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVertex>& verts, bool isRhw) {
-    if (!g_d3dDevice || !g_d3dCtx || !g_vs || !g_ps || verts.empty()) return;
+    if (!g_d3dDevice || !g_d3dCtx || !g_vs || verts.empty()) return;
 
     const uint32_t* xboxRS  = reinterpret_cast<const uint32_t*>(ADDR_D3D_RENDERSTATE);
     const uint32_t* xboxTSS = reinterpret_cast<const uint32_t*>(ADDR_D3D_TEXTURESTATE);
@@ -991,10 +993,17 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
 
     UnpackD3DColor(xboxRS[XBOX_D3DRS_TEXTUREFACTOR], &cb.tfactor[0], &cb.tfactor[1], &cb.tfactor[2], &cb.tfactor[3]);
 
-    uint32_t* stageOpsPtrs[4]   = { cb.stage0Ops,   cb.stage1Ops,   cb.stage2Ops,   cb.stage3Ops   };
-    uint32_t* stageAlphaPtrs[4] = { cb.stage0Alpha, cb.stage1Alpha, cb.stage2Alpha, cb.stage3Alpha };
-    uint32_t  alphaKillMask     = 0;
-    uint32_t  tempResultMask    = 0;
+    const bool     hasProgPs        = (g_currentPsHandle != 0 && g_currentPsType >= 0);
+    const uint32_t psTexModes       = xboxRS[XBOX_D3DRS_PSTEXTUREMODES];
+    bool           ffCascadeActive  = true;
+    uint32_t*      stageOpsPtrs[4]   = { cb.stage0Ops,   cb.stage1Ops,   cb.stage2Ops,   cb.stage3Ops   };
+    uint32_t*      stageAlphaPtrs[4] = { cb.stage0Alpha, cb.stage1Alpha, cb.stage2Alpha, cb.stage3Alpha };
+    uint32_t       texMask          = 0;
+    uint32_t       cubeMask         = 0;
+    uint32_t       volMask          = 0;
+    uint32_t       projMask         = g_lastProjMask & 0x0Fu;
+    uint32_t       alphaKillMask    = 0;
+    uint32_t       tempResultMask   = 0;
     for (int s = 0; s < 4; ++s) {
         stageOpsPtrs[s][0]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLOROP];
         stageOpsPtrs[s][1]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORARG1];
@@ -1005,30 +1014,33 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
         stageAlphaPtrs[s][2] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG2];
         stageAlphaPtrs[s][3] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG0];
 
-        if ((xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAKILL] & 0x04u) != 0u) {
-            alphaKillMask |= (1u << s);
+        if (!hasProgPs && stageOpsPtrs[s][0] <= 1u) {
+            ffCascadeActive = false;
+        }
+        const uint32_t stagePsMode    = (psTexModes >> (s * 5)) & 0x1Fu;
+        const bool     stageEnabled   = hasProgPs ? (stagePsMode != 0u) : ffCascadeActive;
+        const bool     stageTexActive = (stageSrvs[s] != nullptr) && stageEnabled;
+        if (stageTexActive) {
+            texMask |= (1u << s);
+            if (isCube[s]) cubeMask |= (1u << s);
+            if (isVol[s])  volMask  |= (1u << s);
+            if (hasProgPs && (stagePsMode == 1u || stagePsMode == 2u)) {
+                projMask |= (1u << s);
+            }
+            if ((xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAKILL] & 0x04u) != 0u) {
+                alphaKillMask |= (1u << s);
+            }
         }
         uint32_t resArg = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_RESULTARG] & 0x0Fu;
         if (resArg == 0x05u || resArg == 0x0Du) { // D3DTA_TEMP
             tempResultMask |= (1u << s);
         }
-        cb.stageColorKeyOp[s] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORKEYOP] & 0x03u;
+        cb.stageColorKeyOp[s] = stageTexActive ? (xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORKEYOP] & 0x03u) : 0u;
         UnpackD3DColor(
             xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORKEYCOLOR],
             &cb.stageColorKeyColor[s][0], &cb.stageColorKeyColor[s][1],
             &cb.stageColorKeyColor[s][2], &cb.stageColorKeyColor[s][3]);
         cb.stageColorSign[s] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORSIGN];
-    }
-
-    uint32_t texMask  = 0;
-    uint32_t cubeMask = 0;
-    uint32_t volMask  = 0;
-    for (int s = 0; s < 4; ++s) {
-        if (stageSrvs[s]) {
-            texMask |= (1u << s);
-            if (isCube[s]) cubeMask |= (1u << s);
-            if (isVol[s])  volMask  |= (1u << s);
-        }
     }
 
     bool hwScissor = g_scissorEnabled && !g_scissorExclusive && (g_scissorCount == 1u);
@@ -1048,7 +1060,7 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
                 | ((scCount & 0x0Fu) << 4);
     cb.flags[1] = texMask
                 | (cubeMask << 4)
-                | ((g_lastProjMask & 0x0Fu) << 8)
+                | ((projMask & 0x0Fu) << 8)
                 | (volMask << 12)
                 | (alphaKillMask << 16)
                 | (tempResultMask << 20);
@@ -1073,7 +1085,7 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
     memcpy(&cb.bumpParams[0], chosenBump, 16);
     if (cb.bumpParams[0] == 0.0f && cb.bumpParams[1] == 0.0f && cb.bumpParams[2] == 0.0f && cb.bumpParams[3] == 0.0f) {
         cb.bumpParams[0] = 0.04f;
-        cb.bumpParams[3] = 0.04f;
+        cb.bumpParams[2] = 0.04f;
     }
     uint32_t bumpStage0 = useStage1Bump ? 1u : 0u;
     memcpy(&cb.bumpLuminance[0], &xboxTSS[bumpStage0 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVLSCALE], 4);
@@ -1103,7 +1115,6 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
     memcpy(cb.psConst5, g_psConstants[5], 16);
     memcpy(cb.psConst6, g_psConstants[6], 16);
     memcpy(cb.psConst7, g_psConstants[7], 16);
-    PopulateRegisterCombinerConstants(&cb);
 
     if (g_gpuLightMode != 0u && !isRhw) {
         for (int i = 0; i < 4; ++i) {
@@ -1256,6 +1267,11 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
         (xboxRS[XBOX_D3DRS_DESTBLEND] >= 14u && xboxRS[XBOX_D3DRS_DESTBLEND] <= 17u))
     {
         UnpackD3DColor(xboxRS[XBOX_D3DRS_BLENDCOLOR], &blendFactor[0], &blendFactor[1], &blendFactor[2], &blendFactor[3]);
+        if (xboxRS[XBOX_D3DRS_SRCBLEND]  == 0x8003u || xboxRS[XBOX_D3DRS_SRCBLEND]  == 0x8004u ||
+            xboxRS[XBOX_D3DRS_DESTBLEND] == 0x8003u || xboxRS[XBOX_D3DRS_DESTBLEND] == 0x8004u)
+        {
+            blendFactor[0] = blendFactor[1] = blendFactor[2] = blendFactor[3];
+        }
     }
     g_d3dCtx->OMSetBlendState(bs, blendFactor, 0xFFFFFFFFu);
     g_d3dCtx->OMSetDepthStencilState(ds, xboxRS[XBOX_D3DRS_STENCILREF] & 0xFFu);
@@ -1269,11 +1285,8 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
 
     g_d3dCtx->VSSetShader(g_vs, nullptr, 0);
     g_d3dCtx->VSSetConstantBuffers(0, 1, &g_cbPerDraw);
-    ID3D11PixelShader* activePS = GetActiveRegisterCombinerPS();
-    if (!activePS) {
-        activePS = GetPixelShaderPermutation(cb.flags[3]);
-    }
-    g_d3dCtx->PSSetShader(activePS ? activePS : g_ps, nullptr, 0);
+    ID3D11PixelShader* activePS = GetPixelShaderPermutation(cb.flags[3]);
+    g_d3dCtx->PSSetShader(activePS, nullptr, 0);
     g_d3dCtx->PSSetConstantBuffers(0, 1, &g_cbPerDraw);
 
     g_d3dCtx->PSSetShaderResources(0, 13, srvs);
@@ -1595,10 +1608,17 @@ static void SubmitXvuDrawD3D11(
 
     UnpackD3DColor(xboxRS[XBOX_D3DRS_TEXTUREFACTOR], &cb.tfactor[0], &cb.tfactor[1], &cb.tfactor[2], &cb.tfactor[3]);
 
-    uint32_t* stageOpsPtrs[4]   = { cb.stage0Ops,   cb.stage1Ops,   cb.stage2Ops,   cb.stage3Ops   };
-    uint32_t* stageAlphaPtrs[4] = { cb.stage0Alpha, cb.stage1Alpha, cb.stage2Alpha, cb.stage3Alpha };
-    uint32_t  alphaKillMask     = 0;
-    uint32_t  tempResultMask    = 0;
+    const bool     hasProgPs        = (g_currentPsHandle != 0 && g_currentPsType >= 0);
+    const uint32_t psTexModes       = xboxRS[XBOX_D3DRS_PSTEXTUREMODES];
+    bool           ffCascadeActive  = true;
+    uint32_t*      stageOpsPtrs[4]   = { cb.stage0Ops,   cb.stage1Ops,   cb.stage2Ops,   cb.stage3Ops   };
+    uint32_t*      stageAlphaPtrs[4] = { cb.stage0Alpha, cb.stage1Alpha, cb.stage2Alpha, cb.stage3Alpha };
+    uint32_t       texMask          = 0;
+    uint32_t       cubeMask         = 0;
+    uint32_t       volMask          = 0;
+    uint32_t       projMask         = 0;
+    uint32_t       alphaKillMask    = 0;
+    uint32_t       tempResultMask   = 0;
     for (int s = 0; s < 4; ++s) {
         stageOpsPtrs[s][0]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLOROP];
         stageOpsPtrs[s][1]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORARG1];
@@ -1609,30 +1629,36 @@ static void SubmitXvuDrawD3D11(
         stageAlphaPtrs[s][2] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG2];
         stageAlphaPtrs[s][3] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG0];
 
-        if ((xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAKILL] & 0x04u) != 0u) {
-            alphaKillMask |= (1u << s);
+        if (!hasProgPs && stageOpsPtrs[s][0] <= 1u) {
+            ffCascadeActive = false;
+        }
+        const uint32_t stagePsMode    = (psTexModes >> (s * 5)) & 0x1Fu;
+        const bool     stageEnabled   = hasProgPs ? (stagePsMode != 0u) : ffCascadeActive;
+        const bool     stageTexActive = (stageSrvs[s] != nullptr) && stageEnabled;
+        if (stageTexActive) {
+            texMask |= (1u << s);
+            if (isCube[s]) cubeMask |= (1u << s);
+            if (isVol[s])  volMask  |= (1u << s);
+            const bool isStageProj = hasProgPs
+                ? (stagePsMode == 1u || stagePsMode == 2u)
+                : ((xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_TEXTURETRANSFORMFLAGS] & 0x0100u) != 0u);
+            if (isStageProj) {
+                projMask |= (1u << s);
+            }
+            if ((xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAKILL] & 0x04u) != 0u) {
+                alphaKillMask |= (1u << s);
+            }
         }
         uint32_t resArg = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_RESULTARG] & 0x0Fu;
         if (resArg == 0x05u || resArg == 0x0Du) { // D3DTA_TEMP
             tempResultMask |= (1u << s);
         }
-        cb.stageColorKeyOp[s] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORKEYOP] & 0x03u;
+        cb.stageColorKeyOp[s] = stageTexActive ? (xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORKEYOP] & 0x03u) : 0u;
         UnpackD3DColor(
             xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORKEYCOLOR],
             &cb.stageColorKeyColor[s][0], &cb.stageColorKeyColor[s][1],
             &cb.stageColorKeyColor[s][2], &cb.stageColorKeyColor[s][3]);
         cb.stageColorSign[s] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORSIGN];
-    }
-
-    uint32_t texMask  = 0;
-    uint32_t cubeMask = 0;
-    uint32_t volMask  = 0;
-    for (int s = 0; s < 4; ++s) {
-        if (stageSrvs[s]) {
-            texMask |= (1u << s);
-            if (isCube[s]) cubeMask |= (1u << s);
-            if (isVol[s])  volMask  |= (1u << s);
-        }
     }
 
     bool hwScissor = g_scissorEnabled && !g_scissorExclusive && (g_scissorCount == 1u);
@@ -1652,6 +1678,7 @@ static void SubmitXvuDrawD3D11(
                 | ((scCount & 0x0Fu) << 4);
     cb.flags[1] = texMask
                 | (cubeMask << 4)
+                | ((projMask & 0x0Fu) << 8)
                 | (volMask << 12)
                 | (alphaKillMask << 16)
                 | (tempResultMask << 20);
@@ -1675,7 +1702,7 @@ static void SubmitXvuDrawD3D11(
     memcpy(&cb.bumpParams[0], chosenBump, 16);
     if (cb.bumpParams[0] == 0.0f && cb.bumpParams[1] == 0.0f && cb.bumpParams[2] == 0.0f && cb.bumpParams[3] == 0.0f) {
         cb.bumpParams[0] = 0.04f;
-        cb.bumpParams[3] = 0.04f;
+        cb.bumpParams[2] = 0.04f;
     }
     uint32_t bumpStage0 = useStage1Bump ? 1u : 0u;
     memcpy(&cb.bumpLuminance[0], &xboxTSS[bumpStage0 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVLSCALE], 4);
@@ -1706,7 +1733,6 @@ static void SubmitXvuDrawD3D11(
     memcpy(cb.psConst5, g_psConstants[5], 16);
     memcpy(cb.psConst6, g_psConstants[6], 16);
     memcpy(cb.psConst7, g_psConstants[7], 16);
-    PopulateRegisterCombinerConstants(&cb);
 
     D3D11_MAPPED_SUBRESOURCE mappedCB = {};
     if (SUCCEEDED(g_d3dCtx->Map(g_cbPerDraw, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedCB))) {
@@ -1764,6 +1790,11 @@ static void SubmitXvuDrawD3D11(
         (xboxRS[XBOX_D3DRS_DESTBLEND] >= 14u && xboxRS[XBOX_D3DRS_DESTBLEND] <= 17u))
     {
         UnpackD3DColor(xboxRS[XBOX_D3DRS_BLENDCOLOR], &blendFactor[0], &blendFactor[1], &blendFactor[2], &blendFactor[3]);
+        if (xboxRS[XBOX_D3DRS_SRCBLEND]  == 0x8003u || xboxRS[XBOX_D3DRS_SRCBLEND]  == 0x8004u ||
+            xboxRS[XBOX_D3DRS_DESTBLEND] == 0x8003u || xboxRS[XBOX_D3DRS_DESTBLEND] == 0x8004u)
+        {
+            blendFactor[0] = blendFactor[1] = blendFactor[2] = blendFactor[3];
+        }
     }
     g_d3dCtx->OMSetBlendState(bs, blendFactor, 0xFFFFFFFFu);
     g_d3dCtx->OMSetDepthStencilState(ds, xboxRS[XBOX_D3DRS_STENCILREF] & 0xFFu);
@@ -1776,11 +1807,8 @@ static void SubmitXvuDrawD3D11(
     ID3D11Buffer* cbVBs[2] = { g_cbPerDraw, g_cbVSConstants };
     g_d3dCtx->VSSetShader(decl.gpuVS, nullptr, 0);
     g_d3dCtx->VSSetConstantBuffers(0, 2, cbVBs);
-    ID3D11PixelShader* activePS = GetActiveRegisterCombinerPS();
-    if (!activePS) {
-        activePS = GetPixelShaderPermutation(cb.flags[3]);
-    }
-    g_d3dCtx->PSSetShader(activePS ? activePS : g_ps, nullptr, 0);
+    ID3D11PixelShader* activePS = GetPixelShaderPermutation(cb.flags[3]);
+    g_d3dCtx->PSSetShader(activePS, nullptr, 0);
     g_d3dCtx->PSSetConstantBuffers(0, 1, &g_cbPerDraw);
 
     g_d3dCtx->PSSetShaderResources(0, 13, srvs);
@@ -2013,9 +2041,9 @@ static void __stdcall Bridge_D3DDevice_RunPushBuffer(XboxPushBuffer* pPushBuffer
                     vsConstLoad += 8u;
                 }
             } else {
-                // Match against Xbox _D3D__RenderStateEncode[0..81] (0x007CD2C0)
+                // Match against Xbox _D3D__SimpleRenderStateEncode[0..91] (0x007502A0)
                 uint32_t encodedHdr = 0x00040000u | m;
-                for (uint32_t rs = 0; rs < 82u; ++rs) {
+                for (uint32_t rs = 0; rs < 92u; ++rs) {
                     if (rsEnc[rs] == encodedHdr) {
                         xboxRS[rs] = val;
                         break;

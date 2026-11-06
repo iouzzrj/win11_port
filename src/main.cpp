@@ -12,8 +12,6 @@ volatile bool g_appRunning  = true;
 
 int           g_selectedAdapterIndex = 0;
 wchar_t       g_selectedAdapterName[128] = { 0 };
-volatile bool  g_osdShowFps     = true;
-volatile float g_osdCurrentFps  = 0.0f;
 
 // ============================================================================
 // Vectored Exception Handler (Ring-0 / SSE Emulation & Crash Diagnostics)
@@ -76,42 +74,25 @@ static LONG WINAPI XboxCrashHandler(EXCEPTION_POINTERS* ep) {
 // Win32 Game Window & Message Procedure
 // ============================================================================
 
-enum : UINT_PTR {
-    IDM_SYS_VIEW_FPS = 0x1020,
-};
-
 static LRESULT CALLBACK GhostWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_SYSCOMMAND:
-            if ((wParam & 0xFFF0) == IDM_SYS_VIEW_FPS) {
-                g_osdShowFps = !g_osdShowFps;
-                HMENU hSysMenu = GetSystemMenu(hWnd, FALSE);
-                if (hSysMenu) {
-                    CheckMenuItem(hSysMenu, IDM_SYS_VIEW_FPS, MF_BYCOMMAND | (g_osdShowFps ? MF_CHECKED : MF_UNCHECKED));
-                }
+            if (HandleOsdSysCommand(hWnd, wParam)) {
                 return 0;
             }
             break;
         case WM_CLOSE:
             g_appRunning = false;
+            SaveOsdStateToIni();
             ExitProcess(0);
             return 0;
         case WM_DESTROY:
             g_appRunning = false;
+            SaveOsdStateToIni();
             PostQuitMessage(0);
             return 0;
         case WM_TIMER:
-            if (wParam == 1) {
-                static DWORD    s_lastTick  = GetTickCount();
-                static uint32_t s_lastFrame = 0;
-                DWORD    nowTick  = GetTickCount();
-                uint32_t nowFrame = g_swapFrameCount;
-                DWORD    dt       = nowTick - s_lastTick;
-                if (dt >= 250) {
-                    g_osdCurrentFps = (float)(nowFrame - s_lastFrame) * 1000.0f / (float)dt;
-                    s_lastTick      = nowTick;
-                    s_lastFrame     = nowFrame;
-                }
+            if (HandleOsdTimer(hWnd, wParam)) {
                 return 0;
             }
             break;
@@ -159,15 +140,8 @@ static bool InitWin32Window(HINSTANCE hInst) {
 
     if (!g_hWnd) return false;
 
-    // Add "FPS" toggle item directly to the native title bar System Menu
-    HMENU hSysMenu = GetSystemMenu(g_hWnd, FALSE);
-    if (hSysMenu) {
-        InsertMenuW(hSysMenu, SC_CLOSE, MF_BYCOMMAND | MF_STRING | (g_osdShowFps ? MF_CHECKED : MF_UNCHECKED), IDM_SYS_VIEW_FPS, L"&FPS");
-        InsertMenuW(hSysMenu, SC_CLOSE, MF_BYCOMMAND | MF_SEPARATOR, 0, nullptr);
-    }
-
+    InitOsdWindowHooks(g_hWnd);
     SetWindowTextW(g_hWnd, L"StarCraft: Ghost");
-    SetTimer(g_hWnd, 1, 500, nullptr);
     ShowWindow(g_hWnd, SW_SHOWNORMAL);
     UpdateWindow(g_hWnd);
     return true;
@@ -177,7 +151,11 @@ static bool InitWin32Window(HINSTANCE hInst) {
 // Ghost.exe PE Section Loader (into reserved 0x00401000..0x00923000)
 // ============================================================================
 
-static bool LoadGhostXboxPeImage(const char* ghostExePath) {
+bool LoadGhostXboxPeImage(const char* ghostExePath) {
+    static bool s_ghostPeLoaded = false;
+    if (s_ghostPeLoaded) {
+        return true;
+    }
     FILE* f = fopen(ghostExePath, "rb");
     if (!f) {
         return false;
@@ -239,8 +217,57 @@ static bool LoadGhostXboxPeImage(const char* ghostExePath) {
         }
     }
 
-    // Zero the hardware-specific MU static constructor in .CRT$XCU (mu.obj)
-    PatchU32(kAddrMuStaticCtorSlot, 0);
+    // Load Xbox XBE Header + Certificate page into reserved .xbox space at 0x0094F000
+    // (0x00010000 is already occupied by the Windows process environment block on Win11 WOW64)
+    constexpr uint32_t kXbeHeaderBaseVa = 0x0094F000u;
+    constexpr uint32_t kOrigXbeBaseVa   = 0x00010000u;
+    void* xbePage = reinterpret_cast<void*>(kXbeHeaderBaseVa);
+    memset(xbePage, 0, 0x1000);
+    bool loadedXbeHeader = false;
+    char ghostXbePath[MAX_PATH];
+    snprintf(ghostXbePath, sizeof(ghostXbePath), "%s\\Ghost.xbe", g_gameRootDir);
+    FILE* fxbe = fopen(ghostXbePath, "rb");
+    if (fxbe) {
+        if (fread(xbePage, 1, 0x1000, fxbe) == 0x1000 &&
+            *reinterpret_cast<const uint32_t*>(kXbeHeaderBaseVa) == 0x48454258u)
+        {
+            loadedXbeHeader = true;
+            uint32_t origCertVa = *reinterpret_cast<const uint32_t*>(kXbeHeaderBaseVa + 0x118);
+            if (origCertVa >= kOrigXbeBaseVa && origCertVa < kOrigXbeBaseVa + 0x1000u) {
+                *reinterpret_cast<uint32_t*>(kXbeHeaderBaseVa + 0x118) = kXbeHeaderBaseVa + (origCertVa - kOrigXbeBaseVa);
+            }
+            *reinterpret_cast<uint32_t*>(kXbeHeaderBaseVa + 0x104) = kXbeHeaderBaseVa;
+        }
+        fclose(fxbe);
+    }
+    if (!loadedXbeHeader) {
+        memset(xbePage, 0, 0x1000);
+        *reinterpret_cast<uint32_t*>(kXbeHeaderBaseVa + 0x000) = 0x48454258u; // 'XBEH'
+        *reinterpret_cast<uint32_t*>(kXbeHeaderBaseVa + 0x104) = kXbeHeaderBaseVa; // dwBaseAddr
+        *reinterpret_cast<uint32_t*>(kXbeHeaderBaseVa + 0x118) = kXbeHeaderBaseVa + 0x184u; // dwCertificateAddr
+        *reinterpret_cast<uint32_t*>(kXbeHeaderBaseVa + 0x184 + 0x00) = 0x000001ECu; // cbSize
+        *reinterpret_cast<uint32_t*>(kXbeHeaderBaseVa + 0x184 + 0x08) = 0x00000002u; // dwTitleId (Ghost.xbe)
+        wcsncpy(reinterpret_cast<wchar_t*>(kXbeHeaderBaseVa + 0x184 + 0x0C), L"Starcraft: Ghost (Release)", 40);
+        *reinterpret_cast<uint32_t*>(kXbeHeaderBaseVa + 0x184 + 0xAC) = 0x00000100u; // dwVersion
+        memcpy(reinterpret_cast<void*>(kXbeHeaderBaseVa + 0x184 + 0xB0), "TESTTESTTESTTEST", 16); // bzLANKey
+        memcpy(reinterpret_cast<void*>(kXbeHeaderBaseVa + 0x184 + 0xC0), "TESTTESTTESTTEST", 16); // bzSignatureKey
+    }
+
+    // Relocate all 27 XeImageHeader() references (ds:[0x00010108..0x00010138]) in XAPILIB/XNET/XPP to kXbeHeaderBaseVa
+    static const uint32_t kXbeHeaderRefVas[] = {
+        0x0059FD45u, 0x005A0851u, 0x005A09EBu, 0x005A1C51u, 0x005A1ED1u,
+        0x005A2617u, 0x005A26FDu, 0x005A2702u, 0x005A2BE1u, 0x005A2D65u,
+        0x005A2E40u, 0x005A3B2Au, 0x005A3B91u, 0x005A3C46u, 0x005A3C60u,
+        0x005A3E52u, 0x005A3E58u, 0x005A3EDBu, 0x005A3F06u, 0x005A3F29u,
+        0x005A46B8u, 0x005A46BEu, 0x0073BA42u, 0x0073D700u, 0x007464DAu,
+        0x007492E3u, 0x0074930Bu
+    };
+    for (uint32_t refVa : kXbeHeaderRefVas) {
+        uint32_t origTarget = *reinterpret_cast<const uint32_t*>(refVa);
+        if (origTarget >= kOrigXbeBaseVa && origTarget < kOrigXbeBaseVa + 0x1000u) {
+            *reinterpret_cast<uint32_t*>(refVa) = kXbeHeaderBaseVa + (origTarget - kOrigXbeBaseVa);
+        }
+    }
 
     // Neutralize all writes to fs:[0] (NT_TIB.ExceptionList) across all code sections (0x00400740..0x0074FE80,
     // including .text LIBCMT:trnsctrl.obj mov fs:[0], ebx and BINK yuv.obj ?checkrdtsc@@YAXXZ)
@@ -260,12 +287,26 @@ static bool LoadGhostXboxPeImage(const char* ghostExePath) {
         }
     }
 
+    s_ghostPeLoaded = true;
     return true;
 }
 
 // ============================================================================
 // Dedicated Xbox Game Thread & Win32 UI Entry Point (WinMain)
 // ============================================================================
+
+// Per-frame tick wrapper around cSequence::MainLoop (0x0043C250) called from _main at 0x004354B7
+static void __fastcall Bridge_MainLoopStep(void* thisPtr, void* edxUnused, uint32_t flags) {
+    (void)edxUnused;
+    if (!g_appRunning) {
+        ExitThread(0);
+    }
+    UpdateXboxKernelTick();
+    UpdateXboxInputTick();
+    UpdateXboxAudioTick();
+    typedef void (__thiscall *PFN_MainLoop)(void* thisPtr, uint32_t flags);
+    reinterpret_cast<PFN_MainLoop>(0x0043C250)(thisPtr, flags);
+}
 
 static DWORD WINAPI XboxGameThreadProc(LPVOID) {
     InitD3D11HostDevice();
@@ -276,46 +317,23 @@ static DWORD WINAPI XboxGameThreadProc(LPVOID) {
     InitXboxD3D8();
     InitXboxAudio();
 
-    // Run Xbox CRT & C++ static initializers and StarCraft: Ghost main loop
+    // Hook the per-frame call to cSequence::MainLoop (0x0043C250) inside native _main at 0x004354B7
+    {
+        uint8_t* callSite = reinterpret_cast<uint8_t*>(0x004354B7);
+        uint32_t rel = reinterpret_cast<uintptr_t>(&Bridge_MainLoopStep) - (0x004354B7u + 5u);
+        callSite[0] = 0xE8; // CALL rel32
+        *reinterpret_cast<uint32_t*>(callSite + 1) = rel;
+    }
+
+    // Run native Xbox CRT initializers (__rtinit, _cinit) and native _main (0x00435460)
     __try {
         typedef int (__stdcall *PFN_rtinit)();
-        reinterpret_cast<PFN_rtinit>(0x005A430F)();
+        typedef void (__cdecl *PFN_cinit)();
+        typedef int (__cdecl *PFN_main)();
 
-        // Call __FPinit (0x007D2FA4 -> __fpmath at 0x00691889) to initialize LIBCMT floating point (__cfltcvt_tab)
-        uint32_t fpInit = *reinterpret_cast<uint32_t*>(0x007D2FA4);
-        if (fpInit) {
-            reinterpret_cast<void(__cdecl*)()>(fpInit)();
-        }
-
-        for (uint32_t addr = 0x007C2DAC; addr < 0x007C2DC0; addr += 4) {
-            uint32_t fn = *reinterpret_cast<uint32_t*>(addr);
-            if (fn) {
-                reinterpret_cast<void(__cdecl*)()>(fn)();
-            }
-        }
-
-        for (uint32_t addr = 0x007C2CB0; addr < 0x007C2DA8; addr += 4) {
-            uint32_t fn = *reinterpret_cast<uint32_t*>(addr);
-            if (fn) {
-                reinterpret_cast<void(__cdecl*)()>(fn)();
-            }
-        }
-
-        typedef void (__cdecl *PFN_VoidCdecl)();
-        reinterpret_cast<PFN_VoidCdecl>(0x00434780)();
-
-        void* pMainSequence = reinterpret_cast<void*>(0x00812D68); // &mainSequence
-        typedef int (__thiscall *PFN_StartApplication)(void* thisPtr);
-        reinterpret_cast<PFN_StartApplication>(0x0043A2C0)(pMainSequence);
-
-        typedef void (__thiscall *PFN_MainLoop)(void* thisPtr, uint32_t flags);
-        PFN_MainLoop fnMainLoop = reinterpret_cast<PFN_MainLoop>(0x0043C250);
-        while (g_appRunning) {
-            UpdateXboxKernelTick();
-            UpdateXboxInputTick();
-            UpdateXboxAudioTick();
-            fnMainLoop(pMainSequence, 0);
-        }
+        reinterpret_cast<PFN_rtinit>(0x005A430F)(); // __rtinit (.CRT$XRI..XRZ)
+        reinterpret_cast<PFN_cinit>(0x005A42B7)();  // _cinit (__FPinit, .CRT$XIA..XIZ, .CRT$XCA..XCZ including mu.obj)
+        reinterpret_cast<PFN_main>(0x00435460)();   // _main (0x00434780, XGetLaunchInfo, StartApplication, MainLoop, Shutdown)
     } __except (XboxCrashHandler(GetExceptionInformation())) {
     }
 
@@ -331,25 +349,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     g_hInstance = hInstance;
 
-    // Show Native Win32 Pre-Launch Setup UI
+    // Show Native Win32 Pre-Launch Setup UI (and integrated Page 2 Shader Compilation if needed)
     if (!ShowLauncherDialog(hInstance)) {
         return 0;
+    }
+
+    SetCurrentDirectoryA(g_gameRootDir);
+
+    char ghostExePath[MAX_PATH];
+    snprintf(ghostExePath, sizeof(ghostExePath), "%s\\Ghost.exe", g_gameRootDir);
+    if (!LoadGhostXboxPeImage(ghostExePath)) {
+        MessageBoxA(nullptr, "Failed to load Ghost.exe from the selected Game Directory!", "Error", MB_ICONERROR);
+        return 1;
     }
 
     // Install Xbox exception handlers only after the Win32 shell/COM launcher UI has closed
     AddVectoredExceptionHandler(1, XboxCrashHandler);
     SetUnhandledExceptionFilter(XboxCrashHandler);
 
-    SetCurrentDirectoryA(g_gameRootDir);
-
     if (!InitWin32Window(hInstance)) {
-        return 1;
-    }
-
-    char ghostExePath[MAX_PATH];
-    snprintf(ghostExePath, sizeof(ghostExePath), "%s\\Ghost.exe", g_gameRootDir);
-    if (!LoadGhostXboxPeImage(ghostExePath)) {
-        MessageBoxA(g_hWnd, "Failed to load Ghost.exe from the selected Game Directory!", "Error", MB_ICONERROR);
         return 1;
     }
 

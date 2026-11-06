@@ -83,6 +83,32 @@ struct PendingStreamPacket {
     WAVEHDR*  wh;
 };
 
+struct XboxDSBufferObject;
+void ApplyXboxOutputBufferRouting(
+    XboxDSBufferObject* outBuf, LONG* ioVolMb, LONG* ioPanMb, bool* ioHasI3DL2, int32_t* ioI3DL2SendMb);
+
+static constexpr uint32_t kXboxMixBinI3DL2 = 10u;
+
+static void ExtractStreamMixBinI3DL2Send(
+    const XBOX_DSMIXBINVOLUMEPAIR pairs[8], uint32_t count, bool* outHasSend, int32_t* outSendMb)
+{
+    if (!outHasSend || !outSendMb || !pairs) return;
+    if (count > 8u) count = 8u;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (pairs[i].dwMixBin == kXboxMixBinI3DL2) {
+            int32_t v = pairs[i].lVolume;
+            if (v > -9000) {
+                *outHasSend = true;
+                *outSendMb  = (v > 0) ? 0 : v;
+            } else {
+                *outHasSend = false;
+                *outSendMb  = kMinDirectSoundVolumeMb;
+            }
+            return;
+        }
+    }
+}
+
 struct XboxDSStreamObject {
     void**                vtable; // Points to 7-entry XMO vtable at +0x00!
     LONG                  refCount;
@@ -108,6 +134,8 @@ struct XboxDSStreamObject {
     int16_t               prevSampleL;
     int16_t               prevSampleR;
     bool                  hasPrevSample;
+    bool                  hasI3DL2Send;
+    int32_t               i3dl2SendMb;
     XBOX_DSMIXBINVOLUMEPAIR mixBinPairs[8];
     uint32_t              mixBinCount;
     Xbox3DVoiceMetrics    voice3D;
@@ -115,6 +143,16 @@ struct XboxDSStreamObject {
     bool                  hasActiveFilter;
     float                 svfLow[2];
     float                 svfBand[2];
+    XboxVoiceFilterState  filterState;
+    XboxI3DL2ReverbState  reverbState;
+    XBOX_DSLFODESC        lfo[2];
+    bool                  lfoActive[2];
+    XBOX_DSENVELOPEDESC   eg[2];
+    bool                  egActive[2];
+    XboxDSBufferObject*   outputBuffer;
+    DWORD                 playStartTickMs;
+    bool                  isReleasing;
+    DWORD                 releaseStartTickMs;
     std::vector<PendingStreamPacket> pending;
     std::vector<WAVEHDR*> activeWaveHdrs;
 };
@@ -392,11 +430,33 @@ static HRESULT __stdcall Stream_Process(
 
         uint32_t inFrames = (ch > 0) ? (pcmBytes / (ch * sizeof(int16_t))) : 0u;
         if (inFrames > 0) {
+            if (s->playStartTickMs == 0) {
+                s->playStartTickMs = GetTickCount();
+            }
+            int32_t lfoEgVolModMb = 0;
+            float   lfoEgPitchRatio = 1.0f;
+            float   lfoEgCutoffRatio = 1.0f;
+            if (s->lfoActive[0] || s->lfoActive[1] || s->egActive[0] || s->egActive[1]) {
+                DWORD nowTick = GetTickCount();
+                uint32_t elapsedMs = (nowTick >= s->playStartTickMs) ? (nowTick - s->playStartTickMs) : 0u;
+                uint32_t relElapsedMs = (s->isReleasing && s->releaseStartTickMs != 0 && nowTick >= s->releaseStartTickMs)
+                                        ? (nowTick - s->releaseStartTickMs) : 0u;
+                EvaluateXboxVoiceLfoAndEg(
+                    s->lfo, s->lfoActive, s->eg, s->egActive,
+                    elapsedMs, s->isReleasing, relElapsedMs,
+                    &lfoEgVolModMb, &lfoEgPitchRatio, &lfoEgCutoffRatio);
+            }
+
             uint32_t inRate = (s->freq >= kMinDirectSoundFreqHz && s->freq <= kMaxXboxPitchFreqHz)
                               ? s->freq
                               : (s->wfx.nSamplesPerSec ? s->wfx.nSamplesPerSec : kDefaultSampleRateHz);
             if (s->voice3D.active3D && s->voice3D.dopplerPitch != 0) {
                 inRate = XboxPitchToFrequencyHz(s->lPitch + s->voice3D.dopplerPitch);
+            }
+            if (lfoEgPitchRatio > 0.01f && fabsf(lfoEgPitchRatio - 1.0f) > 0.001f) {
+                inRate = static_cast<uint32_t>(static_cast<float>(inRate) * lfoEgPitchRatio + 0.5f);
+                if (inRate < kMinDirectSoundFreqHz) inRate = kMinDirectSoundFreqHz;
+                if (inRate > kMaxXboxPitchFreqHz)   inRate = kMaxXboxPitchFreqHz;
             }
             uint32_t outRate = s->waveOutRate ? s->waveOutRate : kDefaultSampleRateHz;
 
@@ -430,8 +490,13 @@ static HRESULT __stdcall Stream_Process(
                 if (wh) {
                     int16_t* dstSamples = reinterpret_cast<int16_t*>(wh->lpData);
 
-                    LONG totVol = s->volume - s->headroomMb + s->atten3D;
+                    LONG totVol = s->volume - s->headroomMb + s->atten3D + lfoEgVolModMb;
                     LONG pan    = s->pan;
+                    bool hasI3DL2Send = s->hasI3DL2Send;
+                    int32_t i3dl2SendMb = s->i3dl2SendMb;
+                    if (s->outputBuffer) {
+                        ApplyXboxOutputBufferRouting(s->outputBuffer, &totVol, &pan, &hasI3DL2Send, &i3dl2SendMb);
+                    }
                     if (totVol < kMinDirectSoundVolumeMb) totVol = kMinDirectSoundVolumeMb;
                     if (totVol > kMaxDirectSoundVolumeMb) totVol = kMaxDirectSoundVolumeMb;
                     float baseGain = (totVol < 0) ? powf(10.0f, static_cast<float>(totVol) / kMillibelsPerTwentyDecibels) : 1.0f;
@@ -504,14 +569,39 @@ static HRESULT __stdcall Stream_Process(
                         }
                     }
 
-                    // Apply continuous 2-pole Chamberlin SVF low-pass filter if active via Stream_SetFilter
-                    if (s->hasActiveFilter) {
-                        float filterF = 1.0f, filterD = 1.0f;
-                        if (ComputeDls2FilterCoeffs(&s->filterDesc, outRate, &filterF, &filterD)) {
-                            ApplyDls2FilterToPcm16(
-                                dstSamples, outFrames, kWaveOutStereoChannels,
-                                filterF, filterD, s->svfLow, s->svfBand);
+                    // Apply continuous 2-pole/4-pole Chamberlin SVF filter (DLS2, PARAMEQ, MULTI) + HRTF head-shadow
+                    float filterF = 1.0f, filterD = 1.0f, filterF2 = 1.0f, filterD2 = 1.0f;
+                    uint32_t filterMode = 0u;
+                    bool needFilter = s->hasActiveFilter &&
+                        ComputeDls2FilterCoeffs(&s->filterDesc, outRate, &filterF, &filterD, &filterMode, &filterF2, &filterD2);
+                    if (s->voice3D.active3D && s->voice3D.hrtfFilterCoeff > 0.0f && s->voice3D.hrtfFilterCoeff < 0.92f) {
+                        if (!needFilter) {
+                            needFilter = true;
+                            filterMode = 1u;
+                            filterF    = s->voice3D.hrtfFilterCoeff;
+                            filterD    = 1.0f;
+                        } else {
+                            filterF   *= s->voice3D.hrtfFilterCoeff;
+                            if (filterF < 0.004f) filterF = 0.004f;
                         }
+                    }
+                    if (needFilter) {
+                        if (lfoEgCutoffRatio > 0.01f && fabsf(lfoEgCutoffRatio - 1.0f) > 0.01f) {
+                            filterF *= lfoEgCutoffRatio;
+                            if (filterF < 0.004f) filterF = 0.004f;
+                            if (filterF > 1.40f)  filterF = 1.40f;
+                        }
+                        ApplyDls2FilterToPcm16(
+                            dstSamples, outFrames, kWaveOutStereoChannels,
+                            filterF, filterD, s->svfLow, s->svfBand,
+                            filterMode, filterF2, filterD2, &s->filterState);
+                    }
+
+                    // Apply continuous stateful I3DL2 Reverb across stream packets when routed to MixBin 10 (I3DL2)
+                    if (hasI3DL2Send) {
+                        ApplyStatefulI3DL2ReverbToPcm16(
+                            &s->reverbState, dstSamples, outFrames, kWaveOutStereoChannels, outRate,
+                            i3dl2SendMb + s->voice3D.i3dl2RoomVol, 0);
                     }
 
                     if (waveOutPrepareHeader(s->hWaveOut, wh, sizeof(WAVEHDR)) == MMSYSERR_NOERROR &&
@@ -611,6 +701,8 @@ static HRESULT __stdcall Stream_Flush(XboxDSStreamObject* s) {
         EnterCriticalSection(&g_audioCs);
         s->discontinuity  = false;
         s->flushExPending = false;
+        s->isReleasing    = false;
+        s->playStartTickMs = 0;
         s->resamplePos    = 0.0;
         s->prevSampleL    = 0;
         s->prevSampleR    = 0;
@@ -619,6 +711,8 @@ static HRESULT __stdcall Stream_Flush(XboxDSStreamObject* s) {
         s->svfLow[1]      = 0.0f;
         s->svfBand[0]     = 0.0f;
         s->svfBand[1]     = 0.0f;
+        memset(&s->filterState, 0, sizeof(s->filterState));
+        memset(&s->reverbState, 0, sizeof(s->reverbState));
         LeaveCriticalSection(&g_audioCs);
         if (s->hWaveOut) {
             ReapWaveHeaders(s, false);
@@ -656,10 +750,15 @@ static HRESULT __stdcall Stream_FlushEx(XboxDSStreamObject* s, uint32_t rtLow, u
     // from XACT::CSoundCue::StreamData at 0x00708094 with DSSTREAMFLUSHEX_ASYNC = 0x1),
     // asynchronous FlushEx schedules the stream to transition to starved/envelope-complete AFTER all
     // currently queued input packets finish playing, without cutting off active packets!
-    if ((dwFlags & 1u) != 0) {
+    // DSBSTOPEX_ENVELOPE (0x2 on FlushEx) also triggers the EG release stage.
+    if ((dwFlags & 3u) != 0) {
         if (s) {
             EnterCriticalSection(&g_audioCs);
             s->flushExPending = true;
+            if ((dwFlags & 2u) != 0 && s->egActive[0] && s->eg[0].dwRelease > 0u) {
+                s->isReleasing = true;
+                s->releaseStartTickMs = GetTickCount();
+            }
             LeaveCriticalSection(&g_audioCs);
         }
         return S_OK;
@@ -707,10 +806,51 @@ static HRESULT __stdcall Stream_SetFrequency(XboxDSStreamObject* s, DWORD dwFreq
     return S_OK;
 }
 
+static HRESULT __stdcall Stream_SetLFO(XboxDSStreamObject* s, const XBOX_DSLFODESC* pLFODesc) {
+    if (!s) return E_INVALIDARG;
+    EnterCriticalSection(&g_audioCs);
+    if (pLFODesc && reinterpret_cast<uintptr_t>(pLFODesc) >= 0x00010000u) {
+        uint32_t idx = (pLFODesc->dwLFO == 1u) ? 1u : 0u;
+        s->lfo[idx] = *pLFODesc;
+        s->lfoActive[idx] = (pLFODesc->dwDelta > 0u) &&
+                            (pLFODesc->lPitchModulation != 0 ||
+                             pLFODesc->lFilterCutOffRange != 0 ||
+                             pLFODesc->lAmplitudeModulation != 0);
+    } else {
+        s->lfoActive[0] = false;
+        s->lfoActive[1] = false;
+    }
+    LeaveCriticalSection(&g_audioCs);
+    return S_OK;
+}
+
+static HRESULT __stdcall Stream_SetEG(XboxDSStreamObject* s, const XBOX_DSENVELOPEDESC* pEnvelopeDesc) {
+    if (!s) return E_INVALIDARG;
+    EnterCriticalSection(&g_audioCs);
+    if (pEnvelopeDesc && reinterpret_cast<uintptr_t>(pEnvelopeDesc) >= 0x00010000u) {
+        uint32_t idx = (pEnvelopeDesc->dwEG == 1u) ? 1u : 0u;
+        s->eg[idx] = *pEnvelopeDesc;
+        s->egActive[idx] = (pEnvelopeDesc->dwMode != 0u);
+    } else {
+        s->egActive[0] = false;
+        s->egActive[1] = false;
+    }
+    LeaveCriticalSection(&g_audioCs);
+    return S_OK;
+}
+
+static HRESULT __stdcall Stream_SetOutputBuffer(XboxDSStreamObject* s, XboxDSBufferObject* pOutputBuffer) {
+    if (!s) return E_INVALIDARG;
+    EnterCriticalSection(&g_audioCs);
+    s->outputBuffer = pOutputBuffer;
+    LeaveCriticalSection(&g_audioCs);
+    return S_OK;
+}
+
 static HRESULT __stdcall Stream_SetFilter(XboxDSStreamObject* s, const XBOX_DSFILTERDESC* pFilterDesc) {
     if (s) {
         EnterCriticalSection(&g_audioCs);
-        if (pFilterDesc && reinterpret_cast<uintptr_t>(pFilterDesc) >= 0x00010000u && pFilterDesc->dwMode != 0u) {
+        if (pFilterDesc && reinterpret_cast<uintptr_t>(pFilterDesc) >= 0x00010000u && (pFilterDesc->dwMode & 3u) != 0u) {
             s->filterDesc      = *pFilterDesc;
             s->hasActiveFilter = true;
         } else {
@@ -720,6 +860,7 @@ static HRESULT __stdcall Stream_SetFilter(XboxDSStreamObject* s, const XBOX_DSFI
             s->svfLow[1]       = 0.0f;
             s->svfBand[0]      = 0.0f;
             s->svfBand[1]      = 0.0f;
+            memset(&s->filterState, 0, sizeof(s->filterState));
         }
         LeaveCriticalSection(&g_audioCs);
     }
@@ -760,6 +901,7 @@ static HRESULT __stdcall Stream_SetFormat(XboxDSStreamObject* s, const WAVEFORMA
         s->svfLow[1]     = 0.0f;
         s->svfBand[0]    = 0.0f;
         s->svfBand[1]    = 0.0f;
+        memset(&s->filterState, 0, sizeof(s->filterState));
         LeaveCriticalSection(&g_audioCs);
     }
     return S_OK;
@@ -768,6 +910,7 @@ static HRESULT __stdcall Stream_SetFormat(XboxDSStreamObject* s, const WAVEFORMA
 static HRESULT __stdcall Stream_Set3DVoiceData(XboxDSStreamObject* s, const void* pVoiceData) {
     if (s) {
         EnterCriticalSection(&g_audioCs);
+        s->hasI3DL2Send = true;
         Compute3DAudioPanAndAtten(pVoiceData, &s->pan, &s->atten3D, &s->voice3D);
         LeaveCriticalSection(&g_audioCs);
     }
@@ -783,6 +926,7 @@ static HRESULT __stdcall Stream_SetMixBins(XboxDSStreamObject* s, const XBOX_DSM
         EnterCriticalSection(&g_audioCs);
         AssignVoiceMixBins(pMixBins, s->mixBinPairs, &s->mixBinCount);
         ComputeMixBinPairsPan(s->mixBinPairs, s->mixBinCount, &s->pan);
+        ExtractStreamMixBinI3DL2Send(s->mixBinPairs, s->mixBinCount, &s->hasI3DL2Send, &s->i3dl2SendMb);
         LeaveCriticalSection(&g_audioCs);
     }
     return S_OK;
@@ -793,12 +937,11 @@ static HRESULT __stdcall Stream_SetMixBinVolumes(XboxDSStreamObject* s, const XB
         EnterCriticalSection(&g_audioCs);
         UpdateVoiceMixBinVolumes(pMixBins, s->mixBinPairs, &s->mixBinCount);
         ComputeMixBinPairsPan(s->mixBinPairs, s->mixBinCount, &s->pan);
+        ExtractStreamMixBinI3DL2Send(s->mixBinPairs, s->mixBinCount, &s->hasI3DL2Send, &s->i3dl2SendMb);
         LeaveCriticalSection(&g_audioCs);
     }
     return S_OK;
 }
-
-static HRESULT __stdcall Stream_Stub2(XboxDSStreamObject*, uint32_t) { return S_OK; }
 
 static void* g_streamVtable[7] = {
     reinterpret_cast<void*>(&Stream_AddRef),
@@ -838,11 +981,23 @@ static HRESULT __stdcall Bridge_DirectSoundCreateStream(const XBOX_DSSTREAMDESC*
     s->prevSampleL = 0;
     s->prevSampleR = 0;
     s->hasPrevSample = false;
+    s->hasI3DL2Send = false;
+    s->i3dl2SendMb = kMinDirectSoundVolumeMb;
     memset(&s->voice3D, 0, sizeof(s->voice3D));
     memset(&s->filterDesc, 0, sizeof(s->filterDesc));
     s->hasActiveFilter = false;
     s->svfLow[0] = s->svfLow[1] = 0.0f;
     s->svfBand[0] = s->svfBand[1] = 0.0f;
+    memset(&s->filterState, 0, sizeof(s->filterState));
+    memset(&s->reverbState, 0, sizeof(s->reverbState));
+    memset(s->lfo, 0, sizeof(s->lfo));
+    s->lfoActive[0] = s->lfoActive[1] = false;
+    memset(s->eg, 0, sizeof(s->eg));
+    s->egActive[0] = s->egActive[1] = false;
+    s->outputBuffer = nullptr;
+    s->playStartTickMs = 0;
+    s->isReleasing = false;
+    s->releaseStartTickMs = 0;
     InitVoiceDefaultMixBins(pDesc ? pDesc->dwFlags : 0u, s->mixBinPairs, &s->mixBinCount);
 
     if (pDesc) {
@@ -863,6 +1018,7 @@ static HRESULT __stdcall Bridge_DirectSoundCreateStream(const XBOX_DSSTREAMDESC*
             const XBOX_DSMIXBINS* pMixBins = reinterpret_cast<const XBOX_DSMIXBINS*>(pDesc->lpMixBins);
             AssignVoiceMixBins(pMixBins, s->mixBinPairs, &s->mixBinCount);
             ComputeMixBinPairsPan(s->mixBinPairs, s->mixBinCount, &s->pan);
+            ExtractStreamMixBinI3DL2Send(s->mixBinPairs, s->mixBinCount, &s->hasI3DL2Send, &s->i3dl2SendMb);
         }
     }
 
@@ -938,35 +1094,6 @@ static void __stdcall Bridge_DirectSoundDoWork() {
 
 static volatile uint32_t g_mcpxSampleCounter = 0;
 
-static const uint32_t kCSoundCueStopCont = 0x007071C1;
-static void __declspec(naked) Bridge_XACT_CSoundCue_Stop() {
-    __asm {
-        test ecx, ecx
-        jnz  valid_stop_this
-        xor  eax, eax
-        ret  4
-    valid_stop_this:
-        mov  eax, dword ptr [esp+4]
-        push esi
-        mov  esi, ecx
-        jmp  dword ptr [kCSoundCueStopCont]
-    }
-}
-
-static const uint32_t kCSoundCuePlayCont = 0x00708CF1;
-static void __declspec(naked) Bridge_XACT_CSoundCue_Play() {
-    __asm {
-        test ecx, ecx
-        jnz  valid_play_this
-        xor  eax, eax
-        ret  4
-    valid_play_this:
-        mov  eax, dword ptr [esp+4]
-        test al, al
-        jmp  dword ptr [kCSoundCuePlayCont]
-    }
-}
-
 static void __fastcall Bridge_XACT_CEngine_GetTime(void* thisPtr, int dummyEdx, int64_t* pTime) {
     (void)thisPtr; (void)dummyEdx;
     uint64_t ms = GetTickCount64();
@@ -1001,8 +1128,6 @@ void InitXboxAudio() {
     PatchU32(0x00703BF7, reinterpret_cast<uint32_t>(&g_mcpxSampleCounter));
     PatchU32(0x0074E54B, reinterpret_cast<uint32_t>(&g_mcpxSampleCounter));
     InstallBridge(0x00703BDF, &Bridge_XACT_CEngine_GetTime);                // ?GetTime@CEngine@XACT@@QAEXPA_J@Z
-    InstallBridge(0x007071BA, &Bridge_XACT_CSoundCue_Stop);                 // ?Stop@CSoundCue@XACT@@QAEJK@Z
-    InstallBridge(0x00708CEB, &Bridge_XACT_CSoundCue_Play);                 // ?Play@CSoundCue@XACT@@QAEJK@Z
 
     // 2. Top-level DirectSound Stream & DoWork + Buffer bridges
     InitXboxAudioBuffers();
@@ -1015,8 +1140,8 @@ void InitXboxAudio() {
     // 3. IDirectSoundStream / CDirectSoundStream target methods (called by 5-byte thunks at 0x006E1A00..0x006E275B)
     InstallBridge(0x006E14B9, &Stream_SetVolume);                           // CDirectSoundStream::SetVolume
     InstallBridge(0x006E1467, &Stream_SetPitch);                            // CDirectSoundStream::SetPitch
-    InstallBridge(0x006E150B, &Stream_Stub2);                               // CDirectSoundStream::SetLFO
-    InstallBridge(0x006E155D, &Stream_Stub2);                               // CDirectSoundStream::SetEG
+    InstallBridge(0x006E150B, &Stream_SetLFO);                              // CDirectSoundStream::SetLFO
+    InstallBridge(0x006E155D, &Stream_SetEG);                               // CDirectSoundStream::SetEG
     InstallBridge(0x006E15AF, &Stream_SetFilter);                           // CDirectSoundStream::SetFilter
     InstallBridge(0x006E1601, &Stream_SetHeadroom);                         // CDirectSoundStream::SetHeadroom
     InstallBridge(0x006E1653, &Stream_SetMixBinVolumes);                    // CDirectSoundStream::SetMixBinVolumes
@@ -1026,7 +1151,7 @@ void InitXboxAudio() {
     InstallBridge(0x006E16F7, &Stream_Set3DVoiceData);                      // CDirectSoundStream::Set3DVoiceData
     InstallBridge(0x006E1749, &Stream_Use3DVoiceData);                      // CDirectSoundStream::Use3DVoiceData
     InstallBridge(0x006E1F87, &Stream_SetFrequency);                        // CDirectSoundStream::SetFrequency
-    InstallBridge(0x006E1FD9, &Stream_Stub2);                               // CDirectSoundStream::SetOutputBuffer
+    InstallBridge(0x006E1FD9, &Stream_SetOutputBuffer);                     // CDirectSoundStream::SetOutputBuffer
     InstallBridge(0x006E202B, &Stream_SetMixBins);                          // CDirectSoundStream::SetMixBins
     InstallBridge(0x006E26CD, &Stream_SetFormat);                           // CDirectSoundStream::SetFormat
 }

@@ -1,5 +1,6 @@
 #include "ghost_runtime.h"
 #include "ghost_addresses.h"
+#include <vector>
 
 // ============================================================================
 // LIBCMT Thread-Local Storage (__getptd / __freeptd / __mtinit)
@@ -120,9 +121,11 @@ volatile uint32_t g_keTickCount = 0;
 
 static uint8_t  g_launchDataPage[0x1000] = { 0 };
 static uint8_t  g_xboxEEPROMKey[16]      = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 };
-static uint8_t  g_xboxHDKey[16]          = { 16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1 };
-static uint8_t  g_xboxSignatureKey[16]   = { 0xAA,0xBB,0xCC,0xDD,1,2,3,4,5,6,7,8,9,10,11,12 };
-static uint8_t  g_xboxLANKey[16]         = { 0x11,0x22,0x33,0x44,5,6,7,8,9,10,11,12,13,14,15,16 };
+static uint8_t  g_xboxCERTKey[16]        = { 0x5C,0x07,0x33,0xAE,0x04,0x01,0xF7,0xE8,0x3C,0x97,0xF9,0x92,0x32,0x74,0x61,0xE0 };
+static uint8_t  g_xboxHDKey[16]          = { 0 };
+static uint8_t  g_xboxSignatureKey[16]   = { 0 };
+static uint8_t  g_xboxLANKey[16]         = { 0 };
+static uint8_t  g_xboxAltSignatureKeys[16][16] = { { 0 } };
 static uint32_t g_idexChannelObj[32]     = { 0 };
 static uint32_t g_halCachePartCount      = 3;
 static uint32_t g_avPackStandard         = 6; // XC_AV_PACK_STANDARD
@@ -432,40 +435,299 @@ static int32_t __stdcall Krnl_NtFreeVirtualMemory(void** BaseAddress, uint32_t* 
     return 0;
 }
 
-// Crypto functions (XcSHA*, XcHMAC, etc.)
-static void __stdcall Krnl_XcSHAInit(uint8_t* pbSHAContext) {
-    if (pbSHAContext) memset(pbSHAContext, 0, 116);
+// ============================================================================
+// Xbox Kernel Crypto Functions (FIPS 180-1 SHA-1, RFC 2104 HMAC-SHA1, PKCS#1)
+// ============================================================================
+
+#pragma pack(push, 1)
+struct XBOX_SHA_CTX {
+    uint8_t  Buffer[64]; // +0x00
+    uint32_t State[5];   // +0x40
+    uint32_t Count[2];   // +0x54 (Count[0] = low bytes, Count[1] = high bytes)
+};
+#pragma pack(pop)
+
+static inline uint32_t ShaRotl32(uint32_t v, uint32_t s) {
+    return (v << s) | (v >> (32u - s));
+}
+
+static void Sha1TransformBlock(uint32_t state[5], const uint8_t block[64]) {
+    uint32_t w[80];
+    for (int i = 0; i < 16; ++i) {
+        w[i] = (static_cast<uint32_t>(block[i * 4 + 0]) << 24) |
+               (static_cast<uint32_t>(block[i * 4 + 1]) << 16) |
+               (static_cast<uint32_t>(block[i * 4 + 2]) << 8)  |
+               (static_cast<uint32_t>(block[i * 4 + 3]));
+    }
+    for (int i = 16; i < 80; ++i) {
+        w[i] = ShaRotl32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1u);
+    }
+
+    uint32_t a = state[0];
+    uint32_t b = state[1];
+    uint32_t c = state[2];
+    uint32_t d = state[3];
+    uint32_t e = state[4];
+
+    for (int i = 0; i < 80; ++i) {
+        uint32_t f, k;
+        if (i < 20) {
+            f = (b & c) | ((~b) & d);
+            k = 0x5A827999u;
+        } else if (i < 40) {
+            f = b ^ c ^ d;
+            k = 0x6ED9EBA1u;
+        } else if (i < 60) {
+            f = (b & c) | (b & d) | (c & d);
+            k = 0x8F1BBCDCu;
+        } else {
+            f = b ^ c ^ d;
+            k = 0xCA62C1D6u;
+        }
+        uint32_t temp = ShaRotl32(a, 5u) + f + e + k + w[i];
+        e = d;
+        d = c;
+        c = ShaRotl32(b, 30u);
+        b = a;
+        a = temp;
+    }
+
+    state[0] += a;
+    state[1] += b;
+    state[2] += c;
+    state[3] += d;
+    state[4] += e;
+}
+
+void __stdcall Krnl_XcSHAInit(uint8_t* pbSHAContext) {
+    if (!pbSHAContext) return;
+    XBOX_SHA_CTX* ctx = reinterpret_cast<XBOX_SHA_CTX*>(pbSHAContext);
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->State[0] = 0x67452301u;
+    ctx->State[1] = 0xEFCDAB89u;
+    ctx->State[2] = 0x98BADCFEu;
+    ctx->State[3] = 0x10325476u;
+    ctx->State[4] = 0xC3D2E1F0u;
 }
 
 void __stdcall Krnl_XcSHAUpdate(uint8_t* pbSHAContext, const uint8_t* pbInput, uint32_t dwInputLength) {
-    if (!pbSHAContext || !pbInput) return;
-    uint32_t* h = reinterpret_cast<uint32_t*>(pbSHAContext);
-    for (uint32_t i = 0; i < dwInputLength; ++i) {
-        h[i & 7] = (h[i & 7] * 33u) ^ pbInput[i];
+    if (!pbSHAContext || !pbInput || dwInputLength == 0) return;
+    XBOX_SHA_CTX* ctx = reinterpret_cast<XBOX_SHA_CTX*>(pbSHAContext);
+    if (ctx->State[0] == 0 && ctx->State[1] == 0 && ctx->State[2] == 0 && ctx->Count[0] == 0) {
+        Krnl_XcSHAInit(pbSHAContext);
+    }
+
+    uint32_t idx = ctx->Count[0] & 63u;
+    uint32_t newLow = ctx->Count[0] + dwInputLength;
+    if (newLow < ctx->Count[0]) {
+        ctx->Count[1]++;
+    }
+    ctx->Count[0] = newLow;
+
+    uint32_t i = 0;
+    if (idx > 0) {
+        uint32_t fill = 64u - idx;
+        if (dwInputLength < fill) {
+            memcpy(ctx->Buffer + idx, pbInput, dwInputLength);
+            return;
+        }
+        memcpy(ctx->Buffer + idx, pbInput, fill);
+        Sha1TransformBlock(ctx->State, ctx->Buffer);
+        i = fill;
+    }
+
+    for (; i + 64u <= dwInputLength; i += 64u) {
+        Sha1TransformBlock(ctx->State, pbInput + i);
+    }
+
+    if (i < dwInputLength) {
+        memcpy(ctx->Buffer, pbInput + i, dwInputLength - i);
     }
 }
 
-static void __stdcall Krnl_XcSHAFinal(uint8_t* pbSHAContext, uint8_t* pbDigest) {
-    if (pbDigest && pbSHAContext) {
-        memcpy(pbDigest, pbSHAContext, 20);
+void __stdcall Krnl_XcSHAFinal(uint8_t* pbSHAContext, uint8_t* pbDigest) {
+    if (!pbSHAContext || !pbDigest) return;
+    XBOX_SHA_CTX* ctx = reinterpret_cast<XBOX_SHA_CTX*>(pbSHAContext);
+
+    uint64_t totalBits = ((static_cast<uint64_t>(ctx->Count[1]) << 32) | ctx->Count[0]) * 8ULL;
+    uint8_t padLenByte[8];
+    for (int i = 0; i < 8; ++i) {
+        padLenByte[7 - i] = static_cast<uint8_t>((totalBits >> (i * 8)) & 0xFFu);
+    }
+
+    uint8_t oneBit = 0x80u;
+    Krnl_XcSHAUpdate(pbSHAContext, &oneBit, 1u);
+
+    uint8_t zeroPad[64] = { 0 };
+    uint32_t curMod = ctx->Count[0] & 63u;
+    uint32_t padZeros = (curMod <= 56u) ? (56u - curMod) : (120u - curMod);
+    if (padZeros > 0) {
+        Krnl_XcSHAUpdate(pbSHAContext, zeroPad, padZeros);
+    }
+    Krnl_XcSHAUpdate(pbSHAContext, padLenByte, 8u);
+
+    for (int i = 0; i < 5; ++i) {
+        pbDigest[i * 4 + 0] = static_cast<uint8_t>((ctx->State[i] >> 24) & 0xFFu);
+        pbDigest[i * 4 + 1] = static_cast<uint8_t>((ctx->State[i] >> 16) & 0xFFu);
+        pbDigest[i * 4 + 2] = static_cast<uint8_t>((ctx->State[i] >> 8)  & 0xFFu);
+        pbDigest[i * 4 + 3] = static_cast<uint8_t>(ctx->State[i] & 0xFFu);
     }
 }
 
-static void __stdcall Krnl_XcHMAC(
+void __stdcall Krnl_XcHMAC(
     const uint8_t* pbKey, uint32_t dwKeyLength,
     const uint8_t* pbInput, uint32_t dwInputLength,
     const uint8_t* pbInput2, uint32_t dwInputLength2,
     uint8_t* pbDigest)
 {
-    uint8_t ctx[128] = { 0 };
-    Krnl_XcSHAUpdate(ctx, pbKey, dwKeyLength);
-    Krnl_XcSHAUpdate(ctx, pbInput, dwInputLength);
-    Krnl_XcSHAUpdate(ctx, pbInput2, dwInputLength2);
-    if (pbDigest) memcpy(pbDigest, ctx, 20);
+    if (!pbDigest) return;
+    uint8_t keyBlock[64] = { 0 };
+    if (pbKey && dwKeyLength > 0) {
+        if (dwKeyLength > 64u) {
+            // Xbox XcHMAC truncates keys > 64 bytes to 64 bytes (or hashes them in standard RFC 2104; Xbox kernel truncates at 64)
+            memcpy(keyBlock, pbKey, 64u);
+        } else {
+            memcpy(keyBlock, pbKey, dwKeyLength);
+        }
+    }
+
+    uint8_t kIpad[64];
+    uint8_t kOpad[64];
+    for (int i = 0; i < 64; ++i) {
+        kIpad[i] = keyBlock[i] ^ 0x36u;
+        kOpad[i] = keyBlock[i] ^ 0x5Cu;
+    }
+
+    uint8_t innerCtx[116];
+    uint8_t innerDigest[20];
+    Krnl_XcSHAInit(innerCtx);
+    Krnl_XcSHAUpdate(innerCtx, kIpad, 64u);
+    if (pbInput && dwInputLength > 0) {
+        Krnl_XcSHAUpdate(innerCtx, pbInput, dwInputLength);
+    }
+    if (pbInput2 && dwInputLength2 > 0) {
+        Krnl_XcSHAUpdate(innerCtx, pbInput2, dwInputLength2);
+    }
+    Krnl_XcSHAFinal(innerCtx, innerDigest);
+
+    uint8_t outerCtx[116];
+    Krnl_XcSHAInit(outerCtx);
+    Krnl_XcSHAUpdate(outerCtx, kOpad, 64u);
+    Krnl_XcSHAUpdate(outerCtx, innerDigest, 20u);
+    Krnl_XcSHAFinal(outerCtx, pbDigest);
 }
 
-static uint32_t __stdcall Krnl_XcVerifyPKCS1Signature(void* a, void* b, void* c) {
-    (void)a; (void)b; (void)c;
+// Multi-precision modular exponentiation: pA = (pB ^ pC) mod pD (little-endian uint32_t[dwLen])
+static void BigIntSub(uint32_t* a, const uint32_t* b, uint32_t n) {
+    uint64_t borrow = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint64_t diff = static_cast<uint64_t>(a[i]) - b[i] - borrow;
+        a[i] = static_cast<uint32_t>(diff);
+        borrow = (diff >> 63) & 1u;
+    }
+}
+
+static int BigIntCmp(const uint32_t* a, const uint32_t* b, uint32_t n) {
+    for (int i = static_cast<int>(n) - 1; i >= 0; --i) {
+        if (a[i] != b[i]) return (a[i] > b[i]) ? 1 : -1;
+    }
+    return 0;
+}
+
+static void BigIntMulMod(uint32_t* out, const uint32_t* a, const uint32_t* b, const uint32_t* m, uint32_t n) {
+    std::vector<uint32_t> prod(n * 2u + 1u, 0u);
+    for (uint32_t i = 0; i < n; ++i) {
+        uint64_t carry = 0;
+        for (uint32_t j = 0; j < n; ++j) {
+            uint64_t cur = prod[i + j] + static_cast<uint64_t>(a[i]) * b[j] + carry;
+            prod[i + j] = static_cast<uint32_t>(cur);
+            carry = cur >> 32;
+        }
+        prod[i + n] += static_cast<uint32_t>(carry);
+    }
+
+    // Bitwise shift-and-subtract reduction mod m
+    std::vector<uint32_t> rem(n + 1u, 0u);
+    std::vector<uint32_t> mExt(n + 1u, 0u);
+    for (uint32_t i = 0; i < n; ++i) mExt[i] = m[i];
+
+    for (int bit = static_cast<int>(n * 64u) - 1; bit >= 0; --bit) {
+        uint32_t carry = 0;
+        for (uint32_t i = 0; i <= n; ++i) {
+            uint32_t nextCarry = rem[i] >> 31;
+            rem[i] = (rem[i] << 1) | carry;
+            carry = nextCarry;
+        }
+        rem[0] |= (prod[bit >> 5] >> (bit & 31)) & 1u;
+        if (BigIntCmp(rem.data(), mExt.data(), n + 1u) >= 0) {
+            BigIntSub(rem.data(), mExt.data(), n + 1u);
+        }
+    }
+    for (uint32_t i = 0; i < n; ++i) out[i] = rem[i];
+}
+
+static uint32_t __stdcall Krnl_XcModExp(
+    uint32_t* pA, const uint32_t* pB, const uint32_t* pC, const uint32_t* pD, uint32_t dwLen)
+{
+    if (!pA || !pB || !pC || !pD || dwLen == 0 || dwLen > 128u) return 0;
+    bool modNonZero = false;
+    for (uint32_t i = 0; i < dwLen; ++i) {
+        if (pD[i] != 0) { modNonZero = true; break; }
+    }
+    if (!modNonZero) return 0;
+
+    std::vector<uint32_t> result(dwLen, 0u);
+    std::vector<uint32_t> base(dwLen, 0u);
+    result[0] = 1u;
+    for (uint32_t i = 0; i < dwLen; ++i) base[i] = pB[i];
+
+    int highestBit = static_cast<int>(dwLen * 32u) - 1;
+    while (highestBit >= 0 && ((pC[highestBit >> 5] >> (highestBit & 31)) & 1u) == 0) {
+        --highestBit;
+    }
+    for (int bit = 0; bit <= highestBit; ++bit) {
+        if ((pC[bit >> 5] >> (bit & 31)) & 1u) {
+            BigIntMulMod(result.data(), result.data(), base.data(), pD, dwLen);
+        }
+        if (bit < highestBit) {
+            BigIntMulMod(base.data(), base.data(), base.data(), pD, dwLen);
+        }
+    }
+    for (uint32_t i = 0; i < dwLen; ++i) pA[i] = result[i];
+    return 1;
+}
+
+static uint32_t __stdcall Krnl_XcVerifyPKCS1Signature(const uint8_t* pbSig, const uint8_t* pbPubKey, const uint8_t* pbDigest) {
+    if (!pbSig || !pbPubKey || !pbDigest) return 0;
+    uint32_t magic  = *reinterpret_cast<const uint32_t*>(pbPubKey + 0x00);
+    uint32_t bitlen = *reinterpret_cast<const uint32_t*>(pbPubKey + 0x08);
+    uint32_t pubexp = *reinterpret_cast<const uint32_t*>(pbPubKey + 0x10);
+    if (magic == 0x31415352u && bitlen >= 512u && bitlen <= 2048u && (bitlen & 31u) == 0u && pubexp != 0u) {
+        uint32_t dwLen = bitlen / 32u;
+        uint32_t byteLen = bitlen / 8u;
+        const uint32_t* pMod = reinterpret_cast<const uint32_t*>(pbPubKey + 0x14);
+        bool modValid = false;
+        for (uint32_t i = 0; i < dwLen; ++i) {
+            if (pMod[i] != 0) { modValid = true; break; }
+        }
+        if (modValid) {
+            std::vector<uint32_t> expWords(dwLen, 0u);
+            std::vector<uint32_t> outWords(dwLen, 0u);
+            expWords[0] = pubexp;
+            if (Krnl_XcModExp(outWords.data(), reinterpret_cast<const uint32_t*>(pbSig), expWords.data(), pMod, dwLen)) {
+                const uint8_t* dec = reinterpret_cast<const uint8_t*>(outWords.data());
+                // BSAFE little-endian PKCS#1 v1.5 layout: dec[0..19] = reversed SHA-1 digest
+                bool match = true;
+                for (int i = 0; i < 20; ++i) {
+                    if (dec[i] != pbDigest[19 - i] && dec[byteLen - 20 + i] != pbDigest[i]) {
+                        match = false;
+                        break;
+                    }
+                }
+                return match ? 1u : 0u;
+            }
+        }
+    }
     return 1;
 }
 
@@ -527,6 +789,22 @@ static void __stdcall Bridge_XACTEngineDoWork() {
 void InitXboxKernel() {
     UpdateXboxKernelTick();
 
+    // Derive XboxLANKey, XboxSignatureKey, and XboxAlternateSignatureKeys from XBE Certificate at ds:[0x0094F118]
+    // using the Xbox kernel's XcHMAC(XboxCERTKey, 16, certKey, 16, nullptr, 0, digest)[0..15] derivation
+    uint32_t certAddr = *reinterpret_cast<const uint32_t*>(0x0094F118);
+    if (certAddr >= 0x0094F100u && certAddr + 0x1D0u <= 0x00950000u) {
+        uint8_t digest[20];
+        const uint8_t* certBytes = reinterpret_cast<const uint8_t*>(certAddr);
+        Krnl_XcHMAC(g_xboxCERTKey, 16, certBytes + 0xB0, 16, nullptr, 0, digest);
+        memcpy(g_xboxLANKey, digest, 16);
+        Krnl_XcHMAC(g_xboxCERTKey, 16, certBytes + 0xC0, 16, nullptr, 0, digest);
+        memcpy(g_xboxSignatureKey, digest, 16);
+        for (int i = 0; i < 16; ++i) {
+            Krnl_XcHMAC(g_xboxCERTKey, 16, certBytes + 0xD0 + i * 16, 16, nullptr, 0, digest);
+            memcpy(g_xboxAltSignatureKeys[i], digest, 16);
+        }
+    }
+
     // Initialize self-referential empty LIST_ENTRY inside g_idexChannelObj (+0x28) for 0x0074FF20
     g_idexChannelObj[0x28 / 4] = reinterpret_cast<uint32_t>(&g_idexChannelObj[0x28 / 4]);
     g_idexChannelObj[0x2C / 4] = reinterpret_cast<uint32_t>(&g_idexChannelObj[0x28 / 4]);
@@ -554,7 +832,7 @@ void InitXboxKernel() {
     PatchU32(0x0074FEB8, reinterpret_cast<uint32_t>(&Krnl_XcSHAFinal));                // ord 337: __imp__XcSHAFinal@8
     PatchU32(0x0074FEBC, reinterpret_cast<uint32_t>(g_xboxHDKey));                     // ord 323: _XboxHDKey (DATA)
     PatchU32(0x0074FEC0, reinterpret_cast<uint32_t>(g_xboxSignatureKey));              // ord 325: __imp__XboxSignatureKey (DATA)
-    PatchU32(0x0074FEC4, reinterpret_cast<uint32_t>(g_xboxEEPROMKey));                 // ord 354: __imp__XboxAlternateSignatureKeys (DATA)
+    PatchU32(0x0074FEC4, reinterpret_cast<uint32_t>(g_xboxAltSignatureKeys));          // ord 354: __imp__XboxAlternateSignatureKeys (DATA)
     PatchU32(0x0074FEC8, reinterpret_cast<uint32_t>(&Bridge_CloseHandle));             // ord 187: __imp__NtClose@4
     PatchU32(0x0074FECC, reinterpret_cast<uint32_t>(&Krnl_Stub3));                     // ord 233: __imp__NtWaitForSingleObject@12
     PatchU32(0x0074FED0, reinterpret_cast<uint32_t>(&Krnl_Stub8));                     // ord 219: __imp__NtReadFile@32
@@ -665,7 +943,7 @@ void InitXboxKernel() {
     PatchU32(0x00750074, reinterpret_cast<uint32_t>(&Krnl_Stub2));                     // ord 346: __imp__XcDESKeyParity@8
     PatchU32(0x00750078, reinterpret_cast<uint32_t>(&Krnl_Stub7));                     // ord 349: __imp__XcBlockCryptCBC@28
     PatchU32(0x0075007C, reinterpret_cast<uint32_t>(&Krnl_Stub3));                     // ord 347: __imp__XcKeyTable@12
-    PatchU32(0x00750080, reinterpret_cast<uint32_t>(&Krnl_Stub5));                     // ord 345: __imp__XcModExp@20
+    PatchU32(0x00750080, reinterpret_cast<uint32_t>(&Krnl_XcModExp));                  // ord 345: __imp__XcModExp@20
     PatchU32(0x00750084, reinterpret_cast<uint32_t>(g_xboxLANKey));                    // ord 353: __imp__XboxLANKey (DATA)
     PatchU32(0x00750088, reinterpret_cast<uint32_t>(&Krnl_Stub3));                     // ord 339: __imp__XcRC4Crypt@12
     PatchU32(0x0075008C, reinterpret_cast<uint32_t>(&Krnl_Stub3));                     // ord 338: __imp__XcRC4Key@12

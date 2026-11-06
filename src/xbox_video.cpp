@@ -6,132 +6,60 @@
 #include <vector>
 
 // ============================================================================
-// cDivxVideo (.vid Movie Player in VIDPlayerXB.obj) Wall-Clock Frame Pacing Bridges
+// cDivxVideo (.vid Movie Player in VIDPlayerXB.obj) 733.333 MHz RDTSC Virtualization
 // ============================================================================
 // Original cDivxVideo::FrameMove (0x0043DE80) and cDivxVideo::Render (0x0043DEE0)
-// computed elapsed milliseconds via `(rdtsc * 3) / 2200000`, assuming the Original Xbox
-// 733.333 MHz Pentium III CPU. On modern GHz CPUs, RDTSC ticks 5x-6x faster, causing
-// blizzard_logo.vid, Nihilistic_Logo.vid, and Attract_Mode.vid to play in fast-forward
-// and overflow VIDAudioHelper's packet ring buffer.
+// compute elapsed milliseconds via `(rdtsc * 3) / 0x2191C0` (2,200,000), assuming the
+// Original Xbox 733.333 MHz Pentium III CPU. We virtualize the `rdtsc * 3` step to
+// return exact 733.333 MHz Xbox CPU cycles * 3 in edx:eax while letting Ghost.exe's
+// native cDivxVideo::FrameMove and cDivxVideo::Render execute unmodified.
 
-static constexpr uint32_t kDivxRenderModeOffset           = 0x000u;
-static constexpr uint32_t kDivxPlayerOffset               = 0x004u;
-static constexpr uint32_t kDivxRenderOffset               = 0x294u;
-static constexpr uint32_t kDivxDecodeNextFrameOffset      = 0x2BCu;
-static constexpr uint32_t kDivxFirstFrameOffset           = 0x2C0u;
-static constexpr uint32_t kDivxLastTimeMsOffset           = 0x2C4u;
-static constexpr uint32_t kDivxCurrentTimeMsOffset        = 0x2C8u;
-static constexpr uint32_t kDivxTargetTimeMsOffset         = 0x2D0u;
-static constexpr uint32_t kDivxFrameDurationMsOffset      = 0x2D8u;
-static constexpr uint32_t kDivxPausedOffset               = 0x2DCu;
+static LARGE_INTEGER g_qpcFreq  = {};
+static LARGE_INTEGER g_qpcStart = {};
+static bool          g_qpcInit  = false;
 
-static constexpr uint32_t kDivxRenderModeTextureSwizzled  = 0u;
-static constexpr uint32_t kDivxRenderModeTextureLinear    = 1u;
-static constexpr uint32_t kDivxRenderModeSurface          = 2u;
-static constexpr uint32_t kDivxRenderModeOverlay          = 3u;
-static constexpr double   kDivxDefaultFrameDurationMs     = 1000.0 / 30.0;
-static constexpr double   kDivxSleepThresholdMs           = 2.0;
-static constexpr double   kDivxMaxLagCatchupMs            = 100.0;
-static constexpr DWORD    kDivxWaitSleepMs                = 1u;
-
-static HRESULT __fastcall Bridge_cDivxVideo_FrameMove(uint8_t* thisPtr, int dummyEdx) {
-    (void)dummyEdx;
-    if (!thisPtr) return 1;
-
-    uint32_t bFirstFrame = *reinterpret_cast<uint32_t*>(thisPtr + kDivxFirstFrameOffset);
-    if (bFirstFrame == 0) {
-        *reinterpret_cast<uint32_t*>(thisPtr + kDivxDecodeNextFrameOffset) = 1u;
+static uint64_t QueryXbox733MHzCyclesTimes3() {
+    if (!g_qpcInit) {
+        QueryPerformanceFrequency(&g_qpcFreq);
+        QueryPerformanceCounter(&g_qpcStart);
+        g_qpcInit = true;
     }
-
-    if (*reinterpret_cast<uint32_t*>(thisPtr + kDivxDecodeNextFrameOffset) != 0) {
-        typedef uint8_t (__fastcall *PFN_DecodeNextFrame)(void* playerThis, int edx);
-        PFN_DecodeNextFrame fnDecode = reinterpret_cast<PFN_DecodeNextFrame>(kAddrVidSimplePlayerDecodeNextFrame);
-        uint8_t decodedOk = fnDecode(thisPtr + kDivxPlayerOffset, 0);
-        if (!decodedOk) {
-            return 1; // End of .vid stream
-        }
+    LARGE_INTEGER now = {};
+    QueryPerformanceCounter(&now);
+    uint64_t elapsedTicks = static_cast<uint64_t>(now.QuadPart - g_qpcStart.QuadPart);
+    uint64_t freq = static_cast<uint64_t>(g_qpcFreq.QuadPart);
+    if (freq == 0) {
+        return static_cast<uint64_t>(GetTickCount64()) * 0x2191C0ULL;
     }
-    return 0;
+    // 733,333,333.333 Hz * 3 = 2,200,000,000 Hz = 2,200,000 (0x2191C0) ticks per millisecond
+    uint64_t secPart = elapsedTicks / freq;
+    uint64_t remPart = elapsedTicks % freq;
+    return secPart * 2200000000ULL + (remPart * 2200000000ULL) / freq;
 }
 
-static HRESULT __fastcall Bridge_cDivxVideo_Render(uint8_t* thisPtr, int dummyEdx) {
-    (void)dummyEdx;
-    if (!thisPtr) return 0;
+static uint64_t __cdecl Bridge_DivxRdtscTimes3_FrameMove() {
+    return QueryXbox733MHzCyclesTimes3();
+}
 
-    typedef uint8_t (__fastcall *PFN_RenderToTexture)(void* renderThis, int edx, int mode);
-    typedef uint8_t (__fastcall *PFN_RenderNoArg)(void* renderThis, int edx);
-    void* pRender = thisPtr + kDivxRenderOffset;
-    uint32_t renderMode = *reinterpret_cast<uint32_t*>(thisPtr + kDivxRenderModeOffset);
+static uint64_t __cdecl Bridge_DivxRdtscTimes3_Render() {
+    UpdateXboxKernelTick();
+    UpdateXboxInputTick();
+    UpdateXboxAudioTick();
+    SwitchToThread();
+    return QueryXbox733MHzCyclesTimes3();
+}
 
-    switch (renderMode) {
-        case kDivxRenderModeTextureSwizzled:
-            reinterpret_cast<PFN_RenderToTexture>(kAddrVidRenderToTexture)(pRender, 0, 0);
-            break;
-        case kDivxRenderModeTextureLinear:
-            reinterpret_cast<PFN_RenderToTexture>(kAddrVidRenderToTexture)(pRender, 0, 1);
-            break;
-        case kDivxRenderModeSurface:
-            reinterpret_cast<PFN_RenderNoArg>(kAddrVidRenderToSurface)(pRender, 0);
-            break;
-        case kDivxRenderModeOverlay:
-            reinterpret_cast<PFN_RenderNoArg>(kAddrVidRenderToOverlay)(pRender, 0);
-            break;
-        default:
-            break;
+static void PatchCallAndNops(uint32_t addr, const void* targetFn, size_t totalBytes) {
+    DWORD oldProt = 0;
+    VirtualProtect(reinterpret_cast<void*>(addr), totalBytes, PAGE_EXECUTE_READWRITE, &oldProt);
+    uint8_t* p = reinterpret_cast<uint8_t*>(addr);
+    p[0] = 0xE8; // CALL rel32
+    *reinterpret_cast<int32_t*>(p + 1) = static_cast<int32_t>(
+        reinterpret_cast<uintptr_t>(targetFn) - (static_cast<uintptr_t>(addr) + 5u));
+    for (size_t i = 5; i < totalBytes; ++i) {
+        p[i] = 0x90; // NOP
     }
-
-    typedef void (__fastcall *PFN_PlayerNoArg)(void* playerThis, int edx);
-    void* pPlayer = thisPtr + kDivxPlayerOffset;
-
-    if (*reinterpret_cast<uint32_t*>(thisPtr + kDivxPausedOffset) == 0) {
-        uint32_t* pFirstFrame    = reinterpret_cast<uint32_t*>(thisPtr + kDivxFirstFrameOffset);
-        uint32_t* pLastTimeMs    = reinterpret_cast<uint32_t*>(thisPtr + kDivxLastTimeMsOffset);
-        double*   pCurrentTimeMs = reinterpret_cast<double*>(thisPtr + kDivxCurrentTimeMsOffset);
-        double*   pTargetTimeMs  = reinterpret_cast<double*>(thisPtr + kDivxTargetTimeMsOffset);
-        float     frameDurMs     = *reinterpret_cast<float*>(thisPtr + kDivxFrameDurationMsOffset);
-        double    frameStepMs    = (_finite(frameDurMs) && frameDurMs > 1.0f && frameDurMs < 200.0f)
-                                   ? static_cast<double>(frameDurMs)
-                                   : kDivxDefaultFrameDurationMs;
-
-        uint32_t nowMs = GetTickCount();
-        if (*pFirstFrame != 0) {
-            *pFirstFrame    = 0;
-            *pLastTimeMs    = nowMs;
-            *pCurrentTimeMs = 0.0;
-            *pTargetTimeMs  = 0.0;
-        } else {
-            uint32_t lastMs    = *pLastTimeMs;
-            double   currentMs = *pCurrentTimeMs + static_cast<double>(nowMs - lastMs);
-            double   targetMs  = *pTargetTimeMs + frameStepMs;
-            lastMs = nowMs;
-
-            while (currentMs < targetMs) {
-                UpdateXboxKernelTick();
-                UpdateXboxInputTick();
-                UpdateXboxAudioTick();
-                if (targetMs - currentMs > kDivxSleepThresholdMs) {
-                    Sleep(kDivxWaitSleepMs);
-                } else {
-                    SwitchToThread();
-                }
-                nowMs = GetTickCount();
-                currentMs += static_cast<double>(nowMs - lastMs);
-                lastMs = nowMs;
-            }
-
-            if (currentMs > targetMs + kDivxMaxLagCatchupMs) {
-                currentMs = targetMs;
-            }
-            *pLastTimeMs    = lastMs;
-            *pCurrentTimeMs = currentMs;
-            *pTargetTimeMs  = targetMs;
-        }
-
-        reinterpret_cast<PFN_PlayerNoArg>(kAddrVidSimplePlayerHandleAudio)(pPlayer, 0);
-    }
-
-    reinterpret_cast<PFN_PlayerNoArg>(kAddrVidSimplePlayerStartPlayback)(pPlayer, 0);
-    return 0;
+    VirtualProtect(reinterpret_cast<void*>(addr), totalBytes, oldProt, &oldProt);
 }
 
 // ============================================================================
@@ -141,8 +69,11 @@ static HRESULT __fastcall Bridge_cDivxVideo_Render(uint8_t* thisPtr, int dummyEd
 // ============================================================================
 
 static std::vector<uint32_t> g_overlayFrameBuf;
-static bool                  g_overlayEnabled = false;
-static bool                  g_overlayHasData = false;
+static bool                  g_overlayEnabled     = false;
+static bool                  g_overlayHasData     = false;
+static RECT                  g_overlayDstRect     = { 0, 0, 640, 480 };
+static bool                  g_overlayUseColorKey = false;
+static uint32_t              g_overlayColorKey    = 0u;
 
 static void __stdcall Bridge_D3DDevice_EnableOverlay(BOOL bEnable) {
     // In Ghost.exe (0x006B3250), EnableOverlay stops active NV_PVIDEO_BUFFER ([esi+8704h] = 1)
@@ -171,7 +102,51 @@ static BOOL __stdcall Bridge_D3DDevice_GetOverlayUpdateStatus() {
 void FlushXboxOverlayToBackbuffer() {
     if (!g_overlayEnabled || !g_overlayHasData) return;
     if (g_d3dDevice && g_d3dCtx && g_backBufferTex && g_overlayFrameBuf.size() == 640u * 480u) {
-        g_d3dCtx->UpdateSubresource(g_backBufferTex, 0, nullptr, g_overlayFrameBuf.data(), 640u * 4u, 0);
+        int32_t l = g_overlayDstRect.left   < 0   ? 0   : (g_overlayDstRect.left   > 640 ? 640 : g_overlayDstRect.left);
+        int32_t t = g_overlayDstRect.top    < 0   ? 0   : (g_overlayDstRect.top    > 480 ? 480 : g_overlayDstRect.top);
+        int32_t r = g_overlayDstRect.right  < 0   ? 0   : (g_overlayDstRect.right  > 640 ? 640 : g_overlayDstRect.right);
+        int32_t b = g_overlayDstRect.bottom < 0   ? 0   : (g_overlayDstRect.bottom > 480 ? 480 : g_overlayDstRect.bottom);
+        if (r > l && b > t) {
+            D3D11_BOX dstBox = {
+                static_cast<UINT>(l), static_cast<UINT>(t), 0u,
+                static_cast<UINT>(r), static_cast<UINT>(b), 1u
+            };
+            if (g_overlayUseColorKey) {
+                static ID3D11Texture2D* s_overlayStagingTex = nullptr;
+                if (!s_overlayStagingTex) {
+                    D3D11_TEXTURE2D_DESC td = {};
+                    td.Width            = 640u;
+                    td.Height           = 480u;
+                    td.MipLevels        = 1u;
+                    td.ArraySize        = 1u;
+                    td.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+                    td.SampleDesc.Count = 1u;
+                    td.Usage            = D3D11_USAGE_STAGING;
+                    td.CPUAccessFlags   = D3D11_CPU_ACCESS_READ;
+                    g_d3dDevice->CreateTexture2D(&td, nullptr, &s_overlayStagingTex);
+                }
+                if (s_overlayStagingTex) {
+                    g_d3dCtx->CopySubresourceRegion(s_overlayStagingTex, 0, static_cast<UINT>(l), static_cast<UINT>(t), 0, g_backBufferTex, 0, &dstBox);
+                    D3D11_MAPPED_SUBRESOURCE mapped = {};
+                    if (SUCCEEDED(g_d3dCtx->Map(s_overlayStagingTex, 0, D3D11_MAP_READ, 0, &mapped))) {
+                        uint32_t keyRgb = g_overlayColorKey & 0x00FFFFFFu;
+                        for (int32_t y = t; y < b; ++y) {
+                            const uint32_t* bbRow = reinterpret_cast<const uint32_t*>(
+                                static_cast<const uint8_t*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch);
+                            uint32_t* ovRow = &g_overlayFrameBuf[static_cast<size_t>(y) * 640u];
+                            for (int32_t x = l; x < r; ++x) {
+                                if ((bbRow[x] & 0x00FFFFFFu) != keyRgb) {
+                                    ovRow[x] = bbRow[x];
+                                }
+                            }
+                        }
+                        g_d3dCtx->Unmap(s_overlayStagingTex, 0);
+                    }
+                }
+            }
+            const uint32_t* srcPtr = &g_overlayFrameBuf[static_cast<size_t>(t) * 640u + static_cast<size_t>(l)];
+            g_d3dCtx->UpdateSubresource(g_backBufferTex, 0, &dstBox, srcPtr, 640u * 4u, 0);
+        }
     }
     g_overlayHasData = false;
 }
@@ -210,6 +185,13 @@ static void __stdcall Bridge_D3DDevice_UpdateOverlay(
     if (srcLeft + srcW > (int32_t)surfW) srcW = (int32_t)surfW - srcLeft;
     if (srcTop  + srcH > (int32_t)surfH) srcH = (int32_t)surfH - srcTop;
     if (srcW <= 0 || srcH <= 0) return;
+
+    g_overlayDstRect.left   = dstLeft;
+    g_overlayDstRect.top    = dstTop;
+    g_overlayDstRect.right  = dstLeft + dstW;
+    g_overlayDstRect.bottom = dstTop  + dstH;
+    g_overlayUseColorKey    = (bColorKey != FALSE);
+    g_overlayColorKey       = ColorKey;
 
     // 3. Decode source YUY2 (0x24) / UYVY (0x25) region to BGRA8
     std::vector<uint32_t> decodedSrc((size_t)srcW * (size_t)srcH);
@@ -289,9 +271,11 @@ static void __stdcall Bridge_D3DDevice_UpdateOverlay(
 }
 
 void InitXboxVideo() {
-    // 1. cDivxVideo (.vid Movie Player) wall-clock frame pacing bridges
-    InstallBridge(kAddrDivxVideoFrameMove, &Bridge_cDivxVideo_FrameMove);    // ?FrameMove@cDivxVideo@@QAEJXZ
-    InstallBridge(kAddrDivxVideoRender,    &Bridge_cDivxVideo_Render);       // ?Render@cDivxVideo@@QAEJXZ
+    // 1. Virtualize the 13-byte `rdtsc * 3` blocks in cDivxVideo::FrameMove (0x0043DE97..0x0043DEA3)
+    //    and cDivxVideo::Render (0x0043DF56..0x0043DF62) to 733.333 MHz Xbox CPU cycles while letting
+    //    both functions execute their native Ghost.exe machine code.
+    PatchCallAndNops(0x0043DE97, &Bridge_DivxRdtscTimes3_FrameMove, 13u);
+    PatchCallAndNops(0x0043DF56, &Bridge_DivxRdtscTimes3_Render,    13u);
 
     // 2. D3DDevice YUY2 Hardware Overlay bridges
     InstallBridge(0x006B3250, &Bridge_D3DDevice_EnableOverlay);              // _D3DDevice_EnableOverlay@4

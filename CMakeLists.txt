@@ -22,23 +22,6 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Generate C++ raw string literal include from pure shaders/ghost.hlsl (native CMake, zero Python dependency)
-set(GHOST_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
-set(GHOST_HLSL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ghost.hlsl")
-set(GHOST_HLSL_INC "${GHOST_GEN_DIR}/ghost_hlsl.inc")
-set(GHOST_EMBED_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_hlsl.cmake")
-
-add_custom_command(
-    OUTPUT "${GHOST_HLSL_INC}"
-    COMMAND "${CMAKE_COMMAND}"
-        "-DSRC=${GHOST_HLSL_SRC}"
-        "-DDST=${GHOST_HLSL_INC}"
-        -P "${GHOST_EMBED_SCRIPT}"
-    DEPENDS "${GHOST_HLSL_SRC}" "${GHOST_EMBED_SCRIPT}"
-    COMMENT "Embedding shaders/ghost.hlsl into generated/ghost_hlsl.inc"
-    VERBATIM
-)
-
 # Native C++ post-build PE verifier & LoadConfig patcher (uses <windows.h> PE structs, zero Python dependency)
 add_executable(post_build_pe
     cmake/post_build_pe.cpp
@@ -53,6 +36,7 @@ add_executable(GhostWin11 WIN32
     src/main.cpp
     src/config.cpp
     src/launcher.cpp
+    src/osd.cpp
     src/patch.cpp
     src/xbox_kernel.cpp
     src/xbox_xapi.cpp
@@ -68,15 +52,10 @@ add_executable(GhostWin11 WIN32
     include/ghost_runtime.h
     include/ghost_addresses.h
     include/xbox_d3d8_types.h
-    shaders/ghost.hlsl
-    "${GHOST_HLSL_INC}"
 )
-
-set_source_files_properties(shaders/ghost.hlsl PROPERTIES HEADER_FILE_ONLY TRUE)
 
 target_include_directories(GhostWin11 PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
-    "${GHOST_GEN_DIR}"
 )
 
 target_compile_definitions(GhostWin11 PRIVATE

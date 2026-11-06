@@ -188,626 +188,6 @@ static HRESULT __stdcall Bridge_D3DDevice_SetPixelShaderConstant(DWORD Register,
     return S_OK;
 }
 
-// ============================================================================
-// General NV2A Register Combiner (D3DPIXELSHADERDEF / _D3D__RenderState[0..56, 136])
-// Decompiler to HLSL ps_4_0 & Constant Populator
-// ============================================================================
-
-void PopulateRegisterCombinerConstants(PerDrawCBData* cb) {
-    if (!cb) return;
-    const uint32_t* xboxRS = reinterpret_cast<const uint32_t*>(ADDR_D3D_RENDERSTATE);
-    const XboxPixelShaderDef* pDef = GetHandlePSDef(g_currentPsHandle);
-
-    uint32_t combCountFlags = xboxRS[XBOX_D3DRS_PSCOMBINERCOUNT];
-    bool sepC0 = (combCountFlags & 0x1000u)  != 0u;
-    bool sepC1 = (combCountFlags & 0x10000u) != 0u;
-    uint32_t c0Map = pDef ? pDef->PSC0Mapping : 0xFFFFFFFFu;
-    uint32_t c1Map = pDef ? pDef->PSC1Mapping : 0xFFFFFFFFu;
-    uint32_t fcMap = pDef ? pDef->PSFinalCombinerConstants : 0xFFFFFFFFu;
-
-    for (int s = 0; s < 8; ++s) {
-        int effS0 = sepC0 ? s : 0;
-        uint32_t r0 = (c0Map >> (effS0 * 4)) & 0xFu;
-        if (r0 < 8u && PackFloat4ToD3DColor(g_psConstants[r0]) == xboxRS[10 + effS0]) {
-            memcpy(cb->rcStageC0[s], g_psConstants[r0], 16);
-        } else {
-            UnpackD3DColor(xboxRS[10 + effS0], &cb->rcStageC0[s][0], &cb->rcStageC0[s][1], &cb->rcStageC0[s][2], &cb->rcStageC0[s][3]);
-        }
-
-        int effS1 = sepC1 ? s : 0;
-        uint32_t r1 = (c1Map >> (effS1 * 4)) & 0xFu;
-        if (r1 < 8u && PackFloat4ToD3DColor(g_psConstants[r1]) == xboxRS[18 + effS1]) {
-            memcpy(cb->rcStageC1[s], g_psConstants[r1], 16);
-        } else {
-            UnpackD3DColor(xboxRS[18 + effS1], &cb->rcStageC1[s][0], &cb->rcStageC1[s][1], &cb->rcStageC1[s][2], &cb->rcStageC1[s][3]);
-        }
-    }
-
-    uint32_t fc0Reg = fcMap & 0xFu;
-    if (fc0Reg < 8u && PackFloat4ToD3DColor(g_psConstants[fc0Reg]) == xboxRS[43]) {
-        memcpy(cb->rcFinalConst[0], g_psConstants[fc0Reg], 16);
-    } else {
-        UnpackD3DColor(xboxRS[43], &cb->rcFinalConst[0][0], &cb->rcFinalConst[0][1], &cb->rcFinalConst[0][2], &cb->rcFinalConst[0][3]);
-    }
-
-    uint32_t fc1Reg = (fcMap >> 4) & 0xFu;
-    if (fc1Reg < 8u && PackFloat4ToD3DColor(g_psConstants[fc1Reg]) == xboxRS[44]) {
-        memcpy(cb->rcFinalConst[1], g_psConstants[fc1Reg], 16);
-    } else {
-        UnpackD3DColor(xboxRS[44], &cb->rcFinalConst[1][0], &cb->rcFinalConst[1][1], &cb->rcFinalConst[1][2], &cb->rcFinalConst[1][3]);
-    }
-}
-
-struct CachedRegCombinerPS {
-    uint64_t           hash;
-    ID3D11PixelShader* ps;
-};
-static std::vector<CachedRegCombinerPS> g_rcPsCache;
-
-static void FormatRcInputExpr(
-    uint8_t byteVal, bool isAlpha, int stageIdx, bool isFinalCombiner,
-    char* outBuf, size_t outSize)
-{
-    uint32_t reg  = byteVal & 0x0Fu;
-    uint32_t chan = (byteVal >> 4) & 0x01u;
-    uint32_t map  = (byteVal >> 5) & 0x07u;
-
-    char regStr[64];
-    switch (reg) {
-        case 0x0u: snprintf(regStr, sizeof(regStr), "float4(0.0f,0.0f,0.0f,0.0f)"); break;
-        case 0x1u:
-            if (isFinalCombiner) snprintf(regStr, sizeof(regStr), "uRcFinalConst[0]");
-            else                 snprintf(regStr, sizeof(regStr), "uRcStageC0[%d]", stageIdx);
-            break;
-        case 0x2u:
-            if (isFinalCombiner) snprintf(regStr, sizeof(regStr), "uRcFinalConst[1]");
-            else                 snprintf(regStr, sizeof(regStr), "uRcStageC1[%d]", stageIdx);
-            break;
-        case 0x3u: snprintf(regStr, sizeof(regStr), "fogReg");  break;
-        case 0x4u: snprintf(regStr, sizeof(regStr), "v0");      break;
-        case 0x5u: snprintf(regStr, sizeof(regStr), "v1");      break;
-        case 0x8u: snprintf(regStr, sizeof(regStr), "t0");      break;
-        case 0x9u: snprintf(regStr, sizeof(regStr), "t1");      break;
-        case 0xAu: snprintf(regStr, sizeof(regStr), "t2");      break;
-        case 0xBu: snprintf(regStr, sizeof(regStr), "t3");      break;
-        case 0xCu: snprintf(regStr, sizeof(regStr), "r0");      break;
-        case 0xDu: snprintf(regStr, sizeof(regStr), "r1");      break;
-        case 0xEu: snprintf(regStr, sizeof(regStr), "sumReg");  break;
-        case 0xFu: snprintf(regStr, sizeof(regStr), "efProd");  break;
-        default:   snprintf(regStr, sizeof(regStr), "float4(0.0f,0.0f,0.0f,0.0f)"); break;
-    }
-
-    char compStr[80];
-    if (isAlpha) {
-        snprintf(compStr, sizeof(compStr), "(%s).%s", regStr, chan ? "a" : "b");
-    } else {
-        snprintf(compStr, sizeof(compStr), "(%s).%s", regStr, chan ? "aaa" : "rgb");
-    }
-
-    switch (map) {
-        case 0u: // UNSIGNED_IDENTITY: max(0, x)
-            snprintf(outBuf, outSize, "max(%s, 0.0f)", compStr);
-            break;
-        case 1u: // UNSIGNED_INVERT: 1 - clamp(x, 0, 1)
-            snprintf(outBuf, outSize, "(1.0f - saturate(%s))", compStr);
-            break;
-        case 2u: // EXPAND_NORMAL: 2 * max(0, x) - 1
-            snprintf(outBuf, outSize, "(2.0f * max(%s, 0.0f) - 1.0f)", compStr);
-            break;
-        case 3u: // EXPAND_NEGATE: 1 - 2 * max(0, x)
-            snprintf(outBuf, outSize, "(1.0f - 2.0f * max(%s, 0.0f))", compStr);
-            break;
-        case 4u: // HALFBIAS_NORMAL: max(0, x) - 0.5
-            snprintf(outBuf, outSize, "(max(%s, 0.0f) - 0.5f)", compStr);
-            break;
-        case 5u: // HALFBIAS_NEGATE: 0.5 - max(0, x)
-            snprintf(outBuf, outSize, "(0.5f - max(%s, 0.0f))", compStr);
-            break;
-        case 6u: // SIGNED_IDENTITY: x
-            snprintf(outBuf, outSize, "(%s)", compStr);
-            break;
-        case 7u: // SIGNED_NEGATE: -x
-            snprintf(outBuf, outSize, "(-(%s))", compStr);
-            break;
-        default:
-            snprintf(outBuf, outSize, "(%s)", compStr);
-            break;
-    }
-}
-
-static const char* GetRcDestRegName(uint32_t dstNibble) {
-    switch (dstNibble & 0x0Fu) {
-        case 0x4u: return "v0";
-        case 0x5u: return "v1";
-        case 0x8u: return "t0";
-        case 0x9u: return "t1";
-        case 0xAu: return "t2";
-        case 0xBu: return "t3";
-        case 0xCu: return "r0";
-        case 0xDu: return "r1";
-        default:   return nullptr;
-    }
-}
-
-static void FormatRcScaleBias(const char* expr, uint32_t outWord, char* outBuf, size_t outSize) {
-    uint32_t scale = (outWord >> 15) & 0x03u;
-    uint32_t bias  = (outWord >> 17) & 0x01u;
-    const char* scaleMul = "";
-    if (scale == 1u)      scaleMul = " * 2.0f";
-    else if (scale == 2u) scaleMul = " * 4.0f";
-    else if (scale == 3u) scaleMul = " * 0.5f";
-
-    if (bias != 0u) {
-        snprintf(outBuf, outSize, "clamp(((%s) - 0.5f)%s, -1.0f, 1.0f)", expr, scaleMul);
-    } else {
-        snprintf(outBuf, outSize, "clamp((%s)%s, -1.0f, 1.0f)", expr, scaleMul);
-    }
-}
-
-// Decompiles the active NV2A Register Combiner state in _D3D__RenderState[0..56, 136] into HLSL ps_4_0
-static std::string DecompileRegisterCombinersToHLSL(const uint32_t* xboxRS) {
-    uint32_t psTexModes = xboxRS[XBOX_D3DRS_PSTEXTUREMODES];
-    uint32_t dotMapping = xboxRS[XBOX_D3DRS_PSDOTMAPPING];
-    uint32_t inputTex   = xboxRS[XBOX_D3DRS_PSINPUTTEXTURE];
-    uint32_t cmpMode    = xboxRS[XBOX_D3DRS_PSCOMPAREMODE];
-    uint32_t combCount  = xboxRS[XBOX_D3DRS_PSCOMBINERCOUNT] & 0x0Fu;
-    if (combCount == 0u) combCount = 1u;
-    if (combCount > 8u)  combCount = 8u;
-    bool muxMsb = (xboxRS[XBOX_D3DRS_PSCOMBINERCOUNT] & 0x0100u) != 0u;
-
-    std::string s;
-    s.reserve(8192);
-    s += "cbuffer PerDrawCB : register(b0) {\n"
-         "    float4 uWvpRow0; float4 uWvpRow1; float4 uWvpRow2; float4 uWvpRow3;\n"
-         "    float4 uViewport; float4 uTFactor;\n"
-         "    uint4  uStage0Ops; uint4 uStage0Alpha;\n"
-         "    uint4  uStage1Ops; uint4 uStage1Alpha;\n"
-         "    uint4  uStage2Ops; uint4 uStage2Alpha;\n"
-         "    uint4  uStage3Ops; uint4  uStage3Alpha;\n"
-         "    uint4  uFlags; float4 uAlphaTest;\n"
-         "    float4 uUvScale01; float4 uUvScale23;\n"
-         "    float4 uBumpParams; float4 uFogParams; float4 uFogColor;\n"
-         "    float4 uPsConst0; float4 uPsConst1; float4 uPsConst2; float4 uPsConst3;\n"
-         "    float4 uPsConst4; float4 uPsConst5; float4 uPsConst6; float4 uPsConst7;\n"
-         "    float4 uWorldRow0; float4 uWorldRow1; float4 uWorldRow2; float4 uWorldRow3;\n"
-         "    uint4  uLightCount;\n"
-         "    float4 uLightPosType[8]; float4 uLightDirRange[8];\n"
-         "    float4 uLightAttenSpot[8]; float4 uLightSpotParams[8];\n"
-         "    float4 uLightDiffuse[8]; float4 uLightAmbient[8]; float4 uLightSpecular[8];\n"
-         "    float4 uEyePosWorld; float4 uMatBackDiffAmb; float4 uMatBackSpec;\n"
-         "    uint4  uStageColorKeyOp; float4 uStageColorKeyColor[4];\n"
-         "    uint4  uStageColorSign; float4 uBumpLuminance;\n"
-         "    float4 uScissorRects[8];\n"
-         "    float4 uRcStageC0[8]; float4 uRcStageC1[8]; float4 uRcFinalConst[2];\n"
-         "};\n"
-         "Texture2D    tex0 : register(t0); Texture2D    tex1 : register(t1);\n"
-         "Texture2D    tex2 : register(t2); Texture2D    tex3 : register(t3);\n"
-         "TextureCube  cubeTex0 : register(t4); TextureCube  cubeTex1 : register(t5);\n"
-         "TextureCube  cubeTex2 : register(t6); TextureCube  cubeTex3 : register(t7);\n"
-         "Texture3D    volTex0  : register(t8); Texture3D    volTex1  : register(t9);\n"
-         "Texture3D    volTex2  : register(t10); Texture3D   volTex3  : register(t11);\n"
-         "Texture2D    gammaLutTex : register(t12);\n"
-         "SamplerState smp0 : register(s0); SamplerState smp1 : register(s1);\n"
-         "SamplerState smp2 : register(s2); SamplerState smp3 : register(s3);\n"
-         "struct PSIn {\n"
-         "    float4 pos    : SV_POSITION;\n"
-         "    float4 color  : COLOR0;\n"
-         "    float4 uv0    : TEXCOORD0;\n"
-         "    float4 uv1    : TEXCOORD1;\n"
-         "    float4 uv2    : TEXCOORD2;\n"
-         "    float4 uv3    : TEXCOORD3;\n"
-         "    float2 eyeDist: TEXCOORD4;\n"
-         "    float3 norm   : TEXCOORD5;\n"
-         "};\n"
-         "float4 SampleStageTex(uint stageIdx, Texture2D tex2d, TextureCube texCube, Texture3D texVol, SamplerState smp, float4 uv, bool isCube, bool isVol) {\n"
-         "    float4 c;\n"
-         "    if (isCube) { c = texCube.Sample(smp, uv.xyz); }\n"
-         "    else if (isVol) { c = texVol.Sample(smp, uv.xyz); }\n"
-         "    else { c = tex2d.Sample(smp, uv.xy); }\n"
-         "    uint ckOp = uStageColorKeyOp[stageIdx];\n"
-         "    if (ckOp != 0u) {\n"
-         "        float4 ckCol = uStageColorKeyColor[stageIdx];\n"
-         "        bool matchRgb = all(abs(c.rgb - ckCol.rgb) < (1.5f / 255.0f));\n"
-         "        if (ckOp == 1u && matchRgb) c.a = 0.0f;\n"
-         "        else if (ckOp == 2u && matchRgb && abs(c.a - ckCol.a) < (1.5f / 255.0f)) c = 0.0f;\n"
-         "        else if (ckOp == 3u && matchRgb) discard;\n"
-         "    }\n"
-         "    if (((uFlags.y >> (16u + stageIdx)) & 1u) != 0u && c.a < (0.5f / 255.0f)) discard;\n"
-         "    uint cSign = uStageColorSign[stageIdx];\n"
-         "    if (cSign != 0u) {\n"
-         "        if ((cSign & 0x20u) != 0u) c.r = c.r * 2.0f - 1.0f;\n"
-         "        if ((cSign & 0x40u) != 0u) c.g = c.g * 2.0f - 1.0f;\n"
-         "        if ((cSign & 0x80u) != 0u) c.b = c.b * 2.0f - 1.0f;\n"
-         "        if ((cSign & 0x10u) != 0u) c.a = c.a * 2.0f - 1.0f;\n"
-         "    }\n"
-         "    return c;\n"
-         "}\n"
-         "float3 MapDotVec(float4 t, uint dm) {\n"
-         "    if (dm == 0u) return t.rgb;\n"
-         "    if (dm == 1u) return (t.rgb - 128.0f / 255.0f) * (255.0f / 127.0f);\n"
-         "    return t.rgb * 2.0f - 1.0f;\n"
-         "}\n"
-         "float4 PSMain(PSIn input) : SV_TARGET {\n"
-         "    uint scissorCount = (uFlags.x >> 4u) & 0x0Fu;\n"
-         "    if (scissorCount > 0u) {\n"
-         "        bool insideAny = false;\n"
-         "        [unroll] for (uint si = 0u; si < 8u; ++si) {\n"
-         "            if (si < scissorCount) {\n"
-         "                float4 sr = uScissorRects[si];\n"
-         "                if (input.pos.x >= sr.x && input.pos.x < sr.z && input.pos.y >= sr.y && input.pos.y < sr.w) insideAny = true;\n"
-         "            }\n"
-         "        }\n"
-         "        if (((uFlags.x & 4u) != 0u) ? insideAny : !insideAny) discard;\n"
-         "    }\n"
-         "    uint texMask  = uFlags.y & 0x0Fu;\n"
-         "    uint cubeMask = (uFlags.y >> 4u) & 0x0Fu;\n"
-         "    uint projMask = (uFlags.y >> 8u) & 0x0Fu;\n"
-         "    uint volMask  = (uFlags.y >> 12u) & 0x0Fu;\n"
-         "    float4 uv0 = input.uv0, uv1 = input.uv1, uv2 = input.uv2, uv3 = input.uv3;\n"
-         "    float4 t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, t3 = 0.0f;\n"
-         "    float3 dotVec = 0.0f;\n";
-
-    char line[512];
-    // 1. Emit 4-stage NV2A Texture Addressing Modes (PSTextureModes)
-    for (int st = 0; st < 4; ++st) {
-        uint32_t tm = (psTexModes >> (st * 5)) & 0x1Fu;
-        uint32_t inSt = 0u;
-        if (st == 1)      inSt = 0u;
-        else if (st == 2) inSt = (inputTex >> 16) & 1u;
-        else if (st == 3) inSt = (inputTex >> 20) & 3u;
-        if (inSt >= (uint32_t)st) inSt = (st > 0) ? (uint32_t)(st - 1) : 0u;
-        uint32_t dm = (st > 0) ? ((dotMapping >> ((st - 1) * 4)) & 0x07u) : 0u;
-        uint32_t cm = (cmpMode >> (st * 4)) & 0x0Fu;
-
-        switch (tm) {
-            case 0x00u: // PS_TEXTUREMODES_NONE
-                snprintf(line, sizeof(line), "    t%d = float4(0.0f, 0.0f, 0.0f, 0.0f);\n", st);
-                s += line;
-                break;
-            case 0x01u: // PS_TEXTUREMODES_PROJECT2D
-            case 0x02u: // PS_TEXTUREMODES_PROJECT3D
-            case 0x03u: // PS_TEXTUREMODES_CUBEMAP
-                snprintf(line, sizeof(line),
-                    "    if ((texMask & %uu) != 0u) {\n"
-                    "        float4 uvs = uv%d;\n"
-                    "        if ((projMask & %uu) != 0u && abs(uvs.w) > 1e-5f) uvs.xyz /= uvs.w;\n"
-                    "        t%d = SampleStageTex(%uu, tex%d, cubeTex%d, volTex%d, smp%d, uvs, (cubeMask & %uu) != 0u || %uu == 3u, (volMask & %uu) != 0u || %uu == 2u);\n"
-                    "    }\n",
-                    1u << st, st, 1u << st, st, st, st, st, st, st, 1u << st, tm, 1u << st, tm);
-                s += line;
-                break;
-            case 0x04u: // PS_TEXTUREMODES_PASSTHRU
-                snprintf(line, sizeof(line), "    t%d = saturate(uv%d);\n", st, st);
-                s += line;
-                break;
-            case 0x05u: // PS_TEXTUREMODES_CLIPPLANE
-                snprintf(line, sizeof(line),
-                    "    if (((%uu & 1u) != 0u ? (uv%d.x < 0.0f) : (uv%d.x >= 0.0f)) ||\n"
-                    "        ((%uu & 2u) != 0u ? (uv%d.y < 0.0f) : (uv%d.y >= 0.0f)) ||\n"
-                    "        ((%uu & 4u) != 0u ? (uv%d.z < 0.0f) : (uv%d.z >= 0.0f)) ||\n"
-                    "        ((%uu & 8u) != 0u ? (uv%d.w < 0.0f) : (uv%d.w >= 0.0f))) discard;\n",
-                    cm, st, st, cm, st, st, cm, st, st, cm, st, st);
-                s += line;
-                break;
-            case 0x06u: // PS_TEXTUREMODES_BUMPENVMAP
-            case 0x07u: // PS_TEXTUREMODES_BUMPENVMAPLUMINANCE
-                snprintf(line, sizeof(line),
-                    "    if ((texMask & %uu) != 0u) {\n"
-                    "        float2 bd = MapDotVec(t%u, %uu).xy;\n"
-                    "        float4 buv = uv%d;\n"
-                    "        buv.xy += float2(bd.x * uBumpParams.x + bd.y * uBumpParams.z, bd.x * uBumpParams.y + bd.y * uBumpParams.w);\n"
-                    "        t%d = SampleStageTex(%uu, tex%d, cubeTex%d, volTex%d, smp%d, buv, (cubeMask & %uu) != 0u, (volMask & %uu) != 0u);\n"
-                    "        if (%uu == 7u) t%d.rgb *= saturate(t%u.b * uBumpLuminance.x + uBumpLuminance.y);\n"
-                    "    }\n",
-                    1u << st, inSt, dm, st, st, st, st, st, st, st, 1u << st, 1u << st, tm, st, inSt);
-                s += line;
-                break;
-            case 0x0Fu: // PS_TEXTUREMODES_DPNDNT_AR (texreg2ar)
-                snprintf(line, sizeof(line),
-                    "    if ((texMask & %uu) != 0u) t%d = SampleStageTex(%uu, tex%d, cubeTex%d, volTex%d, smp%d, float4(t%u.ar, 0.0f, 0.0f), false, false);\n",
-                    1u << st, st, st, st, st, st, st, inSt);
-                s += line;
-                break;
-            case 0x10u: // PS_TEXTUREMODES_DPNDNT_GB (texreg2gb)
-                snprintf(line, sizeof(line),
-                    "    if ((texMask & %uu) != 0u) t%d = SampleStageTex(%uu, tex%d, cubeTex%d, volTex%d, smp%d, float4(t%u.gb, 0.0f, 0.0f), false, false);\n",
-                    1u << st, st, st, st, st, st, st, inSt);
-                s += line;
-                break;
-            case 0x11u: // PS_TEXTUREMODES_DOTPRODUCT (texm3x2pad / texm3x3pad)
-                snprintf(line, sizeof(line),
-                    "    { float dp = dot(uv%d.xyz, MapDotVec(t%u, %uu)); dotVec.%s = dp; t%d = dp.xxxx; }\n",
-                    st, inSt, dm, (st == 1) ? "x" : ((st == 2) ? "y" : "z"), st);
-                s += line;
-                break;
-            case 0x09u: // PS_TEXTUREMODES_DOT_ST (texm3x2tex)
-                snprintf(line, sizeof(line),
-                    "    { float dp = dot(uv%d.xyz, MapDotVec(t%u, %uu)); dotVec.y = dp;\n"
-                    "      if ((texMask & %uu) != 0u) t%d = SampleStageTex(%uu, tex%d, cubeTex%d, volTex%d, smp%d, float4(dotVec.xy, 0.0f, 0.0f), false, false); }\n",
-                    st, inSt, dm, 1u << st, st, st, st, st, st, st);
-                s += line;
-                break;
-            case 0x0Du: // PS_TEXTUREMODES_DOT_STR_3D
-            case 0x0Eu: // PS_TEXTUREMODES_DOT_STR_CUBE (texm3x3tex)
-                snprintf(line, sizeof(line),
-                    "    { float dp = dot(uv%d.xyz, MapDotVec(t%u, %uu)); dotVec.z = dp;\n"
-                    "      if ((texMask & %uu) != 0u) t%d = SampleStageTex(%uu, tex%d, cubeTex%d, volTex%d, smp%d, float4(dotVec.xyz, 1.0f), (cubeMask & %uu) != 0u || %uu == 14u, (volMask & %uu) != 0u || %uu == 13u); }\n",
-                    st, inSt, dm, 1u << st, st, st, st, st, st, st, 1u << st, tm, 1u << st, tm);
-                s += line;
-                break;
-            case 0x0Bu: // PS_TEXTUREMODES_DOT_RFLCT_DIFF
-            case 0x0Cu: // PS_TEXTUREMODES_DOT_RFLCT_SPEC (texm3x3vspec)
-            case 0x12u: // PS_TEXTUREMODES_DOT_RFLCT_SPEC_CONST (texm3x3spec)
-                snprintf(line, sizeof(line),
-                    "    { float dp = dot(uv%d.xyz, MapDotVec(t%u, %uu));\n"
-                    "      if (%d == 2) dotVec.y = dp; else dotVec.z = dp;\n"
-                    "      float3 Np = (dot(dotVec, dotVec) > 1e-6f) ? normalize(dotVec) : float3(0.0f, 0.0f, 1.0f);\n"
-                    "      float3 Vw = (%uu == 18u) ? uRcStageC0[0].xyz : float3(uv1.w, uv2.w, uv3.w);\n"
-                    "      float3 R  = (%uu == 11u) ? Np : ((dot(Vw, Vw) > 1e-6f) ? reflect(-normalize(Vw), Np) : Np);\n"
-                    "      if ((texMask & %uu) != 0u) t%d = ((cubeMask & %uu) != 0u) ? cubeTex%d.Sample(smp%d, R) : tex%d.Sample(smp%d, float2(R.x * 0.5f + 0.5f, 0.5f - R.y * 0.5f)); }\n",
-                    st, inSt, dm, st, tm, tm, 1u << st, st, 1u << st, st, st, st, st);
-                s += line;
-                break;
-            default:
-                snprintf(line, sizeof(line),
-                    "    if ((texMask & %uu) != 0u) t%d = SampleStageTex(%uu, tex%d, cubeTex%d, volTex%d, smp%d, uv%d, (cubeMask & %uu) != 0u, (volMask & %uu) != 0u);\n",
-                    1u << st, st, st, st, st, st, st, st, 1u << st, 1u << st);
-                s += line;
-                break;
-        }
-    }
-
-    // 2. Initialize Register Combiner registers
-    s += "    float fogFactor = 1.0f;\n"
-         "    if (uFogParams.x > 0.5f && (uFlags.x & 1u) == 0u) {\n"
-         "        float d = input.eyeDist.x;\n"
-         "        if (uFogParams.x > 3.5f) fogFactor = saturate(d);\n"
-         "        else if (uFogParams.x > 2.5f) fogFactor = saturate((uFogParams.z - d) / max(uFogParams.z - uFogParams.y, 0.001f));\n"
-         "        else if (uFogParams.x < 1.5f) fogFactor = saturate(exp(-d * uFogParams.w));\n"
-         "        else { float df = d * uFogParams.w; fogFactor = saturate(exp(-(df * df))); }\n"
-         "    }\n"
-         "    float4 fogReg = float4(uFogColor.rgb, fogFactor);\n"
-         "    float4 v0 = input.color;\n"
-         "    float4 v1 = float4(input.norm, 1.0f);\n"
-         "    float4 r0 = float4(t0.a, t0.a, t0.a, t0.a);\n"
-         "    float4 r1 = float4(0.0f, 0.0f, 0.0f, 0.0f);\n"
-         "    float4 sumReg = float4(0.0f, 0.0f, 0.0f, 0.0f);\n"
-         "    float4 efProd = float4(0.0f, 0.0f, 0.0f, 0.0f);\n";
-
-    // 3. Emit General Combiner Stages 0 .. combCount-1
-    for (uint32_t st = 0; st < combCount; ++st) {
-        uint32_t rgbIn    = xboxRS[XBOX_D3DRS_PSRGBINPUTS0    + st];
-        uint32_t alphaIn  = xboxRS[XBOX_D3DRS_PSALPHAINPUTS0  + st];
-        uint32_t rgbOut   = xboxRS[XBOX_D3DRS_PSRGBOUTPUTS0   + st];
-        uint32_t alphaOut = xboxRS[XBOX_D3DRS_PSALPHAOUTPUTS0 + st];
-
-        char cA[160], cB[160], cC[160], cD[160];
-        FormatRcInputExpr((uint8_t)((rgbIn >> 24) & 0xFFu), false, (int)st, false, cA, sizeof(cA));
-        FormatRcInputExpr((uint8_t)((rgbIn >> 16) & 0xFFu), false, (int)st, false, cB, sizeof(cB));
-        FormatRcInputExpr((uint8_t)((rgbIn >> 8)  & 0xFFu), false, (int)st, false, cC, sizeof(cC));
-        FormatRcInputExpr((uint8_t)( rgbIn        & 0xFFu), false, (int)st, false, cD, sizeof(cD));
-
-        char aA[160], aB[160], aC[160], aD[160];
-        FormatRcInputExpr((uint8_t)((alphaIn >> 24) & 0xFFu), true, (int)st, false, aA, sizeof(aA));
-        FormatRcInputExpr((uint8_t)((alphaIn >> 16) & 0xFFu), true, (int)st, false, aB, sizeof(aB));
-        FormatRcInputExpr((uint8_t)((alphaIn >> 8)  & 0xFFu), true, (int)st, false, aC, sizeof(aC));
-        FormatRcInputExpr((uint8_t)( alphaIn        & 0xFFu), true, (int)st, false, aD, sizeof(aD));
-
-        bool abDot  = ((rgbOut >> 12) & 1u) != 0u;
-        bool cdDot  = ((rgbOut >> 13) & 1u) != 0u;
-        bool rgbMux = ((rgbOut >> 14) & 1u) != 0u;
-        bool alpMux = ((alphaOut >> 14) & 1u) != 0u;
-
-        s += "    {\n";
-        snprintf(line, sizeof(line), "        float3 rgbA = %s, rgbB = %s, rgbC = %s, rgbD = %s;\n", cA, cB, cC, cD);
-        s += line;
-        snprintf(line, sizeof(line), "        float  alpA = %s, alpB = %s, alpC = %s, alpD = %s;\n", aA, aB, aC, aD);
-        s += line;
-        snprintf(line, sizeof(line), "        float3 rawAB_rgb = %s;\n", abDot ? "dot(rgbA, rgbB).xxx" : "(rgbA * rgbB)");
-        s += line;
-        snprintf(line, sizeof(line), "        float3 rawCD_rgb = %s;\n", cdDot ? "dot(rgbC, rgbD).xxx" : "(rgbC * rgbD)");
-        s += line;
-        if (rgbMux) {
-            snprintf(line, sizeof(line), "        float3 rawSum_rgb = (%s) ? rawCD_rgb : rawAB_rgb;\n",
-                     muxMsb ? "(r0.a >= 0.5f)" : "(((int)(saturate(r0.a) * 255.0f + 0.5f) & 1) != 0)");
-        } else {
-            snprintf(line, sizeof(line), "        float3 rawSum_rgb = rawAB_rgb + rawCD_rgb;\n");
-        }
-        s += line;
-
-        s += "        float rawAB_a = alpA * alpB;\n"
-             "        float rawCD_a = alpC * alpD;\n";
-        if (alpMux) {
-            snprintf(line, sizeof(line), "        float rawSum_a = (%s) ? rawCD_a : rawAB_a;\n",
-                     muxMsb ? "(r0.a >= 0.5f)" : "(((int)(saturate(r0.a) * 255.0f + 0.5f) & 1) != 0)");
-        } else {
-            snprintf(line, sizeof(line), "        float rawSum_a = rawAB_a + rawCD_a;\n");
-        }
-        s += line;
-
-        char scaledAB_rgb[128], scaledCD_rgb[128], scaledSum_rgb[128];
-        FormatRcScaleBias("rawAB_rgb",  rgbOut, scaledAB_rgb,  sizeof(scaledAB_rgb));
-        FormatRcScaleBias("rawCD_rgb",  rgbOut, scaledCD_rgb,  sizeof(scaledCD_rgb));
-        FormatRcScaleBias("rawSum_rgb", rgbOut, scaledSum_rgb, sizeof(scaledSum_rgb));
-
-        char scaledAB_a[128], scaledCD_a[128], scaledSum_a[128];
-        FormatRcScaleBias("rawAB_a",  alphaOut, scaledAB_a,  sizeof(scaledAB_a));
-        FormatRcScaleBias("rawCD_a",  alphaOut, scaledCD_a,  sizeof(scaledCD_a));
-        FormatRcScaleBias("rawSum_a", alphaOut, scaledSum_a, sizeof(scaledSum_a));
-
-        if (const char* dst = GetRcDestRegName(rgbOut & 0xFu)) {
-            snprintf(line, sizeof(line), "        %s.rgb = %s;\n", dst, scaledAB_rgb);
-            s += line;
-        }
-        if (const char* dst = GetRcDestRegName((rgbOut >> 4) & 0xFu)) {
-            snprintf(line, sizeof(line), "        %s.rgb = %s;\n", dst, scaledCD_rgb);
-            s += line;
-        }
-        if (const char* dst = GetRcDestRegName((rgbOut >> 8) & 0xFu)) {
-            snprintf(line, sizeof(line), "        %s.rgb = %s;\n", dst, scaledSum_rgb);
-            s += line;
-        }
-
-        if (const char* dst = GetRcDestRegName(alphaOut & 0xFu)) {
-            snprintf(line, sizeof(line), "        %s.a = %s;\n", dst, scaledAB_a);
-            s += line;
-        }
-        if (const char* dst = GetRcDestRegName((alphaOut >> 4) & 0xFu)) {
-            snprintf(line, sizeof(line), "        %s.a = %s;\n", dst, scaledCD_a);
-            s += line;
-        }
-        if (const char* dst = GetRcDestRegName((alphaOut >> 8) & 0xFu)) {
-            snprintf(line, sizeof(line), "        %s.a = %s;\n", dst, scaledSum_a);
-            s += line;
-        }
-        s += "    }\n";
-    }
-
-    // 4. Emit Final Combiner (PSFinalCombinerInputsABCD = RS[8], PSFinalCombinerInputsEFG = RS[9])
-    uint32_t fcABCD = xboxRS[XBOX_D3DRS_PSFINALCOMBINERINPUTSABCD];
-    uint32_t fcEFG  = xboxRS[XBOX_D3DRS_PSFINALCOMBINERINPUTSEFG];
-    if (fcABCD != 0u || fcEFG != 0u) {
-        bool clampSum = (fcEFG & 0x80u) != 0u;
-        snprintf(line, sizeof(line), "    sumReg = %s;\n", clampSum ? "saturate(r0 + v1)" : "(r0 + v1)");
-        s += line;
-
-        char fcE[160], fcF[160], fcA[160], fcB[160], fcC[160], fcD[160], fcG[160];
-        FormatRcInputExpr((uint8_t)((fcEFG  >> 24) & 0xFFu), false, 8, true, fcE, sizeof(fcE));
-        FormatRcInputExpr((uint8_t)((fcEFG  >> 16) & 0xFFu), false, 8, true, fcF, sizeof(fcF));
-        snprintf(line, sizeof(line), "    efProd = float4((%s) * (%s), 1.0f);\n", fcE, fcF);
-        s += line;
-
-        FormatRcInputExpr((uint8_t)((fcABCD >> 24) & 0xFFu), false, 8, true, fcA, sizeof(fcA));
-        FormatRcInputExpr((uint8_t)((fcABCD >> 16) & 0xFFu), false, 8, true, fcB, sizeof(fcB));
-        FormatRcInputExpr((uint8_t)((fcABCD >> 8)  & 0xFFu), false, 8, true, fcC, sizeof(fcC));
-        FormatRcInputExpr((uint8_t)( fcABCD        & 0xFFu), false, 8, true, fcD, sizeof(fcD));
-        FormatRcInputExpr((uint8_t)((fcEFG  >> 8)  & 0xFFu), true,  8, true, fcG, sizeof(fcG));
-
-        snprintf(line, sizeof(line),
-            "    float3 finalA = %s, finalB = %s, finalC = %s, finalD = %s;\n"
-            "    float4 current;\n"
-            "    current.rgb = saturate(finalA * finalB + (1.0f - finalA) * finalC + finalD);\n"
-            "    current.a   = saturate(%s);\n",
-            fcA, fcB, fcC, fcD, fcG);
-        s += line;
-    } else {
-        s += "    float4 current = saturate(r0);\n";
-    }
-
-    // 5. Alpha Test, Fog (if not already consumed in final combiner), and Gamma Ramp LUT
-    bool fcUsesFog =
-        (((fcABCD >> 24) & 0xFu) == 0x3u) ||
-        (((fcABCD >> 16) & 0xFu) == 0x3u) ||
-        (((fcABCD >> 8)  & 0xFu) == 0x3u) ||
-        (( fcABCD        & 0xFu) == 0x3u) ||
-        (((fcEFG  >> 8)  & 0xFu) == 0x3u);
-
-    s += "    if (uFlags.z != 0u) {\n"
-         "        uint fn = (uint)uAlphaTest.x; float refVal = uAlphaTest.y; bool passAlpha = true;\n"
-         "        if (fn == 1u) passAlpha = false;\n"
-         "        else if (fn == 2u) passAlpha = (current.a < refVal - 0.001f);\n"
-         "        else if (fn == 3u) passAlpha = (abs(current.a - refVal) < 0.004f);\n"
-         "        else if (fn == 4u) passAlpha = (current.a <= refVal + 0.001f);\n"
-         "        else if (fn == 5u) passAlpha = (current.a > refVal + 0.001f);\n"
-         "        else if (fn == 6u) passAlpha = (abs(current.a - refVal) >= 0.004f);\n"
-         "        else if (fn == 7u) passAlpha = (current.a >= refVal - 0.001f);\n"
-         "        if (!passAlpha) discard;\n"
-         "    }\n";
-
-    if (!fcUsesFog) {
-        s += "    if (uFogParams.x > 0.5f && (uFlags.x & 1u) == 0u) {\n"
-             "        if (uFogColor.w > 0.5f) current.rgb *= fogFactor;\n"
-             "        else current.rgb = lerp(current.rgb, uFogColor.rgb, 1.0f - fogFactor);\n"
-             "    }\n";
-    }
-
-    s += "    if ((uFlags.x & 2u) != 0u) {\n"
-         "        int3 lutIdx = clamp(int3(saturate(current.rgb) * 255.0f + 0.5f), 0, 255);\n"
-         "        current.rgb = float3(gammaLutTex.Load(int3(lutIdx.r, 0, 0)).r,\n"
-         "                             gammaLutTex.Load(int3(lutIdx.g, 0, 0)).g,\n"
-         "                             gammaLutTex.Load(int3(lutIdx.b, 0, 0)).b);\n"
-         "    } else if (uAlphaTest.z > 0.1f && (abs(uAlphaTest.z - 1.0f) > 0.01f || abs(uAlphaTest.w - 1.0f) > 0.01f)) {\n"
-         "        current.rgb = pow(max(current.rgb, 0.0f), 1.0f / uAlphaTest.z) * uAlphaTest.w;\n"
-         "    }\n"
-         "    return current;\n"
-         "}\n";
-    return s;
-}
-
-static bool IsRegisterCombinerStateUnmodifiedFromDef(const uint32_t* xboxRS, const XboxPixelShaderDef* pDef) {
-    if (!pDef) return false;
-    const uint32_t* dwords = reinterpret_cast<const uint32_t*>(pDef);
-    for (int i = 0; i <= 9; ++i)   if (xboxRS[i] != dwords[i]) return false;
-    for (int i = 26; i <= 42; ++i) if (xboxRS[i] != dwords[i]) return false;
-    for (int i = 45; i <= 53; ++i) if (xboxRS[i] != dwords[i]) return false;
-    if (xboxRS[XBOX_D3DRS_PSTEXTUREMODES] != dwords[54]) return false;
-    if (xboxRS[55] != dwords[55] || xboxRS[56] != dwords[56]) return false;
-    return true;
-}
-
-ID3D11PixelShader* GetActiveRegisterCombinerPS() {
-    if (!g_d3dDevice) return g_ps;
-    const uint32_t* xboxRS = reinterpret_cast<const uint32_t*>(ADDR_D3D_RENDERSTATE);
-
-    if (g_currentPsHandle != 0) {
-        int32_t engType = -1;
-        const XboxPixelShaderDef* pDef = GetHandlePSDef(g_currentPsHandle, &engType);
-        if (engType >= 0 && engType < 28 && IsRegisterCombinerStateUnmodifiedFromDef(xboxRS, pDef)) {
-            return GetPixelShaderPermutation(static_cast<uint32_t>(engType + 1));
-        }
-    } else if ((xboxRS[XBOX_D3DRS_PSCOMBINERCOUNT] & 0x0Fu) == 0u) {
-        return GetPixelShaderPermutation(0u);
-    }
-
-    // Compute 64-bit FNV-1a hash of the active NV2A Register Combiner structure in _D3D__RenderState
-    uint64_t h = 14695981039346656037ULL;
-    auto mix = [&](uint32_t v) {
-        h ^= v;
-        h *= 1099511628211ULL;
-    };
-    uint32_t combCount = xboxRS[XBOX_D3DRS_PSCOMBINERCOUNT] & 0x0Fu;
-    if (combCount == 0u) combCount = 1u;
-    if (combCount > 8u)  combCount = 8u;
-    for (uint32_t i = 0; i < combCount; ++i) {
-        mix(xboxRS[XBOX_D3DRS_PSALPHAINPUTS0  + i]);
-        mix(xboxRS[XBOX_D3DRS_PSALPHAOUTPUTS0 + i]);
-        mix(xboxRS[XBOX_D3DRS_PSRGBINPUTS0    + i]);
-        mix(xboxRS[XBOX_D3DRS_PSRGBOUTPUTS0   + i]);
-    }
-    mix(xboxRS[XBOX_D3DRS_PSFINALCOMBINERINPUTSABCD]);
-    mix(xboxRS[XBOX_D3DRS_PSFINALCOMBINERINPUTSEFG]);
-    mix(xboxRS[XBOX_D3DRS_PSCOMPAREMODE]);
-    mix(xboxRS[XBOX_D3DRS_PSCOMBINERCOUNT]);
-    mix(xboxRS[XBOX_D3DRS_PSTEXTUREMODES]);
-    mix(xboxRS[XBOX_D3DRS_PSDOTMAPPING]);
-    mix(xboxRS[XBOX_D3DRS_PSINPUTTEXTURE]);
-
-    for (size_t i = 0; i < g_rcPsCache.size(); ++i) {
-        if (g_rcPsCache[i].hash == h) {
-            return g_rcPsCache[i].ps;
-        }
-    }
-
-    std::string hlsl = DecompileRegisterCombinersToHLSL(xboxRS);
-    ID3DBlob* psBlob  = nullptr;
-    ID3DBlob* errBlob = nullptr;
-    ID3D11PixelShader* compiledPS = nullptr;
-    HRESULT hr = D3DCompile(
-        hlsl.data(), hlsl.size(), "XboxRegCombinerPS",
-        nullptr, nullptr, "PSMain", "ps_4_0",
-        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &errBlob);
-    if (SUCCEEDED(hr) && psBlob) {
-        g_d3dDevice->CreatePixelShader(
-            psBlob->GetBufferPointer(), psBlob->GetBufferSize(),
-            nullptr, &compiledPS);
-        psBlob->Release();
-    }
-    if (errBlob) errBlob->Release();
-    if (!compiledPS) compiledPS = g_ps;
-    g_rcPsCache.push_back({ h, compiledPS });
-    return compiledPS;
-}
-
 struct XboxDeclElem {
     uint8_t  stream;
     uint8_t  reg;
@@ -905,7 +285,10 @@ static void FormatXvuSrcOperand(
 }
 
 // Decompiles 128-bit Xbox NV2A .xvu vertex shader microcode into D3D11 HLSL (vs_4_0)
-static std::string DecompileXvuToHLSL(const XboxDeclElem* elems, uint32_t numElems, const DWORD* pFunction) {
+static std::string DecompileXvuToHLSL(
+    const XboxDeclElem* elems, uint32_t numElems, const DWORD* pFunction,
+    const char* relPath = nullptr, uintptr_t declVa = 0)
+{
     uint32_t count = (pFunction[0] >> 16) & 0xFFFFu;
     bool hasC58     = false;
     bool writesOD1  = false;
@@ -934,6 +317,17 @@ static std::string DecompileXvuToHLSL(const XboxDeclElem* elems, uint32_t numEle
 
     std::string s;
     s.reserve(8192);
+    if (relPath && relPath[0]) {
+        char hdr[512];
+        snprintf(hdr, sizeof(hdr),
+            "// ============================================================================\n"
+            "// Decompiled Xbox NV2A Vertex Shader (.xvu -> D3D11 HLSL vs_4_0)\n"
+            "// Source: %s\n"
+            "// Declaration VA: 0x%08X | Instructions: %u\n"
+            "// ============================================================================\n\n",
+            relPath, (uint32_t)declVa, count);
+        s += hdr;
+    }
     s += "cbuffer PerDrawCB : register(b0) {\n"
          "    float4 uWvp0; float4 uWvp1; float4 uWvp2; float4 uWvp3;\n"
          "    float4 uViewport; float4 uTFactor;\n"
@@ -1171,10 +565,10 @@ static std::string DecompileXvuToHLSL(const XboxDeclElem* elems, uint32_t numEle
          "    o.norm  = saturate(oD1.xyz);\n";
 
     if (writesOD1) {
-        s += "    if ((uStage0Ops.x == 25u && (uStage0Ops.z & 0x0Fu) == 0u) ||\n"
-             "        (uStage1Ops.x == 25u && (uStage1Ops.z & 0x0Fu) == 0u) ||\n"
-             "        (uStage2Ops.x == 25u && (uStage2Ops.z & 0x0Fu) == 0u) ||\n"
-             "        (uStage3Ops.x == 25u && (uStage3Ops.z & 0x0Fu) == 0u)) {\n"
+        s += "    if ((uStage0Ops.x == 22u && (uStage0Ops.z & 0x0Fu) == 0u) ||\n"
+             "        (uStage1Ops.x == 22u && (uStage1Ops.z & 0x0Fu) == 0u) ||\n"
+             "        (uStage2Ops.x == 22u && (uStage2Ops.z & 0x0Fu) == 0u) ||\n"
+             "        (uStage3Ops.x == 22u && (uStage3Ops.z & 0x0Fu) == 0u)) {\n"
              "        o.color = float4(saturate(oD1.xyz), saturate(oD0.w));\n"
              "    }\n";
     }
@@ -1195,23 +589,11 @@ static uint8_t GetXboxDeclTypeComponentCount(uint32_t xType) {
     }
 }
 
-static HRESULT __stdcall Bridge_D3DDevice_CreateVertexShader(
-    const DWORD* pDeclaration, const DWORD* pFunction, DWORD* pHandle, DWORD Usage)
+static void ParseXboxVertexDeclaration(
+    const DWORD* pDeclaration, bool isFixedFunction,
+    XboxDeclElem* outElems, uint32_t* outNumElems, XboxShaderDeclInfo* outInfo)
 {
-    (void)Usage;
-    if (!pHandle) return E_INVALIDARG;
-
-    XboxShaderDeclInfo info = {};
-    info.vsType = -1;
-
-    uintptr_t hAddr = reinterpret_cast<uintptr_t>(pHandle);
-    if (hAddr >= ADDR_VERTEX_SHADERS_TABLE && hAddr < ADDR_VERTEX_SHADERS_TABLE + 66 * 24) {
-        info.vsType = (int32_t)((hAddr - ADDR_VERTEX_SHADERS_TABLE) / 24);
-    }
-
-    XboxDeclElem elems[16] = {};
     uint32_t numElems = 0;
-
     if (pDeclaration) {
         uint16_t curStream = 0;
         uint16_t curOffset = 0;
@@ -1231,53 +613,1088 @@ static HRESULT __stdcall Bridge_D3DDevice_CreateVertexShader(
                     uint32_t byteSize = GetXboxDeclTypeByteSize(xType);
                     uint8_t compCount = GetXboxDeclTypeComponentCount(xType);
                     if (curStream < 2 && reg < 16 && numElems < 16) {
-                        elems[numElems].stream = (uint8_t)curStream;
-                        elems[numElems].reg    = (uint8_t)reg;
-                        elems[numElems].xType  = (uint8_t)xType;
-                        elems[numElems].offset = curOffset;
+                        if (outElems) {
+                            outElems[numElems].stream = (uint8_t)curStream;
+                            outElems[numElems].reg    = (uint8_t)reg;
+                            outElems[numElems].xType  = (uint8_t)xType;
+                            outElems[numElems].offset = curOffset;
+                        }
                         numElems++;
-                        info.usesStream[curStream] = true;
+                        if (outInfo) outInfo->usesStream[curStream] = true;
                     }
-                    if (pFunction == nullptr) {
-                        // Xbox fixed-function D3DVSDE_* register mapping (e.g. VertexSetupPrelitRigid at 0x00605B50)
-                        if (curStream == 0) {
+                    if (outInfo) {
+                        if (isFixedFunction) {
+                            // Xbox fixed-function D3DVSDE_* register mapping (e.g. VertexSetupPrelitRigid at 0x00605B50)
+                            if (curStream == 0) {
+                                switch (reg) {
+                                    case 0:  outInfo->hasPos  = true; outInfo->offPos  = curOffset; break;
+                                    case 2:  outInfo->hasNorm = true; outInfo->offNorm = curOffset; break;
+                                    case 3:  outInfo->hasDiff = true; outInfo->offDiff = curOffset; break;
+                                    case 4:  outInfo->hasSpec = true; outInfo->offSpec = curOffset; break;
+                                    case 9:  outInfo->hasUv0  = true; outInfo->offUv0  = curOffset; outInfo->dimUv[0] = compCount; break;
+                                    case 10: outInfo->hasUv1  = true; outInfo->offUv1  = curOffset; outInfo->dimUv[1] = compCount; break;
+                                    case 11: outInfo->hasUv2  = true; outInfo->offUv2  = curOffset; outInfo->dimUv[2] = compCount; break;
+                                    case 12: outInfo->hasUv3  = true; outInfo->offUv3  = curOffset; outInfo->dimUv[3] = compCount; break;
+                                    default: break;
+                                }
+                            } else if (curStream == 1 && reg == 3) {
+                                outInfo->hasStream1Diff = true;
+                                outInfo->offStream1Diff = curOffset;
+                            }
+                        } else if (curStream == 0) {
+                            // Ghost.exe programmable D3DVSD register convention (0x007A980C..0x007A996C)
                             switch (reg) {
-                                case 0:  info.hasPos  = true; info.offPos  = curOffset; break;
-                                case 2:  info.hasNorm = true; info.offNorm = curOffset; break;
-                                case 3:  info.hasDiff = true; info.offDiff = curOffset; break;
-                                case 4:  info.hasSpec = true; info.offSpec = curOffset; break;
-                                case 9:  info.hasUv0  = true; info.offUv0  = curOffset; info.dimUv[0] = compCount; break;
-                                case 10: info.hasUv1  = true; info.offUv1  = curOffset; info.dimUv[1] = compCount; break;
-                                case 11: info.hasUv2  = true; info.offUv2  = curOffset; info.dimUv[2] = compCount; break;
-                                case 12: info.hasUv3  = true; info.offUv3  = curOffset; info.dimUv[3] = compCount; break;
+                                case 0:  outInfo->hasPos  = true; outInfo->offPos  = curOffset; break;
+                                case 1:  outInfo->hasNorm = true; outInfo->offNorm = curOffset; break;
+                                case 2:  outInfo->hasDiff = true; outInfo->offDiff = curOffset; break;
+                                case 3:  outInfo->hasUv0  = true; outInfo->offUv0  = curOffset; outInfo->dimUv[0] = compCount; break;
+                                case 4:  outInfo->hasUv1  = true; outInfo->offUv1  = curOffset; outInfo->dimUv[1] = compCount; break;
+                                case 5:  outInfo->hasUv2  = true; outInfo->offUv2  = curOffset; outInfo->dimUv[2] = compCount; break;
+                                case 6:  outInfo->hasUv3  = true; outInfo->offUv3  = curOffset; outInfo->dimUv[3] = compCount; break;
+                                case 10: outInfo->hasRhw  = true; outInfo->offRhw  = curOffset; break;
                                 default: break;
                             }
-                        } else if (curStream == 1 && reg == 3) {
-                            info.hasStream1Diff = true;
-                            info.offStream1Diff = curOffset;
-                        }
-                    } else if (curStream == 0) {
-                        // Ghost.exe programmable D3DVSD register convention (0x007A980C..0x007A996C)
-                        switch (reg) {
-                            case 0:  info.hasPos  = true; info.offPos  = curOffset; break;
-                            case 1:  info.hasNorm = true; info.offNorm = curOffset; break;
-                            case 2:  info.hasDiff = true; info.offDiff = curOffset; break;
-                            case 3:  info.hasUv0  = true; info.offUv0  = curOffset; info.dimUv[0] = compCount; break;
-                            case 4:  info.hasUv1  = true; info.offUv1  = curOffset; info.dimUv[1] = compCount; break;
-                            case 5:  info.hasUv2  = true; info.offUv2  = curOffset; info.dimUv[2] = compCount; break;
-                            case 6:  info.hasUv3  = true; info.offUv3  = curOffset; info.dimUv[3] = compCount; break;
-                            case 10: info.hasRhw  = true; info.offRhw  = curOffset; break;
-                            default: break;
                         }
                     }
                     curOffset += (uint16_t)byteSize;
                 }
-                if (curStream < 2) {
-                    info.streamStrides[curStream] = curOffset;
+                if (outInfo && curStream < 2) {
+                    outInfo->streamStrides[curStream] = curOffset;
                 }
             }
         }
     }
+    if (outNumElems) *outNumElems = numElems;
+}
+
+// ============================================================================
+// First-Run HLSL Generation & D3D11 Disk Shader Cache (GhostWin11_Data\shaders\)
+// ============================================================================
+
+static const char* kSharedPerDrawCBAndPSInHLSL =
+    "cbuffer PerDrawCB : register(b0) {\n"
+    "    float4 uWvpRow0;\n"
+    "    float4 uWvpRow1;\n"
+    "    float4 uWvpRow2;\n"
+    "    float4 uWvpRow3;\n"
+    "    float4 uViewport;\n"
+    "    float4 uTFactor;\n"
+    "    uint4  uStage0Ops;\n"
+    "    uint4  uStage0Alpha;\n"
+    "    uint4  uStage1Ops;\n"
+    "    uint4  uStage1Alpha;\n"
+    "    uint4  uStage2Ops;\n"
+    "    uint4  uStage2Alpha;\n"
+    "    uint4  uStage3Ops;\n"
+    "    uint4  uStage3Alpha;\n"
+    "    uint4  uFlags;\n"
+    "    float4 uAlphaTest;\n"
+    "    float4 uUvScale01;\n"
+    "    float4 uUvScale23;\n"
+    "    float4 uBumpParams;\n"
+    "    float4 uFogParams;\n"
+    "    float4 uFogColor;\n"
+    "    float4 uPsConst0;\n"
+    "    float4 uPsConst1;\n"
+    "    float4 uPsConst2;\n"
+    "    float4 uPsConst3;\n"
+    "    float4 uPsConst4;\n"
+    "    float4 uPsConst5;\n"
+    "    float4 uPsConst6;\n"
+    "    float4 uPsConst7;\n"
+    "    float4 uWorldRow0;\n"
+    "    float4 uWorldRow1;\n"
+    "    float4 uWorldRow2;\n"
+    "    float4 uWorldRow3;\n"
+    "    uint4  uLightCount;\n"
+    "    float4 uLightPosType[8];\n"
+    "    float4 uLightDirRange[8];\n"
+    "    float4 uLightAttenSpot[8];\n"
+    "    float4 uLightSpotParams[8];\n"
+    "    float4 uLightDiffuse[8];\n"
+    "    float4 uLightAmbient[8];\n"
+    "    float4 uLightSpecular[8];\n"
+    "    float4 uEyePosWorld;\n"
+    "    float4 uMatBackDiffAmb;\n"
+    "    float4 uMatBackSpec;\n"
+    "    uint4  uStageColorKeyOp;\n"
+    "    float4 uStageColorKeyColor[4];\n"
+    "    uint4  uStageColorSign;\n"
+    "    float4 uBumpLuminance;\n"
+    "    float4 uScissorRects[8];\n"
+    "};\n\n"
+    "struct PSIn {\n"
+    "    float4 pos    : SV_POSITION;\n"
+    "    float4 color  : COLOR0;\n"
+    "    float4 uv0    : TEXCOORD0;\n"
+    "    float4 uv1    : TEXCOORD1;\n"
+    "    float4 uv2    : TEXCOORD2;\n"
+    "    float4 uv3    : TEXCOORD3;\n"
+    "    float2 eyeDist: TEXCOORD4;\n"
+    "    float3 norm   : TEXCOORD5;\n"
+    "};\n\n";
+
+static const char* kSharedPsResourcesAndHelpersHLSL =
+    "Texture2D    tex0        : register(t0);\n"
+    "Texture2D    tex1        : register(t1);\n"
+    "Texture2D    tex2        : register(t2);\n"
+    "Texture2D    tex3        : register(t3);\n"
+    "TextureCube  cubeTex0    : register(t4);\n"
+    "TextureCube  cubeTex1    : register(t5);\n"
+    "TextureCube  cubeTex2    : register(t6);\n"
+    "TextureCube  cubeTex3    : register(t7);\n"
+    "Texture3D    volTex0     : register(t8);\n"
+    "Texture3D    volTex1     : register(t9);\n"
+    "Texture3D    volTex2     : register(t10);\n"
+    "Texture3D    volTex3     : register(t11);\n"
+    "Texture2D    gammaLutTex : register(t12);\n"
+    "SamplerState smp0        : register(s0);\n"
+    "SamplerState smp1        : register(s1);\n"
+    "SamplerState smp2        : register(s2);\n"
+    "SamplerState smp3        : register(s3);\n\n"
+    "float4 SampleStageTex(\n"
+    "    uint stageIdx, Texture2D tex2d, TextureCube texCube, Texture3D texVol,\n"
+    "    SamplerState smp, float4 uv, bool isCube, bool isVol)\n"
+    "{\n"
+    "    if (((uFlags.y >> stageIdx) & 1u) == 0u) {\n"
+    "        return float4(1.0f, 1.0f, 1.0f, 1.0f);\n"
+    "    }\n"
+    "    float4 c;\n"
+    "    if (isCube) {\n"
+    "        c = texCube.Sample(smp, uv.xyz);\n"
+    "    } else if (isVol) {\n"
+    "        c = texVol.Sample(smp, uv.xyz);\n"
+    "    } else {\n"
+    "        c = tex2d.Sample(smp, uv.xy);\n"
+    "    }\n"
+    "    uint ckOp = uStageColorKeyOp[stageIdx];\n"
+    "    if (ckOp != 0u) {\n"
+    "        float4 ckCol = uStageColorKeyColor[stageIdx];\n"
+    "        bool matchRgb = all(abs(c.rgb - ckCol.rgb) < (1.5f / 255.0f));\n"
+    "        if (ckOp == 1u && matchRgb) {\n"
+    "            c.a = 0.0f;\n"
+    "        } else if (ckOp == 2u && matchRgb && abs(c.a - ckCol.a) < (1.5f / 255.0f)) {\n"
+    "            c = float4(0.0f, 0.0f, 0.0f, 0.0f);\n"
+    "        } else if (ckOp == 3u && matchRgb) {\n"
+    "            discard;\n"
+    "        }\n"
+    "    }\n"
+    "    if (((uFlags.y >> (16u + stageIdx)) & 1u) != 0u) {\n"
+    "        if (c.a < (0.5f / 255.0f)) {\n"
+    "            discard;\n"
+    "        }\n"
+    "    }\n"
+    "    uint cSign = uStageColorSign[stageIdx];\n"
+    "    if (cSign != 0u) {\n"
+    "        if ((cSign & 0x20u) != 0u) c.r = c.r * 2.0f - 1.0f;\n"
+    "        if ((cSign & 0x40u) != 0u) c.g = c.g * 2.0f - 1.0f;\n"
+    "        if ((cSign & 0x80u) != 0u) c.b = c.b * 2.0f - 1.0f;\n"
+    "        if ((cSign & 0x10u) != 0u) c.a = c.a * 2.0f - 1.0f;\n"
+    "    }\n"
+    "    return c;\n"
+    "}\n\n"
+    "float ComputeFogFactor(float d) {\n"
+    "    if (uFogParams.x <= 0.5f || (uFlags.x & 1u) != 0u) return 1.0f;\n"
+    "    float fogMode = uFogParams.x;\n"
+    "    if (fogMode > 3.5f) {\n"
+    "        return saturate(d);\n"
+    "    } else if (fogMode > 2.5f) {\n"
+    "        float span = max(uFogParams.z - uFogParams.y, 0.001f);\n"
+    "        return saturate((uFogParams.z - d) / span);\n"
+    "    } else if (fogMode < 1.5f) {\n"
+    "        return saturate(exp(-d * uFogParams.w));\n"
+    "    } else {\n"
+    "        float df = d * uFogParams.w;\n"
+    "        return saturate(exp(-(df * df)));\n"
+    "    }\n"
+    "}\n\n"
+    "float ComputeInvProjQ(float4 uv, float fallbackW, bool isProj) {\n"
+    "    if (!isProj) return 1.0f;\n"
+    "    if (abs(uv.w) > 0.0001f && abs(uv.w - 1.0f) > 0.0001f) return 1.0f / uv.w;\n"
+    "    if (abs(uv.w - 1.0f) <= 0.0001f && abs(uv.z) > 0.0001f) return 1.0f / uv.z;\n"
+    "    if (abs(fallbackW) > 0.0001f) return 1.0f / fallbackW;\n"
+    "    return 1.0f;\n"
+    "}\n\n";
+
+static const char* kSharedPsPrologueHLSL =
+    "float4 PSMain(PSIn input) : SV_TARGET {\n"
+    "    uint scissorCount = (uFlags.x >> 4u) & 0x0Fu;\n"
+    "    if (scissorCount > 0u) {\n"
+    "        bool insideAny = false;\n"
+    "        [unroll]\n"
+    "        for (uint si = 0u; si < 8u; ++si) {\n"
+    "            if (si < scissorCount) {\n"
+    "                float4 sr = uScissorRects[si];\n"
+    "                if (input.pos.x >= sr.x && input.pos.x < sr.z &&\n"
+    "                    input.pos.y >= sr.y && input.pos.y < sr.w) {\n"
+    "                    insideAny = true;\n"
+    "                }\n"
+    "            }\n"
+    "        }\n"
+    "        bool scissorExcl = (uFlags.x & 4u) != 0u;\n"
+    "        if (scissorExcl ? insideAny : !insideAny) {\n"
+    "            discard;\n"
+    "        }\n"
+    "    }\n\n"
+    "    float4 diffuse = input.color;\n"
+    "    float4 specCol = float4(input.norm, 1.0f);\n"
+    "    float4 current = diffuse;\n"
+    "    float4 tempReg = float4(0.0f, 0.0f, 0.0f, 0.0f);\n\n"
+    "    uint texMask  = uFlags.y & 0x0Fu;\n"
+    "    uint cubeMask = (uFlags.y >> 4u)  & 0x0Fu;\n"
+    "    uint projMask = (uFlags.y >> 8u)  & 0x0Fu;\n"
+    "    uint volMask  = (uFlags.y >> 12u) & 0x0Fu;\n"
+    "    uint tempMask = (uFlags.y >> 20u) & 0x0Fu;\n\n"
+    "    float invProjQ0 = ComputeInvProjQ(input.uv0, input.eyeDist.y, (projMask & 1u) != 0u);\n"
+    "    float invProjQ1 = ComputeInvProjQ(input.uv1, input.eyeDist.y, (projMask & 2u) != 0u);\n"
+    "    float invProjQ2 = ComputeInvProjQ(input.uv2, input.eyeDist.y, (projMask & 4u) != 0u);\n"
+    "    float invProjQ3 = ComputeInvProjQ(input.uv3, input.eyeDist.y, (projMask & 8u) != 0u);\n\n"
+    "    float4 uv0 = ((projMask & 1u) != 0u) ? float4(input.uv0.xyz * invProjQ0, input.uv0.w) : input.uv0;\n"
+    "    float4 uv1 = ((projMask & 2u) != 0u) ? float4(input.uv1.xyz * invProjQ1, input.uv1.w) : input.uv1;\n"
+    "    float4 uv2 = ((projMask & 4u) != 0u) ? float4(input.uv2.xyz * invProjQ2, input.uv2.w) : input.uv2;\n"
+    "    float4 uv3 = ((projMask & 8u) != 0u) ? float4(input.uv3.xyz * invProjQ3, input.uv3.w) : input.uv3;\n\n"
+    "    float4 t0 = ((texMask & 1u) != 0u) ? SampleStageTex(0u, tex0, cubeTex0, volTex0, smp0, uv0, (cubeMask & 1u) != 0u, (volMask & 1u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);\n"
+    "    float4 t1 = ((texMask & 2u) != 0u) ? SampleStageTex(1u, tex1, cubeTex1, volTex1, smp1, uv1, (cubeMask & 2u) != 0u, (volMask & 2u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);\n";
+
+static const char* kSharedPsAlphaTestAndGammaHLSL =
+    "    if (uFlags.z != 0u) {\n"
+    "        uint fn = (uint)uAlphaTest.x;\n"
+    "        float refVal = uAlphaTest.y;\n"
+    "        bool passAlpha = true;\n"
+    "        if (fn == 1u)      passAlpha = false;\n"
+    "        else if (fn == 2u) passAlpha = (current.a <  refVal - 0.001f);\n"
+    "        else if (fn == 3u) passAlpha = (abs(current.a - refVal) < 0.004f);\n"
+    "        else if (fn == 4u) passAlpha = (current.a <= refVal + 0.001f);\n"
+    "        else if (fn == 5u) passAlpha = (current.a >  refVal + 0.001f);\n"
+    "        else if (fn == 6u) passAlpha = (abs(current.a - refVal) >= 0.004f);\n"
+    "        else if (fn == 7u) passAlpha = (current.a >= refVal - 0.001f);\n"
+    "        if (!passAlpha) discard;\n"
+    "    }\n";
+
+static const char* kSharedPsFogHLSL =
+    "    if (uFogParams.x > 0.5f && (uFlags.x & 1u) == 0u) {\n"
+    "        float fogAmt = 1.0f - fogFactor;\n"
+    "        if (uFogColor.w > 0.5f) {\n"
+    "            current.rgb *= fogFactor;\n"
+    "        } else {\n"
+    "            current.rgb = lerp(current.rgb, uFogColor.rgb, fogAmt);\n"
+    "        }\n"
+    "    }\n";
+
+static const char* kSharedPsGammaEpilogueHLSL =
+    "    if ((uFlags.x & 2u) != 0u) {\n"
+    "        float3 c = saturate(current.rgb);\n"
+    "        current.r = gammaLutTex.SampleLevel(smp0, float2(c.r * (255.0f / 256.0f) + (0.5f / 256.0f), 0.5f), 0).r;\n"
+    "        current.g = gammaLutTex.SampleLevel(smp0, float2(c.g * (255.0f / 256.0f) + (0.5f / 256.0f), 0.5f), 0).g;\n"
+    "        current.b = gammaLutTex.SampleLevel(smp0, float2(c.b * (255.0f / 256.0f) + (0.5f / 256.0f), 0.5f), 0).b;\n"
+    "    } else if (abs(uAlphaTest.z - 1.0f) > 0.01f || abs(uAlphaTest.w - 1.0f) > 0.01f) {\n"
+    "        float invG = 1.0f / max(uAlphaTest.z, 0.1f);\n"
+    "        current.rgb = saturate(pow(max(current.rgb, 0.0f), invG) * uAlphaTest.w);\n"
+    "    }\n"
+    "    return current;\n"
+    "}\n";
+
+static std::string BuildFixedVsHLSL() {
+    std::string s;
+    s.reserve(8192);
+    s += "// ============================================================================\n"
+         "// StarCraft: Ghost (" GHOST_STR(GHOST_PROJECT_NAME) ") — Fixed-Function Vertex Shader (vs_4_0)\n"
+         "// ============================================================================\n\n";
+    s += kSharedPerDrawCBAndPSInHLSL;
+    s += "struct VSIn {\n"
+         "    float4 pos   : POSITION;\n"
+         "    float3 norm  : NORMAL;\n"
+         "    float4 color : COLOR0;\n"
+         "    float2 uv0   : TEXCOORD0;\n"
+         "    float2 uv1   : TEXCOORD1;\n"
+         "    float2 uv2   : TEXCOORD2;\n"
+         "    float2 uv3   : TEXCOORD3;\n"
+         "    float4 uvw_w : TEXCOORD4;\n"
+         "    float4 spec  : COLOR1;\n"
+         "};\n\n"
+         "PSIn VSMain(VSIn input) {\n"
+         "    PSIn o;\n"
+         "    bool isRhw = (uFlags.x & 1u) != 0u;\n"
+         "    if (isRhw) {\n"
+         "        float vpW = max(uViewport.z, 1.0f);\n"
+         "        float vpH = max(uViewport.w, 1.0f);\n"
+         "        float ndcX = ((input.pos.x - uViewport.x) / vpW) * 2.0f - 1.0f;\n"
+         "        float ndcY = 1.0f - ((input.pos.y - uViewport.y) / vpH) * 2.0f;\n"
+         "        o.pos = float4(ndcX, ndcY, saturate(input.pos.z), 1.0f);\n"
+         "        o.eyeDist = float2(0.0f, 1.0f);\n"
+         "    } else {\n"
+         "        float4 clipPos = input.pos.x * uWvpRow0 +\n"
+         "                         input.pos.y * uWvpRow1 +\n"
+         "                         input.pos.z * uWvpRow2 +\n"
+         "                         uWvpRow3;\n"
+         "        o.pos = clipPos;\n"
+         "        o.eyeDist = float2(max(clipPos.w, 0.0f), input.pos.w);\n"
+         "    }\n"
+         "    if (uLightCount.y != 0u && !isRhw) {\n"
+         "        float3 wPos = input.pos.x * uWorldRow0.xyz +\n"
+         "                      input.pos.y * uWorldRow1.xyz +\n"
+         "                      input.pos.z * uWorldRow2.xyz +\n"
+         "                      uWorldRow3.xyz;\n"
+         "        float3 wNorm = input.norm.x * uWorldRow0.xyz +\n"
+         "                       input.norm.y * uWorldRow1.xyz +\n"
+         "                       input.norm.z * uWorldRow2.xyz;\n"
+         "        float nLen = length(wNorm);\n"
+         "        if (nLen > 0.0001f) wNorm /= nLen;\n"
+         "        bool specEnable  = (uLightCount.z & 1u) != 0u;\n"
+         "        bool localViewer = (uLightCount.z & 2u) != 0u;\n"
+         "        float specPower  = max(uEyePosWorld.w, 0.001f);\n"
+         "        float3 V = localViewer ? normalize(uEyePosWorld.xyz - wPos) : normalize(uEyePosWorld.xyz);\n"
+         "        float3 totRgb  = input.color.rgb;\n"
+         "        float3 totSpec = input.spec.rgb;\n"
+         "        uint numLights = min(uLightCount.x, 8u);\n"
+         "        for (uint l = 0u; l < numLights; ++l) {\n"
+         "            float4 posType = uLightPosType[l];\n"
+         "            float lType = posType.w;\n"
+         "            float3 L = float3(0.0f, 0.0f, 0.0f);\n"
+         "            float atten = 1.0f;\n"
+         "            if (lType > 2.5f) {\n"
+         "                L = posType.xyz;\n"
+         "            } else {\n"
+         "                float3 toLight = posType.xyz - wPos;\n"
+         "                float dist = length(toLight);\n"
+         "                float range = uLightDirRange[l].w;\n"
+         "                if (range > 0.0f && dist > range) continue;\n"
+         "                if (dist > 0.0001f) L = toLight / dist;\n"
+         "                float4 attSpot = uLightAttenSpot[l];\n"
+         "                float denom = attSpot.x + attSpot.y * dist + attSpot.z * dist * dist;\n"
+         "                if (denom > 0.0001f) atten = 1.0f / denom;\n"
+         "                if (lType > 1.5f) {\n"
+         "                    float cosAlpha = -dot(L, uLightDirRange[l].xyz);\n"
+         "                    float cosHalfPhi = attSpot.w;\n"
+         "                    if (cosAlpha <= cosHalfPhi) continue;\n"
+         "                    float cosHalfTheta = uLightSpotParams[l].x;\n"
+         "                    if (cosAlpha < cosHalfTheta && (cosHalfTheta - cosHalfPhi) > 0.0001f) {\n"
+         "                        atten *= pow(max((cosAlpha - cosHalfPhi) / (cosHalfTheta - cosHalfPhi), 0.0f), uLightSpotParams[l].y);\n"
+         "                    }\n"
+         "                }\n"
+         "            }\n"
+         "            float ndotl = max(dot(wNorm, L), 0.0f);\n"
+         "            totRgb += atten * (uLightAmbient[l].rgb + ndotl * uLightDiffuse[l].rgb);\n"
+         "            if (specEnable && ndotl > 0.0f) {\n"
+         "                float3 H = normalize(L + V);\n"
+         "                float ndoth = max(dot(wNorm, H), 0.0f);\n"
+         "                totSpec += atten * pow(ndoth, specPower) * uLightSpecular[l].rgb;\n"
+         "            }\n"
+         "        }\n"
+         "        o.color = float4(saturate(totRgb), input.color.a);\n"
+         "        o.norm  = specEnable ? saturate(totSpec) : ((dot(abs(input.spec.rgb), float3(1.0f, 1.0f, 1.0f)) > 0.0f) ? input.spec.rgb : input.norm);\n"
+         "    } else {\n"
+         "        o.color = input.color;\n"
+         "        o.norm  = (dot(abs(input.spec.rgb), float3(1.0f, 1.0f, 1.0f)) > 0.0f) ? input.spec.rgb : input.norm;\n"
+         "    }\n"
+         "    o.uv0 = float4(input.uv0 * uUvScale01.xy, input.uvw_w.x, 0.0f);\n"
+         "    o.uv1 = float4(input.uv1 * uUvScale01.zw, input.uvw_w.y, 0.0f);\n"
+         "    o.uv2 = float4(input.uv2 * uUvScale23.xy, input.uvw_w.z, 0.0f);\n"
+         "    o.uv3 = float4(input.uv3 * uUvScale23.zw, input.uvw_w.w, 0.0f);\n"
+         "    return o;\n"
+         "}\n";
+    return s;
+}
+
+static std::string BuildFixedPsHLSL() {
+    std::string s;
+    s.reserve(12288);
+    s += "// ============================================================================\n"
+         "// StarCraft: Ghost (" GHOST_STR(GHOST_PROJECT_NAME) ") — Fixed-Function Pixel Shader (ps_4_0)\n"
+         "// ============================================================================\n\n";
+    s += kSharedPerDrawCBAndPSInHLSL;
+    s += kSharedPsResourcesAndHelpersHLSL;
+    s += "float4 EvalArg(uint arg, float4 diffuse, float4 current, float4 tex, float4 tfactor, float4 spec, float4 tempReg) {\n"
+         "    uint src = arg & 0x0Fu;\n"
+         "    float4 v = current;\n"
+         "    if (src == 0u)      v = diffuse;\n"
+         "    else if (src == 1u) v = current;\n"
+         "    else if (src == 2u) v = tex;\n"
+         "    else if (src == 3u) v = tfactor;\n"
+         "    else if (src == 4u) v = spec;\n"
+         "    else if (src == 5u) v = tempReg;\n"
+         "    if ((arg & 0x10u) != 0u) v = 1.0f - v;\n"
+         "    if ((arg & 0x20u) != 0u) v = v.aaaa;\n"
+         "    return v;\n"
+         "}\n\n"
+         "float3 EvalColorOp(uint op, uint arg2Src, float4 a1, float4 a2, float4 a0, float4 diffuse, float4 current, float4 tex, float4 tfactor) {\n"
+         "    if (op == 2u)  return a1.rgb;\n"
+         "    if (op == 3u)  return a2.rgb;\n"
+         "    if (op == 4u)  return a1.rgb * a2.rgb;\n"
+         "    if (op == 5u)  return saturate(a1.rgb * a2.rgb * 2.0f);\n"
+         "    if (op == 6u)  return saturate(a1.rgb * a2.rgb * 4.0f);\n"
+         "    if (op == 7u)  return saturate(a1.rgb + a2.rgb);\n"
+         "    if (op == 8u)  return saturate(a1.rgb + a2.rgb - 0.5f);\n"
+         "    if (op == 9u)  return saturate((a1.rgb + a2.rgb - 0.5f) * 2.0f);\n"
+         "    if (op == 10u) return saturate(a1.rgb - a2.rgb);\n"
+         "    if (op == 11u) return saturate(a1.rgb + a2.rgb - a1.rgb * a2.rgb);\n"
+         "    if (op == 12u) return lerp(a2.rgb, a1.rgb, diffuse.a);\n"
+         "    if (op == 13u) return lerp(a2.rgb, a1.rgb, current.a);\n"
+         "    if (op == 14u) return lerp(a2.rgb, a1.rgb, tex.a);\n"
+         "    if (op == 15u) return lerp(a2.rgb, a1.rgb, tfactor.a);\n"
+         "    if (op == 16u) return saturate(a1.rgb + a2.rgb * (1.0f - tex.a));\n"
+         "    if (op == 17u) return saturate(a1.rgb + a2.rgb * (1.0f - current.a));\n"
+         "    if (op == 18u) return saturate(a1.rgb + a1.a * a2.rgb);\n"
+         "    if (op == 19u) return saturate(a1.rgb * a2.rgb + a1.a);\n"
+         "    if (op == 20u) return saturate(a1.rgb + (1.0f - a1.a) * a2.rgb);\n"
+         "    if (op == 21u) return saturate((1.0f - a1.rgb) * a2.rgb + a1.a);\n"
+         "    if (op == 22u) return saturate(dot((a1.rgb - 0.5f) * 2.0f, (a2.rgb - 0.5f) * 2.0f)).xxx;\n"
+         "    if (op == 23u) return saturate(a0.rgb + a1.rgb * a2.rgb);\n"
+         "    if (op == 24u) return lerp(a2.rgb, a1.rgb, a0.rgb);\n"
+         "    if (op == 25u || op == 26u) return current.rgb;\n"
+         "    return a1.rgb * a2.rgb;\n"
+         "}\n\n"
+         "float EvalAlphaOp(uint op, float a1, float a2, float a0, float4 diffuse, float4 current, float4 tex, float4 tfactor) {\n"
+         "    if (op == 2u)  return a1;\n"
+         "    if (op == 3u)  return a2;\n"
+         "    if (op == 4u)  return a1 * a2;\n"
+         "    if (op == 5u)  return saturate(a1 * a2 * 2.0f);\n"
+         "    if (op == 6u)  return saturate(a1 * a2 * 4.0f);\n"
+         "    if (op == 7u)  return saturate(a1 + a2);\n"
+         "    if (op == 8u)  return saturate(a1 + a2 - 0.5f);\n"
+         "    if (op == 9u)  return saturate((a1 + a2 - 0.5f) * 2.0f);\n"
+         "    if (op == 10u) return saturate(a1 - a2);\n"
+         "    if (op == 11u) return saturate(a1 + a2 - a1 * a2);\n"
+         "    if (op == 12u) return lerp(a2, a1, diffuse.a);\n"
+         "    if (op == 13u) return lerp(a2, a1, current.a);\n"
+         "    if (op == 14u) return lerp(a2, a1, tex.a);\n"
+         "    if (op == 15u) return lerp(a2, a1, tfactor.a);\n"
+         "    if (op == 16u) return saturate(a1 + a2 * (1.0f - tex.a));\n"
+         "    if (op == 17u) return saturate(a1 + a2 * (1.0f - current.a));\n"
+         "    if (op == 23u) return saturate(a0 + a1 * a2);\n"
+         "    if (op == 24u) return lerp(a2, a1, a0);\n"
+         "    return a1 * a2;\n"
+         "}\n\n"
+         "bool OpUsesMissingTex(uint4 ops, bool hasStageTex) {\n"
+         "    if (hasStageTex) return false;\n"
+         "    uint op = ops.x;\n"
+         "    if (op <= 1u || op == 25u || op == 26u) return false;\n"
+         "    if (op == 14u || op == 16u) return true;\n"
+         "    if (op != 3u && (ops.y & 0x0Fu) == 2u) return true;\n"
+         "    if (op != 2u && op != 17u && (ops.z & 0x0Fu) == 2u) return true;\n"
+         "    if ((op == 23u || op == 24u) && (ops.w & 0x0Fu) == 2u) return true;\n"
+         "    return false;\n"
+         "}\n\n"
+         "void EvalStage(\n"
+         "    uint4 colorOps, uint4 alphaOps, float4 diffuse, inout float4 current, inout float4 tempReg,\n"
+         "    float4 tex, float4 tfactor, float4 spec, bool writeToTemp, bool hasStageTex, bool isStage0)\n"
+         "{\n"
+         "    bool missingColorTex = OpUsesMissingTex(colorOps, hasStageTex);\n"
+         "    float3 outRgb;\n"
+         "    if (missingColorTex) {\n"
+         "        outRgb = isStage0 ? diffuse.rgb : current.rgb;\n"
+         "    } else {\n"
+         "        float4 c1 = EvalArg(colorOps.y, diffuse, current, tex, tfactor, spec, tempReg);\n"
+         "        float4 c2 = EvalArg(colorOps.z, diffuse, current, tex, tfactor, spec, tempReg);\n"
+         "        float4 c0 = EvalArg(colorOps.w, diffuse, current, tex, tfactor, spec, tempReg);\n"
+         "        outRgb = EvalColorOp(colorOps.x, colorOps.z, c1, c2, c0, diffuse, current, tex, tfactor);\n"
+         "    }\n"
+         "    float outA = (colorOps.x == 22u && !missingColorTex)\n"
+         "               ? outRgb.x\n"
+         "               : (writeToTemp ? tempReg.a : current.a);\n"
+         "    if (alphaOps.x > 1u && colorOps.x != 22u) {\n"
+         "        if (OpUsesMissingTex(alphaOps, hasStageTex)) {\n"
+         "            outA = isStage0 ? diffuse.a : current.a;\n"
+         "        } else {\n"
+         "            float4 a1 = EvalArg(alphaOps.y, diffuse, current, tex, tfactor, spec, tempReg);\n"
+         "            float4 a2 = EvalArg(alphaOps.z, diffuse, current, tex, tfactor, spec, tempReg);\n"
+         "            float4 a0 = EvalArg(alphaOps.w, diffuse, current, tex, tfactor, spec, tempReg);\n"
+         "            outA = EvalAlphaOp(alphaOps.x, a1.a, a2.a, a0.a, diffuse, current, tex, tfactor);\n"
+         "        }\n"
+         "    }\n"
+         "    if (writeToTemp) {\n"
+         "        tempReg = float4(outRgb, outA);\n"
+         "    } else {\n"
+         "        current = float4(outRgb, outA);\n"
+         "    }\n"
+         "}\n\n";
+    s += kSharedPsPrologueHLSL;
+    s += "    if (uStage0Ops.x == 25u || uStage0Ops.x == 26u) {\n"
+         "        float2 d = ((uStageColorSign[0] & 0x60u) != 0u) ? t0.rg : (t0.rg * 2.0f - 1.0f);\n"
+         "        uv1.xy += float2(d.x * uBumpParams.x + d.y * uBumpParams.w, d.x * uBumpParams.y + d.y * uBumpParams.z);\n"
+         "        if ((texMask & 2u) != 0u) {\n"
+         "            t1 = SampleStageTex(1u, tex1, cubeTex1, volTex1, smp1, uv1, (cubeMask & 2u) != 0u, (volMask & 2u) != 0u);\n"
+         "        }\n"
+         "        if (uStage0Ops.x == 26u && (uBumpLuminance.x != 0.0f || uBumpLuminance.y != 0.0f)) {\n"
+         "            t1.rgb *= saturate(t0.b * uBumpLuminance.x + uBumpLuminance.y);\n"
+         "        }\n"
+         "    }\n"
+         "    if (uStage1Ops.x == 25u || uStage1Ops.x == 26u) {\n"
+         "        float2 d = ((uStageColorSign[1] & 0x60u) != 0u) ? t1.rg : (t1.rg * 2.0f - 1.0f);\n"
+         "        uv2.xy += float2(d.x * uBumpParams.x + d.y * uBumpParams.w, d.x * uBumpParams.y + d.y * uBumpParams.z);\n"
+         "    }\n"
+         "    float4 t2 = ((texMask & 4u) != 0u) ? SampleStageTex(2u, tex2, cubeTex2, volTex2, smp2, uv2, (cubeMask & 4u) != 0u, (volMask & 4u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);\n"
+         "    if (uStage1Ops.x == 26u && (uBumpLuminance.z != 0.0f || uBumpLuminance.w != 0.0f)) {\n"
+         "        t2.rgb *= saturate(t1.b * uBumpLuminance.z + uBumpLuminance.w);\n"
+         "    }\n"
+         "    float4 t3 = ((texMask & 8u) != 0u) ? SampleStageTex(3u, tex3, cubeTex3, volTex3, smp3, uv3, (cubeMask & 8u) != 0u, (volMask & 8u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);\n"
+         "    float fogFactor = ComputeFogFactor(input.eyeDist.x);\n\n"
+         "    if (uStage0Ops.x > 1u) {\n"
+         "        EvalStage(uStage0Ops, uStage0Alpha, diffuse, current, tempReg, t0, uTFactor, specCol, (tempMask & 1u) != 0u, (texMask & 1u) != 0u, true);\n"
+         "        if (uStage1Ops.x > 1u) {\n"
+         "            EvalStage(uStage1Ops, uStage1Alpha, diffuse, current, tempReg, t1, uTFactor, specCol, (tempMask & 2u) != 0u, (texMask & 2u) != 0u, false);\n"
+         "            if (uStage2Ops.x > 1u) {\n"
+         "                EvalStage(uStage2Ops, uStage2Alpha, diffuse, current, tempReg, t2, uTFactor, specCol, (tempMask & 4u) != 0u, (texMask & 4u) != 0u, false);\n"
+         "                if (uStage3Ops.x > 1u) {\n"
+         "                    EvalStage(uStage3Ops, uStage3Alpha, diffuse, current, tempReg, t3, uTFactor, specCol, (tempMask & 8u) != 0u, (texMask & 8u) != 0u, false);\n"
+         "                }\n"
+         "            }\n"
+         "        }\n"
+         "    }\n"
+         "    if ((uFlags.x & 8u) != 0u || (uLightCount.z & 1u) != 0u) {\n"
+         "        current.rgb = saturate(current.rgb + specCol.rgb);\n"
+         "    }\n\n";
+    s += kSharedPsAlphaTestAndGammaHLSL;
+    s += kSharedPsFogHLSL;
+    s += kSharedPsGammaEpilogueHLSL;
+    return s;
+}
+
+static std::string DecompileXpuToHLSL(const char* relPath, uint32_t pt, const XboxPixelShaderDef* pDef) {
+    std::string s;
+    s.reserve(8192);
+    char line[512];
+    snprintf(line, sizeof(line),
+        "// ============================================================================\n"
+        "// Decompiled Xbox NV2A Pixel Shader (.xpu -> D3D11 HLSL ps_4_0)\n"
+        "// Source: %s (aPixelShaders[%u])\n",
+        relPath ? relPath : "", pt);
+    s += line;
+    if (pDef) {
+        uint32_t numStages = pDef->PSCombinerCount & 0xFu;
+        snprintf(line, sizeof(line),
+            "// PSB0 CombinerCount: 0x%08X (%u stages) | PSTextureModes: 0x%08X\n"
+            "// PSDotMapping: 0x%08X | PSInputTexture: 0x%08X | PSCompareMode: 0x%08X\n"
+            "// PSC0Mapping: 0x%08X | PSC1Mapping: 0x%08X | PSFinalCombinerConstants: 0x%08X\n",
+            pDef->PSCombinerCount, numStages, pDef->PSTextureModes,
+            pDef->PSDotMapping, pDef->PSInputTexture, pDef->PSCompareMode,
+            pDef->PSC0Mapping, pDef->PSC1Mapping, pDef->PSFinalCombinerConstants);
+        s += line;
+        for (uint32_t st = 0; st < numStages && st < 8u; ++st) {
+            snprintf(line, sizeof(line),
+                "// Stage %u: RGBIn=0x%08X AlphaIn=0x%08X RGBOut=0x%08X AlphaOut=0x%08X C0=0x%08X C1=0x%08X\n",
+                st, pDef->PSRGBInputs[st], pDef->PSAlphaInputs[st],
+                pDef->PSRGBOutputs[st], pDef->PSAlphaOutputs[st],
+                pDef->PSConstant0[st], pDef->PSConstant1[st]);
+            s += line;
+        }
+        snprintf(line, sizeof(line),
+            "// FinalCombiner: ABCD=0x%08X EFG=0x%08X FC0=0x%08X FC1=0x%08X\n",
+            pDef->PSFinalCombinerInputsABCD, pDef->PSFinalCombinerInputsEFG,
+            pDef->PSFinalCombinerConstant0, pDef->PSFinalCombinerConstant1);
+        s += line;
+    }
+    s += "// ============================================================================\n\n";
+    s += kSharedPerDrawCBAndPSInHLSL;
+    s += kSharedPsResourcesAndHelpersHLSL;
+    s += kSharedPsPrologueHLSL;
+
+    if (pt == 0u || pt == 1u || pt == 2u) {
+        s += "    // texbem t1, t0 BumpEnv UV perturbation\n"
+             "    {\n"
+             "        float2 d = ((uStageColorSign[0] & 0x60u) != 0u) ? t0.rg : (t0.rg * 2.0f - 1.0f);\n"
+             "        uv1.xy += float2(d.x * uBumpParams.x + d.y * uBumpParams.w, d.x * uBumpParams.y + d.y * uBumpParams.z);\n"
+             "        if ((texMask & 2u) != 0u) {\n"
+             "            t1 = SampleStageTex(1u, tex1, cubeTex1, volTex1, smp1, uv1, (cubeMask & 2u) != 0u, (volMask & 2u) != 0u);\n"
+             "        }\n"
+             "        if (uBumpLuminance.x != 0.0f || uBumpLuminance.y != 0.0f) {\n"
+             "            t1.rgb *= saturate(t0.b * uBumpLuminance.x + uBumpLuminance.y);\n"
+             "        }\n"
+             "    }\n";
+    }
+    s += "    float4 t2 = ((texMask & 4u) != 0u) ? SampleStageTex(2u, tex2, cubeTex2, volTex2, smp2, uv2, (cubeMask & 4u) != 0u, (volMask & 4u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);\n"
+         "    float4 t3 = ((texMask & 8u) != 0u) ? SampleStageTex(3u, tex3, cubeTex3, volTex3, smp3, uv3, (cubeMask & 8u) != 0u, (volMask & 8u) != 0u) : float4(1.0f, 1.0f, 1.0f, 1.0f);\n"
+         "    float fogFactor = ComputeFogFactor(input.eyeDist.x);\n\n";
+
+    switch (pt) {
+        case 0u: // emBump.xpu
+            s += "    current = t1;\n";
+            break;
+        case 1u: // lava.xpu
+            s += "    current.rgb = saturate(t1.a * t2.rgb + t1.rgb);\n"
+                 "    current.a   = saturate(t1.a * t2.b   + t1.b);\n";
+            break;
+        case 2u: // heatShimmer.xpu
+            s += "    current.rgb = t1.rgb * t2.rgb;\n"
+                 "    current.a   = t2.a * diffuse.a;\n";
+            break;
+        case 3u: // terrain_fog.xpu
+            s += "    current.rgb = uFogColor.rgb;\n"
+                 "    current.a   = (uFogParams.x > 0.5f) ? fogFactor : saturate(diffuse.a);\n";
+            break;
+        case 4u: // ghostsuit.xpu
+            s += "    float3 r1 = saturate(t1.rgb + uPsConst1.rgb);\n"
+                 "    current.rgb = (t0.a >= 0.5f) ? (uPsConst0.rgb * r1)   : (t0.rgb * diffuse.rgb);\n"
+                 "    current.a   = (t0.a >= 0.5f) ? (uPsConst0.a   * r1.b) : (t0.a   * diffuse.a);\n";
+            break;
+        case 5u: // selfglow.xpu
+            s += "    float4 r0 = saturate(uPsConst0 * t0.a + diffuse);\n"
+                 "    current = r0 * t0;\n";
+            break;
+        case 6u: // bumpreflect.xpu
+            s += "    float3 nTs = t0.rgb * 2.0f - 1.0f;\n"
+                 "    float3 uvw = float3(dot(uv1.xyz, nTs), dot(uv2.xyz, nTs), dot(uv3.xyz, nTs));\n"
+                 "    float3 Vw  = float3(uv1.w, uv2.w, uv3.w);\n"
+                 "    float3 Np  = (dot(uvw, uvw) > 1e-6f) ? normalize(uvw) : float3(0.0f, 0.0f, 1.0f);\n"
+                 "    float3 R   = (dot(Vw, Vw) > 1e-6f) ? reflect(-normalize(Vw), Np) : Np;\n"
+                 "    float4 refl = t3;\n"
+                 "    if ((texMask & 8u) != 0u) {\n"
+                 "        refl = ((cubeMask & 8u) != 0u)\n"
+                 "            ? cubeTex3.Sample(smp3, R)\n"
+                 "            : tex3.Sample(smp3, float2(R.x * 0.5f + 0.5f, 0.5f - R.y * 0.5f));\n"
+                 "    }\n"
+                 "    current = refl;\n";
+            break;
+        case 7u: // waterNM.xpu
+            s += "    current = (t0 + t1) * 0.5f;\n";
+            break;
+        case 8u: // screenHaze.xpu
+            s += "    float r0a = dot(t1.rgb, uPsConst0.aaa);\n"
+                 "    float r1a = dot(t2.rgb, uPsConst0.aaa);\n"
+                 "    float4 r0 = (r0a >= 0.5f) ? t1 : float4(uPsConst0.rgb, uPsConst0.b);\n"
+                 "    float4 r1 = (r1a >= 0.5f) ? t2 : float4(uPsConst0.rgb, uPsConst0.b);\n"
+                 "    r1.rgb = saturate(r0.rgb * uPsConst1.rgb + r1.rgb * uPsConst1.rgb);\n"
+                 "    r1.a   = saturate(r0.a   * uPsConst1.b   + r1.a   * uPsConst1.b);\n"
+                 "    r0a = dot(t3.rgb, uPsConst0.aaa);\n"
+                 "    r0 = (r0a >= 0.5f) ? t3 : float4(uPsConst0.rgb, uPsConst0.b);\n"
+                 "    current.rgb = saturate(uPsConst1.rgb * r0.rgb + r1.rgb);\n"
+                 "    current.a   = saturate(uPsConst1.a);\n";
+            break;
+        case 9u: // terrain.xpu
+            s += "    float3 r0 = lerp(t2.rgb, t1.rgb, t0.a);\n"
+                 "    r0 = saturate(r0 * t0.rgb * 2.0f);\n"
+                 "    r0 = saturate(r0 * t3.rgb * 2.0f);\n"
+                 "    current.rgb = r0 * diffuse.rgb;\n"
+                 "    current.a   = 1.0f;\n";
+            break;
+        case 10u: // terrain_nodetail.xpu
+            s += "    float3 r0 = lerp(t2.rgb, t1.rgb, t0.a);\n"
+                 "    current.rgb = saturate(r0 * t0.rgb * 2.0f) * diffuse.rgb;\n"
+                 "    current.a   = 1.0f;\n";
+            break;
+        case 11u:
+        case 14u: // gaussBlurSource.xpu / gaussBlur_Source_ms.xpu
+            s += "    float4 r0 = saturate(t0 - uPsConst0);\n"
+                 "    float4 r1 = saturate(r0 * 2.0f);\n"
+                 "    r1.rgb = saturate(uPsConst2.rgb - r1.rgb);\n"
+                 "    r1.a   = saturate(uPsConst2.b   - r1.a);\n"
+                 "    r1 = saturate((r1 - uPsConst2.a) * 2.0f);\n"
+                 "    r1 = t1 * r1 * uPsConst1;\n"
+                 "    current = saturate(r0 + r1);\n";
+            break;
+        case 12u:
+        case 13u: // gaussBlur.xpu / gaussBlur_ms.xpu
+            s += "    current = saturate(saturate(t0 * uPsConst0 + t1 * uPsConst1) + saturate(t2 * uPsConst2 + t3 * uPsConst3));\n";
+            break;
+        case 15u: // sightFinal.xpu
+            s += "    current = ((texMask & 2u) != 0u) ? tex1.Sample(smp1, t0.gb) : t0;\n";
+            break;
+        case 16u: // cloak.xpu
+            s += "    float3 r1 = saturate(t1.a * t1.rgb + t0.rgb);\n"
+                 "    float3 r0 = lerp(t3.rgb, t3.rgb * diffuse.rgb, uPsConst1.a);\n"
+                 "    r0 = lerp(r1, r0, uPsConst0.rgb);\n"
+                 "    current.rgb = (t2.a >= 0.5f) ? r0 : r1;\n"
+                 "    current.a   = uPsConst0.a;\n";
+            break;
+        case 17u: // cloakDissolve.xpu
+            s += "    float3 r0 = saturate(t1.a * t1.rgb + t0.rgb);\n"
+                 "    float3 r1 = lerp(t3.rgb, t3.rgb * diffuse.rgb, uPsConst1.a);\n"
+                 "    r1 = ((t2.b - (uPsConst2.a - 0.5f)) >= 0.5f) ? r1 : uPsConst2.rgb;\n"
+                 "    float3 blended = ((uPsConst2.a - (t2.b - 0.5f)) >= 0.5f) ? r0 : r1;\n"
+                 "    current.rgb = lerp(blended, uPsConst3.rgb, uPsConst3.a);\n"
+                 "    current.a   = uPsConst0.a;\n";
+            break;
+        case 18u: // cloakDissolveShadow.xpu
+            s += "    float r0a = t0.b - (uPsConst1.a - 0.5f);\n"
+                 "    current.rgb = ((r0a >= 0.5f) ? uPsConst1.rgb : uPsConst0.rgb) * uPsConst0.a;\n"
+                 "    current.a   = saturate(r0a * uPsConst0.a);\n";
+            break;
+        case 19u: // desaturate.xpu
+            s += "    float m = max(t0.r, max(t0.g, t0.b));\n"
+                 "    current.rgb = saturate(m + uPsConst1.rgb) * uPsConst0.rgb;\n"
+                 "    current.a   = m;\n";
+            break;
+        case 20u: // shield.xpu
+            s += "    float4 s1 = ((texMask & 2u) != 0u) ? tex1.Sample(smp1, t0.ar) : t1;\n"
+                 "    float4 r1 = t2 * uPsConst0.a;\n"
+                 "    float4 r0 = saturate(s1 + r1) * r1.a;\n"
+                 "    float r0a = saturate(t3.b - uPsConst0.b);\n"
+                 "    r1 = (r0a >= 0.5f) ? float4(r0.rgb, r0a) : uPsConst1;\n"
+                 "    current.rgb = r1.rgb;\n"
+                 "    current.a   = r0a;\n";
+            break;
+        case 21u: // shieldblur.xpu
+            s += "    float r0a = ((t0.a - 0.5f) + (t1.a - 0.5f)) * 0.5f;\n"
+                 "    float r1a = ((t2.a - 0.5f) + (t3.a - 0.5f)) * 0.5f;\n"
+                 "    r0a = saturate((r0a + r1a) * 0.5f + uPsConst0.a);\n"
+                 "    current = float4(r0a, r0a, r0a, r0a);\n";
+            break;
+        case 22u: // shield_part1.xpu
+            s += "    float r0a = clamp((t1.a - t0.a) + (t2.a - t0.a) + (t3.a - t0.a), -1.0f, 1.0f);\n"
+                 "    float r1a = (uPsConst0.a - t0.a) * uPsConst1.a + r0a;\n"
+                 "    r0a = saturate(r1a + uPsConst0.a);\n"
+                 "    current = float4(r0a, r0a, r0a, 1.0f);\n";
+            break;
+        case 23u: // shield_part2.xpu
+            s += "    float d = dot(t0.rgb, uPsConst2.rgb);\n"
+                 "    float r0a = t1.a - t0.a;\n"
+                 "    float4 r0 = saturate(float4(d + r0a, d + r0a, d + r0a, d + r0a));\n"
+                 "    float4 r1 = clamp((float4(t0.rgb, t0.b) - uPsConst1) * 2.0f, -1.0f, 1.0f);\n"
+                 "    r1.rgb = ((2.0f * r0.rgb - 1.0f) * uPsConst0.rgb + r1.rgb * uPsConst3.a) * 0.5f;\n"
+                 "    r1.a   = ((2.0f * r0.a   - 1.0f) * uPsConst0.b   + r1.a   * uPsConst3.a) * 0.5f;\n"
+                 "    r1.rgb = saturate(r1.rgb + uPsConst1.rgb);\n"
+                 "    r1.a   = saturate(r1.a   + uPsConst1.b);\n"
+                 "    float r0a2 = clamp((t0.a - uPsConst1.a) * 2.0f, -1.0f, 1.0f);\n"
+                 "    r0a2 = ((2.0f * r1.a - 1.0f) * uPsConst0.a + r0a2) * 0.5f;\n"
+                 "    current.rgb = r1.rgb;\n"
+                 "    current.a   = saturate(r0a2 + uPsConst1.a);\n";
+            break;
+        case 24u: // dof.xpu
+            s += "    float4 s1 = ((texMask & 2u) != 0u) ? tex1.Sample(smp1, t0.ar) : t1;\n"
+                 "    float r0_rgb = saturate(((2.0f * saturate(s1.a) - 1.0f) * uPsConst0.a + uPsConst1.a) * 0.5f);\n"
+                 "    float r1_rgb = saturate((2.0f * saturate(s1.a) - 1.0f) * uPsConst1.a);\n"
+                 "    float r0_a   = (s1.a >= 0.5f) ? r0_rgb : saturate(s1.a * uPsConst1.a);\n"
+                 "    current.rgb  = lerp(t2.rgb, t3.rgb, r1_rgb);\n"
+                 "    current.a    = saturate(r0_a);\n";
+            break;
+        case 25u: // alphadissolve.xpu
+            s += "    float r0a = t0.a - (saturate(uPsConst0.a) - 0.5f);\n"
+                 "    current.rgb = (r0a >= 0.5f) ? t0.rgb : t1.rgb;\n"
+                 "    current.a   = saturate(r0a);\n";
+            break;
+        case 26u: // alphadissolve_sep.xpu
+            s += "    float r0a = t1.b - (saturate(uPsConst0.a) - 0.5f);\n"
+                 "    current.rgb = (r0a >= 0.5f) ? t0.rgb : uPsConst1.rgb;\n"
+                 "    current.a   = saturate(r0a);\n";
+            break;
+        default: // 27u: alphadissolve_sep_glo.xpu
+            s += "    float4 r1 = float4(saturate(t1.bbb + diffuse.rgb) * t0.rgb, t0.a);\n"
+                 "    float r0a = t2.b - (saturate(uPsConst0.a) - 0.5f);\n"
+                 "    r1 = (r0a >= 0.5f) ? r1 : uPsConst1;\n"
+                 "    r0a = t2.b - (saturate(uPsConst0.b) - 0.5f);\n"
+                 "    current = (r0a >= 0.5f) ? r1 : uPsConst2;\n";
+            break;
+    }
+
+    s += "\n";
+    s += kSharedPsAlphaTestAndGammaHLSL;
+    if (pt != 3u) { // Skip fog for terrain_fog.xpu which outputs fog directly
+        s += kSharedPsFogHLSL;
+    }
+    s += kSharedPsGammaEpilogueHLSL;
+    return s;
+}
+
+static void GetShaderCacheFilePaths(
+    const char* shaderBaseName, char* outHlslPath, size_t hlslMax, char* outCsoPath, size_t csoMax)
+{
+    if (outHlslPath && hlslMax > 0) {
+        snprintf(outHlslPath, hlslMax, "%s\\shaders\\%s.hlsl", g_appRootDir, shaderBaseName);
+    }
+    if (outCsoPath && csoMax > 0) {
+        snprintf(outCsoPath, csoMax, "%s\\shaders\\%s.cso", g_appRootDir, shaderBaseName);
+    }
+}
+
+bool LoadShaderCsoFromDisk(const char* shaderBaseName, void** outData, size_t* outSize) {
+    if (!shaderBaseName || !outData || !outSize) return false;
+    *outData = nullptr;
+    *outSize = 0;
+
+    char csoPath[MAX_PATH] = {};
+    GetShaderCacheFilePaths(shaderBaseName, nullptr, 0, csoPath, sizeof(csoPath));
+    FILE* f = fopen(csoPath, "rb");
+    if (!f) return false;
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) {
+        fclose(f);
+        return false;
+    }
+
+    void* buf = malloc((size_t)sz);
+    if (!buf || fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        if (buf) free(buf);
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+    *outData = buf;
+    *outSize = (size_t)sz;
+    return true;
+}
+
+struct ShaderCompileJob {
+    std::string baseName;
+    std::string hlslSource;
+    bool        isPixel;
+};
+
+struct ShaderCompileBatchCtx {
+    const std::vector<ShaderCompileJob>* jobs;
+    volatile LONG                        nextIdx;
+    volatile LONG                        doneCount;
+    volatile LONG                        failCount;
+    volatile LONG                        currentJobIdx;
+    volatile LONG                        abortFlag;
+};
+
+static DWORD WINAPI ShaderCompileWorkerProc(LPVOID param) {
+    ShaderCompileBatchCtx* ctx = reinterpret_cast<ShaderCompileBatchCtx*>(param);
+    const size_t total = ctx->jobs->size();
+    for (;;) {
+        if (ctx->abortFlag != 0) break;
+        LONG idx = InterlockedIncrement(&ctx->nextIdx) - 1;
+        if (idx < 0 || (size_t)idx >= total) break;
+
+        InterlockedExchange(&ctx->currentJobIdx, idx);
+        const ShaderCompileJob& job = (*ctx->jobs)[(size_t)idx];
+        char hlslPath[MAX_PATH] = {};
+        char csoPath[MAX_PATH]  = {};
+        GetShaderCacheFilePaths(job.baseName.c_str(), hlslPath, sizeof(hlslPath), csoPath, sizeof(csoPath));
+
+        FILE* fHlsl = fopen(hlslPath, "wb");
+        if (fHlsl) {
+            fwrite(job.hlslSource.data(), 1, job.hlslSource.size(), fHlsl);
+            fclose(fHlsl);
+        }
+
+        ID3DBlob* blob    = nullptr;
+        ID3DBlob* errBlob = nullptr;
+        HRESULT hr = D3DCompile(
+            job.hlslSource.data(), job.hlslSource.size(), job.baseName.c_str(),
+            nullptr, nullptr,
+            job.isPixel ? "PSMain" : "VSMain",
+            job.isPixel ? "ps_4_0" : "vs_4_0",
+            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &errBlob);
+        if (SUCCEEDED(hr) && blob) {
+            FILE* fCso = fopen(csoPath, "wb");
+            if (fCso) {
+                fwrite(blob->GetBufferPointer(), 1, blob->GetBufferSize(), fCso);
+                fclose(fCso);
+            } else {
+                InterlockedIncrement(&ctx->failCount);
+            }
+            blob->Release();
+        } else {
+            InterlockedIncrement(&ctx->failCount);
+        }
+        if (errBlob) errBlob->Release();
+
+        InterlockedIncrement(&ctx->doneCount);
+    }
+    return 0;
+}
+
+void ClearShaderCacheDirectory() {
+    char shadersDir[MAX_PATH] = {};
+    snprintf(shadersDir, sizeof(shadersDir), "%s\\shaders", g_appRootDir);
+    EnsureDirExists(shadersDir);
+
+    char searchPattern[MAX_PATH] = {};
+    snprintf(searchPattern, sizeof(searchPattern), "%s\\*", shadersDir);
+
+    WIN32_FIND_DATAA fd = {};
+    HANDLE hFind = FindFirstFileA(searchPattern, &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            char filePath[MAX_PATH] = {};
+            snprintf(filePath, sizeof(filePath), "%s\\%s", shadersDir, fd.cFileName);
+            DeleteFileA(filePath);
+        }
+    } while (FindNextFileA(hFind, &fd));
+
+    FindClose(hFind);
+}
+
+bool IsShaderCacheReadyOnDisk() {
+    char shadersDir[MAX_PATH] = {};
+    snprintf(shadersDir, sizeof(shadersDir), "%s\\shaders", g_appRootDir);
+    EnsureDirExists(shadersDir);
+
+    char fixedVsCso[MAX_PATH] = {};
+    char fixedPsCso[MAX_PATH] = {};
+    GetShaderCacheFilePaths("fixed_vs", nullptr, 0, fixedVsCso, sizeof(fixedVsCso));
+    GetShaderCacheFilePaths("fixed_ps", nullptr, 0, fixedPsCso, sizeof(fixedPsCso));
+
+    return IsShaderCacheCompiledInIni() &&
+           GetFileAttributesA(fixedVsCso) != INVALID_FILE_ATTRIBUTES &&
+           GetFileAttributesA(fixedPsCso) != INVALID_FILE_ATTRIBUTES;
+}
+
+bool CompileAllGameShadersToCache(PFN_ShaderCompileProgressCallback progressCb, void* userData) {
+    ClearShaderCacheDirectory();
+
+    std::vector<ShaderCompileJob> jobs;
+    jobs.reserve(320);
+
+    // 1. Fixed-function Pixel & Vertex Shaders (place fixed_ps first so Thread #0 starts it immediately)
+    jobs.push_back({ "fixed_ps", BuildFixedPsHLSL(), true });
+    jobs.push_back({ "fixed_vs", BuildFixedVsHLSL(), false });
+
+    // 2. All .xpu Pixel Shaders from aPixelShaders[0..27] (0x007D1210) in VertexShaders/xbox
+    for (uint32_t pt = 0; pt < 28u; ++pt) {
+        const char* relPath = *reinterpret_cast<const char* const*>(0x007D1210u + pt * 8u);
+        if (!relPath || reinterpret_cast<uintptr_t>(relPath) < kMinValidXboxAddress) continue;
+
+        char fullPath[MAX_PATH] = {};
+        snprintf(fullPath, sizeof(fullPath), "%s\\%s", g_gameRootDir, relPath);
+        FILE* f = fopen(fullPath, "rb");
+        if (!f) continue;
+
+        uint32_t magic = 0;
+        XboxPixelShaderDef def = {};
+        bool ok = (fread(&magic, 1, 4, f) == 4 && magic == 0x30425350u &&
+                   fread(&def, 1, sizeof(XboxPixelShaderDef), f) == sizeof(XboxPixelShaderDef));
+        fclose(f);
+        if (!ok) continue;
+
+        const char* s1 = strrchr(relPath, '\\');
+        const char* s2 = strrchr(relPath, '/');
+        const char* baseName = (s1 > s2) ? (s1 + 1) : (s2 ? (s2 + 1) : relPath);
+        jobs.push_back({ baseName, DecompileXpuToHLSL(relPath, pt, &def), true });
+    }
+
+    // 3. All .xvu Vertex Shaders from aVertexShaders[0..65] (0x007D0BE0) in VertexShaders/xbox
+    std::vector<std::string> seenXvuNames;
+    seenXvuNames.reserve(300);
+    static const char* const kXvuSuffixes[5] = { ".xvu", "0.xvu", "1.xvu", "2.xvu", "3.xvu" };
+
+    for (uint32_t vsType = 0; vsType < 66u; ++vsType) {
+        uint32_t entryVa = ADDR_VERTEX_SHADERS_TABLE + vsType * 24u;
+        const char* prefixRel = *reinterpret_cast<const char* const*>(entryVa + 0u);
+        const DWORD* pDecl    = *reinterpret_cast<const DWORD* const*>(entryVa + 4u);
+        if (!prefixRel || reinterpret_cast<uintptr_t>(prefixRel) < kMinValidXboxAddress ||
+            !pDecl     || reinterpret_cast<uintptr_t>(pDecl)     < kMinValidXboxAddress)
+        {
+            continue;
+        }
+
+        XboxDeclElem elems[16] = {};
+        uint32_t numElems = 0;
+        ParseXboxVertexDeclaration(pDecl, false, elems, &numElems, nullptr);
+        if (numElems == 0) continue;
+
+        for (int sfxIdx = 0; sfxIdx < 5; ++sfxIdx) {
+            char relFile[MAX_PATH]  = {};
+            char fullFile[MAX_PATH] = {};
+            snprintf(relFile, sizeof(relFile), "%s%s", prefixRel, kXvuSuffixes[sfxIdx]);
+            snprintf(fullFile, sizeof(fullFile), "%s\\%s", g_gameRootDir, relFile);
+
+            const char* s1 = strrchr(relFile, '\\');
+            const char* s2 = strrchr(relFile, '/');
+            const char* baseName = (s1 > s2) ? (s1 + 1) : (s2 ? (s2 + 1) : relFile);
+
+            bool duplicate = false;
+            for (size_t k = 0; k < seenXvuNames.size(); ++k) {
+                if (_stricmp(seenXvuNames[k].c_str(), baseName) == 0) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+
+            FILE* f = fopen(fullFile, "rb");
+            if (!f) continue;
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (sz < 4) {
+                fclose(f);
+                continue;
+            }
+            std::vector<uint8_t> xvuBytes((size_t)sz);
+            if (fread(xvuBytes.data(), 1, (size_t)sz, f) != (size_t)sz) {
+                fclose(f);
+                continue;
+            }
+            fclose(f);
+
+            const DWORD* pFunction = reinterpret_cast<const DWORD*>(xvuBytes.data());
+            if ((pFunction[0] & 0xFFFFu) != 0x2078u) continue;
+
+            seenXvuNames.push_back(baseName);
+            jobs.push_back({
+                baseName,
+                DecompileXvuToHLSL(elems, numElems, pFunction, relFile, reinterpret_cast<uintptr_t>(pDecl)),
+                false
+            });
+        }
+    }
+
+    // Balance worker threads (3 threads: 1 for fixed_ps + 2 for the 307 .xpu/.xvu shaders)
+    // so all 308 shaders progress evenly across the segmented progress bar.
+    SYSTEM_INFO sysInfo = {};
+    GetSystemInfo(&sysInfo);
+    uint32_t numThreads = sysInfo.dwNumberOfProcessors;
+    if (numThreads < 1u) numThreads = 1u;
+    if (numThreads > 3u) numThreads = 3u;
+
+    ShaderCompileBatchCtx batchCtx = { &jobs, 0, 0, 0, 0, 0 };
+    HANDLE threads[3] = {};
+    for (uint32_t t = 0; t < numThreads; ++t) {
+        threads[t] = CreateThread(nullptr, 0, ShaderCompileWorkerProc, &batchCtx, 0, nullptr);
+    }
+
+    const uint32_t totalJobs = (uint32_t)jobs.size();
+    bool cancelled = false;
+    while (WaitForMultipleObjects(numThreads, threads, TRUE, 30) == WAIT_TIMEOUT) {
+        if (progressCb) {
+            LONG done   = batchCtx.doneCount;
+            LONG curIdx = batchCtx.currentJobIdx;
+            if (done < 0)                  done = 0;
+            if ((uint32_t)done > totalJobs) done = (LONG)totalJobs;
+            const char* curName = (curIdx >= 0 && (uint32_t)curIdx < totalJobs)
+                ? jobs[(size_t)curIdx].baseName.c_str()
+                : "fixed_ps";
+            if (!progressCb((uint32_t)done, totalJobs, curName, userData)) {
+                cancelled = true;
+                InterlockedExchange(&batchCtx.abortFlag, 1);
+            }
+        }
+    }
+
+    for (uint32_t t = 0; t < numThreads; ++t) {
+        if (threads[t]) CloseHandle(threads[t]);
+    }
+
+    if (cancelled) {
+        return false;
+    }
+    if (progressCb && totalJobs > 0) {
+        progressCb(totalJobs, totalJobs, jobs.back().baseName.c_str(), userData);
+    }
+    if (batchCtx.failCount == 0) {
+        SetShaderCacheCompiledInIni(true);
+    }
+    return true;
+}
+
+static HRESULT __stdcall Bridge_D3DDevice_CreateVertexShader(
+    const DWORD* pDeclaration, const DWORD* pFunction, DWORD* pHandle, DWORD Usage)
+{
+    (void)Usage;
+    if (!pHandle) return E_INVALIDARG;
+
+    XboxShaderDeclInfo info = {};
+    info.vsType = -1;
+    uint32_t lightVariant = 0u;
+
+    uintptr_t hAddr = reinterpret_cast<uintptr_t>(pHandle);
+    if (hAddr >= ADDR_VERTEX_SHADERS_TABLE && hAddr < ADDR_VERTEX_SHADERS_TABLE + 66 * 24) {
+        uint32_t offset = (uint32_t)(hAddr - ADDR_VERTEX_SHADERS_TABLE);
+        info.vsType = (int32_t)(offset / 24u);
+        uint32_t rem = offset % 24u;
+        if (rem >= 8u) lightVariant = (rem - 8u) / 4u;
+    }
+
+    XboxDeclElem elems[16] = {};
+    uint32_t numElems = 0;
+    ParseXboxVertexDeclaration(pDeclaration, (pFunction == nullptr), elems, &numElems, &info);
 
     if (pFunction && (pFunction[0] & 0xFFFFu) == 0x2078u) {
         uint32_t instCount = (pFunction[0] >> 16) & 0xFFFFu;
@@ -1294,17 +1711,22 @@ static HRESULT __stdcall Bridge_D3DDevice_CreateVertexShader(
     }
 
     if (pFunction && (pFunction[0] & 0xFFFFu) == 0x2078u && g_d3dDevice && numElems > 0) {
-        std::string hlsl = DecompileXvuToHLSL(elems, numElems, pFunction);
-        ID3DBlob* vsBlob  = nullptr;
-        ID3DBlob* errBlob = nullptr;
-        HRESULT hr = D3DCompile(
-            hlsl.data(), hlsl.size(), "XvuVS",
-            nullptr, nullptr, "VSMain", "vs_4_0",
-            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsBlob, &errBlob);
-        if (SUCCEEDED(hr) && vsBlob) {
-            g_d3dDevice->CreateVertexShader(
-                vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(),
-                nullptr, &info.gpuVS);
+        void*  csoData = nullptr;
+        size_t csoSize = 0;
+        if (info.vsType >= 0 && info.vsType < 66) {
+            const char* prefixRel = *reinterpret_cast<const char* const*>(ADDR_VERTEX_SHADERS_TABLE + (uint32_t)info.vsType * 24u);
+            if (prefixRel && reinterpret_cast<uintptr_t>(prefixRel) >= kMinValidXboxAddress) {
+                const char* s1 = strrchr(prefixRel, '\\');
+                const char* s2 = strrchr(prefixRel, '/');
+                const char* prefixBase = (s1 > s2) ? (s1 + 1) : (s2 ? (s2 + 1) : prefixRel);
+                char xvuBaseName[128] = {};
+                snprintf(xvuBaseName, sizeof(xvuBaseName), "%s%u.xvu", prefixBase, lightVariant);
+                LoadShaderCsoFromDisk(xvuBaseName, &csoData, &csoSize);
+            }
+        }
+
+        if (csoData && csoSize > 0) {
+            g_d3dDevice->CreateVertexShader(csoData, csoSize, nullptr, &info.gpuVS);
             D3D11_INPUT_ELEMENT_DESC ied[16] = {};
             uint32_t iedCount = 0;
             bool seenReg[16] = {};
@@ -1321,14 +1743,10 @@ static HRESULT __stdcall Bridge_D3DDevice_CreateVertexShader(
                 ied[iedCount].InstanceDataStepRate = 0;
                 iedCount++;
             }
-            g_d3dDevice->CreateInputLayout(
-                ied, iedCount,
-                vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(),
-                &info.gpuInputLayout);
+            g_d3dDevice->CreateInputLayout(ied, iedCount, csoData, csoSize, &info.gpuInputLayout);
             info.isCompiledXvu = (info.gpuVS != nullptr && info.gpuInputLayout != nullptr);
-            vsBlob->Release();
+            free(csoData);
         }
-        if (errBlob) errBlob->Release();
     }
 
     g_vertexShaders.push_back(info);

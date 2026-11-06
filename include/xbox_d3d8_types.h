@@ -467,9 +467,6 @@ struct alignas(16) PerDrawCBData {
     uint32_t stageColorSign[4];     // Stage 0..3 D3DTSS_COLORSIGN bitmask (bit5=B, bit6=G, bit7=R, bit8=A)
     float    bumpLuminance[4];      // x=stage0 LScale, y=stage0 LOffset, z=stage1 LScale, w=stage1 LOffset
     float    scissorRects[8][4];    // Up to 8 scissor rects (left, top, right, bottom)
-    float    rcStageC0[8][4];       // NV2A Register Combiner per-stage PSConstant0[0..7]
-    float    rcStageC1[8][4];       // NV2A Register Combiner per-stage PSConstant1[0..7]
-    float    rcFinalConst[2][4];    // NV2A Final Combiner PSFinalCombinerConstant0..1
 };
 #pragma pack(pop)
 
@@ -551,7 +548,6 @@ extern uint32_t                  g_scissorCount;
 extern bool                      g_scissorExclusive;
 extern RECT                      g_scissorRects[8];
 extern ID3D11VertexShader*       g_vs;
-extern ID3D11PixelShader*        g_ps;
 extern ID3D11InputLayout*        g_inputLayout;
 extern ID3D11Buffer*             g_cbPerDraw;
 extern ID3D11Buffer*             g_cbVSConstants;
@@ -597,9 +593,8 @@ extern uint32_t        g_curPrelitBaseVertex;
 extern bool            g_curPrelitUseCustomBase;
 
 bool GetXboxVertexShaderDecl(uint32_t handle, XboxShaderDeclInfo* outDecl);
-ID3D11PixelShader* GetActiveRegisterCombinerPS();
-void PopulateRegisterCombinerConstants(PerDrawCBData* cb);
 void __stdcall Bridge_D3DDevice_SetVertexShader(uint32_t Handle);
+bool LoadShaderCsoFromDisk(const char* shaderBaseName, void** outData, size_t* outSize);
 void InitXboxD3D8ShaderBridges();
 
 // d3d8_draw.cpp

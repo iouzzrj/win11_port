@@ -85,8 +85,6 @@ void TranslateXboxPath(const char* xboxPath, char* outWinPath, size_t outMaxLen)
             subFolder = "tdata";
         } else if (drive == 'z') {
             subFolder = "cache";
-        } else if (drive >= 'f' && drive <= 'm') {
-            subFolder = "mu";
         } else {
             // Already a Windows drive letter (e.g., C:\...)
             strncpy(outWinPath, xboxPath, outMaxLen - 1);

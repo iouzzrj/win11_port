@@ -99,18 +99,20 @@ static void __stdcall Bridge_XInitDevices(DWORD dwPreallocTypeCount, void* Preal
 }
 
 static DWORD __stdcall Bridge_XGetDevices(void* pDeviceType) {
-    // Compare against _XDEVICE_TYPE_GAMEPAD_TABLE (0x00747B8C)
-    if (reinterpret_cast<uintptr_t>(pDeviceType) == 0x00747B8C) {
+    uintptr_t devType = reinterpret_cast<uintptr_t>(pDeviceType);
+    // _XDEVICE_TYPE_GAMEPAD_TABLE (0x00747B8C)
+    if (devType == 0x00747B8C) {
         return 0x00000001; // Port 0 connected
     }
-    return 0; // No Memory Units or IR remotes needed (HDD U:\ used for saves)
+    return 0;
 }
 
 static BOOL __stdcall Bridge_XGetDeviceChanges(void* pDeviceType, DWORD* pdwInsertions, DWORD* pdwRemovals) {
     if (pdwInsertions) *pdwInsertions = 0;
     if (pdwRemovals)   *pdwRemovals   = 0;
 
-    if (reinterpret_cast<uintptr_t>(pDeviceType) == 0x00747B8C) {
+    uintptr_t devType = reinterpret_cast<uintptr_t>(pDeviceType);
+    if (devType == 0x00747B8C) {
         if (!g_padReportedInsert[0]) {
             g_padReportedInsert[0] = true;
             if (pdwInsertions) *pdwInsertions = 0x00000001;
@@ -311,7 +313,8 @@ static DWORD __stdcall Bridge_XInputDebugGetKeystroke(XBOX_XINPUT_KEYSTROKE* pKe
 
 static DWORD __stdcall Bridge_XMountMUA(DWORD dwPort, DWORD dwSlot, char* pchDrive) {
     (void)dwPort; (void)dwSlot;
-    if (pchDrive) *pchDrive = 'F';
+    if (pchDrive) *pchDrive = '\0';
+    SetLastError(ERROR_DEVICE_NOT_CONNECTED);
     return ERROR_DEVICE_NOT_CONNECTED;
 }
 
@@ -342,6 +345,6 @@ void InitXboxInput() {
     InstallBridge(0x0074FB64, &Bridge_XInputDebugInitKeyboardQueue); // _XInputDebugInitKeyboardQueue@4
     InstallBridge(0x0074F8A3, &Bridge_XInputDebugGetKeystroke);      // _XInputDebugGetKeystroke@4
 
-    // Stub cXBoxMemoryUnits::Startup (0x005AC2F0) to skip the 1.5s MU enumeration sleep
-    PatchRet(0x005AC2F0, 0, 0, false);
+    // Skip the 1.5-second Memory Unit startup enumeration wait in cXBoxMemoryUnits::Startup (0x005AC2F0)
+    PatchRet(0x005AC2F0, 0, 1, true);
 }

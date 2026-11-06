@@ -263,32 +263,56 @@ static void NormalizeXboxRootDrive(const char* lpRootPathName, char* outRoot, si
     }
 }
 
-static void SanitizeSaveGameAsciiName(const wchar_t* lpSaveGameName, char* outAscii, size_t outSize) {
-    strncpy(outAscii, "DefaultSave", outSize - 1);
-    outAscii[outSize - 1] = '\0';
-    if (lpSaveGameName && lpSaveGameName[0]) {
-        WideCharToMultiByte(CP_ACP, 0, lpSaveGameName, -1, outAscii, (int)(outSize - 1), nullptr, nullptr);
-        outAscii[outSize - 1] = '\0';
-        for (char* p = outAscii; *p; ++p) {
-            if (*p == '\\' || *p == '/' || *p == ':' || *p == '*' || *p == '?' || *p == '"' || *p == '<' || *p == '>' || *p == '|') {
-                *p = '_';
-            }
+// Exact _XapiSaveGameHashEncode@12 (0x0059FDEB) implementation:
+// Computes 48-bit polynomial rolling hash modulo 0x0000FFFFFFFFC5ULL and formats as 12 uppercase hex digits.
+static void XapiSaveGameHashEncode(const wchar_t* lpSaveGameName, char outHashDir[16]) {
+    uint64_t hash = 0;
+    if (lpSaveGameName) {
+        for (const wchar_t* p = lpSaveGameName; *p != 0; ++p) {
+            hash = ((hash << 16) + static_cast<uint16_t>(*p)) % 0x0000FFFFFFFFC5ULL;
         }
     }
+    snprintf(outHashDir, 16, "%012llX", static_cast<unsigned long long>(hash));
+}
+
+static bool ParseSaveMetaFile(const char* metaPath, wchar_t* outName, size_t maxChars) {
+    if (!outName || maxChars == 0) return false;
+    outName[0] = L'\0';
+    FILE* f = fopen(metaPath, "rb");
+    if (!f) return false;
+    wchar_t buf[256] = { 0 };
+    size_t readWChars = fread(buf, sizeof(wchar_t), 255, f);
+    fclose(f);
+    if (readWChars == 0) return false;
+    buf[readWChars] = L'\0';
+
+    const wchar_t* p = buf;
+    if (*p == 0xFEFF) {
+        ++p;
+    }
+    const wchar_t* nameLine = wcsstr(p, L"Name=");
+    if (!nameLine) return false;
+    nameLine += 5;
+    size_t i = 0;
+    while (nameLine[i] != L'\0' && nameLine[i] != L'\r' && nameLine[i] != L'\n' && i + 1 < maxChars) {
+        outName[i] = nameLine[i];
+        ++i;
+    }
+    outName[i] = L'\0';
+    return true;
 }
 
 static DWORD __stdcall Bridge_XCreateSaveGame(
     const char* lpRootPathName, const wchar_t* lpSaveGameName, DWORD dwCreationDisposition,
     DWORD dwCreateFlags, char* lpPathBuffer, UINT uSize)
 {
-    (void)dwCreateFlags;
     char root[8];
     NormalizeXboxRootDrive(lpRootPathName, root, sizeof(root));
-    char asciiName[kMaxXboxSaveGameNameChars];
-    SanitizeSaveGameAsciiName(lpSaveGameName, asciiName, sizeof(asciiName));
+    char hashName[16];
+    XapiSaveGameHashEncode(lpSaveGameName, hashName);
 
     char xboxSaveDir[MAX_PATH];
-    snprintf(xboxSaveDir, sizeof(xboxSaveDir), "%s%s\\", root, asciiName);
+    snprintf(xboxSaveDir, sizeof(xboxSaveDir), "%s%s\\", root, hashName);
     char winSaveDir[MAX_PATH];
     TranslateXboxPath(xboxSaveDir, winSaveDir, sizeof(winSaveDir));
 
@@ -300,16 +324,27 @@ static DWORD __stdcall Bridge_XCreateSaveGame(
             SetLastError(ERROR_PATH_NOT_FOUND);
             return ERROR_PATH_NOT_FOUND;
         }
+    } else if (dwCreationDisposition == CREATE_NEW && dirExists) {
+        SetLastError(ERROR_ALREADY_EXISTS);
+        return ERROR_ALREADY_EXISTS;
     } else {
         EnsureDirExists(winSaveDir);
-        // Save the Unicode name in SaveMeta.xbx for XFindFirstSaveGame
+        // Write exact Xbox SaveMeta.xbx format (0x005A0225): UTF-16LE BOM (0xFEFF) + "Name=<SaveGameName>\r\n" [+ "NoCopy=1\r\n"]
         char metaPath[MAX_PATH];
         snprintf(metaPath, sizeof(metaPath), "%s\\SaveMeta.xbx", winSaveDir);
         FILE* f = fopen(metaPath, "wb");
-        if (f && lpSaveGameName) {
-            fwrite(lpSaveGameName, sizeof(wchar_t), wcslen(lpSaveGameName) + 1, f);
-            fclose(f);
-        } else if (f) {
+        if (f) {
+            wchar_t metaBuf[256];
+            const wchar_t* safeName = lpSaveGameName ? lpSaveGameName : L"";
+            int len = 0;
+            if (dwCreateFlags & 1u) {
+                len = swprintf(metaBuf, 256, L"%lcName=%ls\r\nNoCopy=1\r\n", (wint_t)0xFEFF, safeName);
+            } else {
+                len = swprintf(metaBuf, 256, L"%lcName=%ls\r\n", (wint_t)0xFEFF, safeName);
+            }
+            if (len > 0) {
+                fwrite(metaBuf, sizeof(wchar_t), (size_t)len, f);
+            }
             fclose(f);
         }
     }
@@ -321,17 +356,7 @@ static DWORD __stdcall Bridge_XCreateSaveGame(
     return ERROR_SUCCESS;
 }
 
-static DWORD __stdcall Bridge_XDeleteSaveGame(const char* lpRootPathName, const wchar_t* lpSaveGameName) {
-    char root[8];
-    NormalizeXboxRootDrive(lpRootPathName, root, sizeof(root));
-    char asciiName[kMaxXboxSaveGameNameChars];
-    SanitizeSaveGameAsciiName(lpSaveGameName, asciiName, sizeof(asciiName));
-
-    char xboxSaveDir[MAX_PATH];
-    snprintf(xboxSaveDir, sizeof(xboxSaveDir), "%s%s\\", root, asciiName);
-    char winSaveDir[MAX_PATH];
-    TranslateXboxPath(xboxSaveDir, winSaveDir, sizeof(winSaveDir));
-
+static void DeleteDirectoryContentsAndRemove(const char* winSaveDir) {
     char searchPattern[MAX_PATH];
     snprintf(searchPattern, sizeof(searchPattern), "%s\\*", winSaveDir);
     WIN32_FIND_DATAA wfd = {};
@@ -347,6 +372,19 @@ static DWORD __stdcall Bridge_XDeleteSaveGame(const char* lpRootPathName, const 
         FindClose(hFind);
     }
     RemoveDirectoryA(winSaveDir);
+}
+
+static DWORD __stdcall Bridge_XDeleteSaveGame(const char* lpRootPathName, const wchar_t* lpSaveGameName) {
+    char root[8];
+    NormalizeXboxRootDrive(lpRootPathName, root, sizeof(root));
+    char hashName[16];
+    XapiSaveGameHashEncode(lpSaveGameName, hashName);
+
+    char xboxSaveDir[MAX_PATH];
+    snprintf(xboxSaveDir, sizeof(xboxSaveDir), "%s%s\\", root, hashName);
+    char winSaveDir[MAX_PATH];
+    TranslateXboxPath(xboxSaveDir, winSaveDir, sizeof(winSaveDir));
+    DeleteDirectoryContentsAndRemove(winSaveDir);
     return ERROR_SUCCESS;
 }
 
@@ -355,16 +393,12 @@ static bool FillSaveGameFindData(SaveFindContext* ctx, WIN32_FIND_DATAA* wfd, XB
         if ((wfd->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
             strcmp(wfd->cFileName, ".") != 0 && strcmp(wfd->cFileName, "..") != 0)
         {
+            char metaPath[MAX_PATH];
+            snprintf(metaPath, sizeof(metaPath), "%s\\%s\\SaveMeta.xbx", ctx->baseWinDir, wfd->cFileName);
             memset(outData, 0, sizeof(*outData));
             outData->wfd = *wfd;
             snprintf(outData->szSaveGameDirectory, sizeof(outData->szSaveGameDirectory), "%s%s\\", ctx->rootDrive, wfd->cFileName);
-            char metaPath[MAX_PATH];
-            snprintf(metaPath, sizeof(metaPath), "%s\\%s\\SaveMeta.xbx", ctx->baseWinDir, wfd->cFileName);
-            FILE* f = fopen(metaPath, "rb");
-            if (f) {
-                fread(outData->szSaveGameName, sizeof(wchar_t), kMaxXboxSaveGameNameChars - 1, f);
-                fclose(f);
-            } else {
+            if (!ParseSaveMetaFile(metaPath, outData->szSaveGameName, kMaxXboxSaveGameNameChars)) {
                 MultiByteToWideChar(CP_ACP, 0, wfd->cFileName, -1, outData->szSaveGameName, (int)(kMaxXboxSaveGameNameChars - 1));
             }
             return true;
@@ -424,36 +458,10 @@ static BOOL __stdcall Bridge_XFindClose(HANDLE hFindGame) {
     return Bridge_CloseHandle(hFindGame);
 }
 
-// Xbox Signature Calculation
-static HANDLE __stdcall Bridge_XCalculateSignatureBegin(DWORD dwFlags) {
-    (void)dwFlags;
-    uint8_t* ctx = (uint8_t*)calloc(1, kXboxShaContextAllocSize);
-    return (HANDLE)ctx;
-}
-
-static HANDLE __stdcall Bridge_XCalculateSignatureBeginEx(DWORD dwFlags, DWORD dwAltTitleId) {
-    (void)dwAltTitleId;
-    return Bridge_XCalculateSignatureBegin(dwFlags);
-}
-
-static DWORD __stdcall Bridge_XCalculateSignatureUpdate(HANDLE hCalcSig, const BYTE* pbData, ULONG cbData) {
-    if (hCalcSig && pbData) {
-        Krnl_XcSHAUpdate((uint8_t*)hCalcSig, pbData, cbData);
-    }
-    return ERROR_SUCCESS;
-}
-
-static DWORD __stdcall Bridge_XCalculateSignatureEnd(HANDLE hCalcSig, void* pSignature) {
-    if (pSignature) {
-        if (hCalcSig) {
-            memcpy(pSignature, hCalcSig, kXboxSignatureByteSize);
-        } else {
-            memset(pSignature, 0, kXboxSignatureByteSize);
-        }
-    }
-    if (hCalcSig) free(hCalcSig);
-    return ERROR_SUCCESS;
-}
+// Note: _XCalculateSignatureBeginEx@8 (0x005A09A9), _XCalculateSignatureBegin@4 (0x005A09EA),
+// _XCalculateSignatureUpdate@12 (0x005A09FE), and _XCalculateSignatureEnd@8 (0x005A0A4C)
+// execute natively in Ghost.exe using ds:[0x00010118] (XBE Certificate), __imp__XboxSignatureKey,
+// __imp__XboxAlternateSignatureKeys, _XboxHDKey, and _XcSHAInit/_XcSHAUpdate/_XcSHAFinal.
 
 // Xbox Section Loading (_XGetSectionHandleA, _XLoadSectionByHandle, _XFreeSectionByHandle, _XGetSectionSize)
 static constexpr int      kMaxXboxPeSections     = 40;
@@ -815,6 +823,83 @@ static int __stdcall Bridge_WideCharToMultiByte(UINT CodePage, DWORD dwFlags, LP
     return WideCharToMultiByte(CodePage, dwFlags, lpWideCharStr, cchWideChar, lpMultiByteStr, cbMultiByte, lpDefaultChar, lpUsedDefaultChar);
 }
 
+// ============================================================================
+// XNet / Winsock2 Bridges (ws2_32.dll)
+// ============================================================================
+#pragma comment(lib, "ws2_32.lib")
+extern "C" {
+    int       __stdcall WSAStartup(WORD wVersionRequested, void* lpWSAData);
+    int       __stdcall WSACleanup(void);
+    int       __stdcall WSAGetLastError(void);
+    int       __stdcall __WSAFDIsSet(uintptr_t fd, void* set);
+    uintptr_t __stdcall socket(int af, int type, int protocol);
+    int       __stdcall closesocket(uintptr_t s);
+    int       __stdcall setsockopt(uintptr_t s, int level, int optname, const char* optval, int optlen);
+    int       __stdcall bind(uintptr_t s, const void* name, int namelen);
+    int       __stdcall listen(uintptr_t s, int backlog);
+    uintptr_t __stdcall accept(uintptr_t s, void* addr, int* addrlen);
+    int       __stdcall select(int nfds, void* readfds, void* writefds, void* exceptfds, const void* timeout);
+    int       __stdcall recv(uintptr_t s, char* buf, int len, int flags);
+    int       __stdcall send(uintptr_t s, const char* buf, int len, int flags);
+}
+
+static int __stdcall Bridge_XNetStartup(const void* pDummy) {
+    (void)pDummy;
+    return 0;
+}
+
+static int __stdcall Bridge_WSAStartup(WORD wVersionRequested, void* lpWSAData) {
+    return WSAStartup(wVersionRequested, lpWSAData);
+}
+
+static int __stdcall Bridge_WSACleanup() {
+    return WSACleanup();
+}
+
+static uint32_t __stdcall Bridge_socket(int af, int type, int protocol) {
+    return static_cast<uint32_t>(socket(af, type, protocol));
+}
+
+static int __stdcall Bridge_closesocket(uint32_t s) {
+    return closesocket(static_cast<uintptr_t>(s));
+}
+
+static int __stdcall Bridge_setsockopt(uint32_t s, int level, int optname, const char* optval, int optlen) {
+    return setsockopt(static_cast<uintptr_t>(s), level, optname, optval, optlen);
+}
+
+static int __stdcall Bridge_bind(uint32_t s, const void* name, int namelen) {
+    return bind(static_cast<uintptr_t>(s), name, namelen);
+}
+
+static int __stdcall Bridge_listen(uint32_t s, int backlog) {
+    return listen(static_cast<uintptr_t>(s), backlog);
+}
+
+static uint32_t __stdcall Bridge_accept(uint32_t s, void* addr, int* addrlen) {
+    return static_cast<uint32_t>(accept(static_cast<uintptr_t>(s), addr, addrlen));
+}
+
+static int __stdcall Bridge_select(int nfds, void* readfds, void* writefds, void* exceptfds, const void* timeout) {
+    return select(nfds, readfds, writefds, exceptfds, timeout);
+}
+
+static int __stdcall Bridge_recv(uint32_t s, char* buf, int len, int flags) {
+    return recv(static_cast<uintptr_t>(s), buf, len, flags);
+}
+
+static int __stdcall Bridge_send(uint32_t s, const char* buf, int len, int flags) {
+    return send(static_cast<uintptr_t>(s), buf, len, flags);
+}
+
+static int __stdcall Bridge_WSAGetLastError() {
+    return WSAGetLastError();
+}
+
+static int __stdcall Bridge_WSAFDIsSet(uint32_t fd, void* set) {
+    return __WSAFDIsSet(static_cast<uintptr_t>(fd), set);
+}
+
 void InitXboxXapi() {
     InitializeCriticalSection(&g_findCs);
 
@@ -829,16 +914,12 @@ void InitXboxXapi() {
     InstallBridge(0x0059FD2C, &Bridge_XGetLaunchInfo);             // _XGetLaunchInfo@8
     PatchRet(0x0059FD90, 20, 0, true);                             // _XWriteTitleInfoAndRebootA@20
 
-    // SaveGame & Signature APIs
+    // SaveGame APIs (_XCalculateSignature* at 0x005A09A9..0x005A0A4C run natively in Ghost.exe)
     InstallBridge(0x005A0225, &Bridge_XCreateSaveGame);            // _XCreateSaveGame@24
     InstallBridge(0x005A0488, &Bridge_XDeleteSaveGame);            // _XDeleteSaveGame@8
     InstallBridge(0x005A0558, &Bridge_XFindFirstSaveGame);         // _XFindFirstSaveGame@8
     InstallBridge(0x005A0662, &Bridge_XFindNextSaveGame);          // _XFindNextSaveGame@8
     InstallBridge(0x005A06A9, &Bridge_XFindClose);                 // _XFindClose@4
-    InstallBridge(0x005A09A9, &Bridge_XCalculateSignatureBeginEx); // _XCalculateSignatureBeginEx@8
-    InstallBridge(0x005A09EA, &Bridge_XCalculateSignatureBegin);   // _XCalculateSignatureBegin@4
-    InstallBridge(0x005A09FE, &Bridge_XCalculateSignatureUpdate);  // _XCalculateSignatureUpdate@12
-    InstallBridge(0x005A0A4C, &Bridge_XCalculateSignatureEnd);     // _XCalculateSignatureEnd@8
 
     // File & Directory APIs
     InstallBridge(0x005A0A91, &Bridge_CloseHandle);                // _CloseHandle@4
@@ -866,7 +947,7 @@ void InitXboxXapi() {
     InstallBridge(0x005A1E92, &Bridge_XMountUtilityDrive);         // _XMountUtilityDrive@4
     PatchRet(0x005A1F97, 4, 0, true);                              // _XUnmountAlternateTitleA@4
     InstallBridge(0x005A1FF4, &Bridge_XGetDiskSectorSizeA);        // _XGetDiskSectorSizeA@4
-    PatchRet(0x005A208F, 12, 0, true);                             // _XMUNameFromDriveLetter@12
+    PatchRet(0x005A208F, 12, ERROR_INVALID_DRIVE, true);           // _XMUNameFromDriveLetter@12
 
     // Physical Memory & Synchronization & Thread APIs
     InstallBridge(0x005A216A, &Bridge_XPhysicalAlloc);             // _XPhysicalAlloc@16
@@ -933,7 +1014,7 @@ void InitXboxXapi() {
     InstallBridge(0x006AA8E7, &Bridge_MultiByteToWideChar);        // _MultiByteToWideChar@24
     InstallBridge(0x006AA9A2, &Bridge_WideCharToMultiByte);        // _WideCharToMultiByte@32
 
-    // 2. XNet / Winsock Offline Stubs (prevents null CXnSock* dereferences when hkBsdSockServer calls XNET)
+    // 2. XNet / Winsock2 Bridges (routed to host ws2_32.dll)
     constexpr uint32_t kAddrXNetSocket         = 0x00739AA0u;
     constexpr uint32_t kAddrXNetCloseSocket    = 0x00739AABu;
     constexpr uint32_t kAddrXNetSetsockopt     = 0x00739AB6u;
@@ -948,24 +1029,39 @@ void InitXboxXapi() {
     constexpr uint32_t kAddrWSACleanup         = 0x00739E19u;
     constexpr uint32_t kAddrWSAGetLastError    = 0x00739E90u;
     constexpr uint32_t kAddrWSAFDIsSet         = 0x00739E95u;
-    constexpr uint32_t kXboxInvalidSocket      = 0xFFFFFFFFu;
-    constexpr uint32_t kXboxSocketError        = 0xFFFFFFFFu;
-    constexpr uint32_t kXboxWsaErrorNetDown    = 10050u;
 
-    PatchRet(kAddrXNetStartup,     4,  0,                   true); // _XNetStartup@4 -> 0
-    PatchRet(kAddrWSAStartup,      8,  0,                   true); // _WSAStartup@8 -> 0
-    PatchRet(kAddrWSACleanup,      0,  0,                   true); // _WSACleanup@0 -> 0
-    PatchRet(kAddrXNetSocket,      12, kXboxInvalidSocket,  true); // _socket@12 -> INVALID_SOCKET
-    PatchRet(kAddrXNetCloseSocket, 4,  0,                   true); // _closesocket@4 -> 0
-    PatchRet(kAddrXNetSetsockopt,  20, kXboxSocketError,    true); // _setsockopt@20 -> SOCKET_ERROR
-    PatchRet(kAddrXNetBind,        12, kXboxSocketError,    true); // _bind@12 -> SOCKET_ERROR
-    PatchRet(kAddrXNetListen,      8,  kXboxSocketError,    true); // _listen@8 -> SOCKET_ERROR
-    PatchRet(kAddrXNetAccept,      12, kXboxInvalidSocket,  true); // _accept@12 -> INVALID_SOCKET
-    PatchRet(kAddrXNetSelect,      20, kXboxSocketError,    true); // _select@20 -> SOCKET_ERROR
-    PatchRet(kAddrXNetRecv,        16, kXboxSocketError,    true); // _recv@16 -> SOCKET_ERROR
-    PatchRet(kAddrXNetSend,        16, kXboxSocketError,    true); // _send@16 -> SOCKET_ERROR
-    PatchRet(kAddrWSAGetLastError, 0,  kXboxWsaErrorNetDown,true); // _WSAGetLastError@0 -> WSAENETDOWN
-    PatchRet(kAddrWSAFDIsSet,      8,  0,                   true); // ___WSAFDIsSet@8 -> 0
+    if (g_enableHavokDebugServer) {
+        InstallBridge(kAddrXNetStartup,     &Bridge_XNetStartup);     // _XNetStartup@4
+        InstallBridge(kAddrWSAStartup,      &Bridge_WSAStartup);      // _WSAStartup@8
+        InstallBridge(kAddrWSACleanup,      &Bridge_WSACleanup);      // _WSACleanup@0
+        InstallBridge(kAddrXNetSocket,      &Bridge_socket);          // _socket@12
+        InstallBridge(kAddrXNetCloseSocket, &Bridge_closesocket);     // _closesocket@4
+        InstallBridge(kAddrXNetSetsockopt,  &Bridge_setsockopt);      // _setsockopt@20
+        InstallBridge(kAddrXNetBind,        &Bridge_bind);            // _bind@12
+        InstallBridge(kAddrXNetListen,      &Bridge_listen);          // _listen@8
+        InstallBridge(kAddrXNetAccept,      &Bridge_accept);          // _accept@12
+        InstallBridge(kAddrXNetSelect,      &Bridge_select);          // _select@20
+        InstallBridge(kAddrXNetRecv,        &Bridge_recv);            // _recv@16
+        InstallBridge(kAddrXNetSend,        &Bridge_send);            // _send@16
+        InstallBridge(kAddrWSAGetLastError, &Bridge_WSAGetLastError); // _WSAGetLastError@0
+        InstallBridge(kAddrWSAFDIsSet,      &Bridge_WSAFDIsSet);      // ___WSAFDIsSet@8
+    } else {
+        // Default: keep Havok Visual Debugger (hkBsdSockServer on port 25001) offline without opening local listening sockets
+        PatchRet(kAddrXNetStartup,     4,  0,           true);
+        PatchRet(kAddrWSAStartup,      8,  0,           true);
+        PatchRet(kAddrWSACleanup,      0,  0,           true);
+        PatchRet(kAddrXNetSocket,      12, 0xFFFFFFFFu, true); // INVALID_SOCKET
+        PatchRet(kAddrXNetCloseSocket, 4,  0,           true);
+        PatchRet(kAddrXNetSetsockopt,  20, 0xFFFFFFFFu, true); // SOCKET_ERROR
+        PatchRet(kAddrXNetBind,        12, 0xFFFFFFFFu, true); // SOCKET_ERROR
+        PatchRet(kAddrXNetListen,      8,  0xFFFFFFFFu, true); // SOCKET_ERROR
+        PatchRet(kAddrXNetAccept,      12, 0xFFFFFFFFu, true); // INVALID_SOCKET
+        PatchRet(kAddrXNetSelect,      20, 0,           true);
+        PatchRet(kAddrXNetRecv,        16, 0xFFFFFFFFu, true); // SOCKET_ERROR
+        PatchRet(kAddrXNetSend,        16, 0xFFFFFFFFu, true); // SOCKET_ERROR
+        PatchRet(kAddrWSAGetLastError, 0,  10050u,      true); // WSAENETDOWN
+        PatchRet(kAddrWSAFDIsSet,      8,  0,           true);
+    }
 }
 
 void InitXboxKernelAndXapi() {

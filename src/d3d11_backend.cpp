@@ -3,14 +3,12 @@
 #include "xbox_d3d8_types.h"
 #include <d3d11.h>
 #include <dxgi.h>
-#include <d3dcompiler.h>
 #include <math.h>
 #include <stdio.h>
 #include <vector>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
-#pragma comment(lib, "d3dcompiler.lib")
 
 // ============================================================================
 // Direct3D 11 Device & Xbox CDevice State
@@ -36,7 +34,6 @@ ID3D11ShaderResourceView* g_gammaLutSRV       = nullptr;
 bool                      g_hasGammaRamp      = false;
 
 ID3D11VertexShader*       g_vs                = nullptr;
-ID3D11PixelShader*        g_ps                = nullptr;
 ID3D11InputLayout*        g_inputLayout       = nullptr;
 ID3D11Buffer*             g_cbPerDraw         = nullptr;
 ID3D11Buffer*             g_cbVSConstants     = nullptr;
@@ -63,14 +60,6 @@ static uint32_t* __stdcall Bridge_MakeRequestedSpace(uint32_t a, uint32_t b) {
     Bridge_D3DDevice_MakeSpace();
     return g_dummyPushBuf;
 }
-
-// ============================================================================
-// HLSL Unified Vertex & Pixel Shaders (generated from shaders/ghost.hlsl)
-// ============================================================================
-
-static const char* kGhostHLSL =
-#include "ghost_hlsl.inc"
-;
 
 // ============================================================================
 // RenderState, BlendState, DepthStencilState, RasterizerState, SamplerState Cache
@@ -650,7 +639,8 @@ static void __stdcall Bridge_D3DDevice_Clear(
     }
 
     // Sub-rectangle or partial-channel clear via screen-space quad draw
-    if (!g_vs || !g_ps || !g_cbPerDraw || !g_inputLayout) return;
+    ID3D11PixelShader* clearPS = GetPixelShaderPermutation(0u);
+    if (!g_vs || !clearPS || !g_cbPerDraw || !g_inputLayout) return;
 
     RECT fullDefaultRect = { 0, 0, (LONG)vpW, (LONG)vpH };
     if (Count == 0 || !rects) {
@@ -722,8 +712,7 @@ static void __stdcall Bridge_D3DDevice_Clear(
 
     g_d3dCtx->VSSetShader(g_vs, nullptr, 0);
     g_d3dCtx->VSSetConstantBuffers(0, 1, &g_cbPerDraw);
-    ID3D11PixelShader* clearPS = GetPixelShaderPermutation(0u);
-    g_d3dCtx->PSSetShader(clearPS ? clearPS : g_ps, nullptr, 0);
+    g_d3dCtx->PSSetShader(clearPS, nullptr, 0);
     g_d3dCtx->PSSetConstantBuffers(0, 1, &g_cbPerDraw);
 
     for (DWORD i = 0; i < Count; ++i) {
@@ -748,252 +737,6 @@ static void __stdcall Bridge_D3DDevice_Clear(
     }
 
     if (writeMask && rtv == g_rtv) g_backBufferDirty = true;
-}
-
-static ID3D11Texture2D*          g_osdTex           = nullptr;
-static ID3D11ShaderResourceView* g_osdSRV           = nullptr;
-static ID3D11Buffer*             g_osdVB            = nullptr;
-static uint32_t                  g_osdTexW          = 0;
-static uint32_t                  g_osdTexH          = 0;
-static wchar_t                   g_lastOsdText[256] = { 0 };
-static HFONT                     g_hOsdFont         = nullptr;
-
-static void UpdateOsdTexture(const wchar_t* text) {
-    if (!g_d3dDevice || !g_d3dCtx || !text || !text[0]) return;
-    if (!g_hOsdFont) {
-        g_hOsdFont = CreateFontW(
-            -12, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-            DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-    }
-
-    HDC hdcScreen = GetDC(nullptr);
-    HDC hdc = CreateCompatibleDC(hdcScreen);
-    ReleaseDC(nullptr, hdcScreen);
-    if (!hdc) return;
-
-    HGDIOBJ oldFont = SelectObject(hdc, g_hOsdFont);
-    SIZE sz = {};
-    GetTextExtentPoint32W(hdc, text, (int)wcslen(text), &sz);
-
-    uint32_t w = (uint32_t)(sz.cx + 14);
-    uint32_t h = (uint32_t)(sz.cy + 6);
-    if (w < 16)  w = 16;
-    if (w > 620) w = 620;
-    if (h < 14)  h = 14;
-    if (h > 64)  h = 64;
-
-    BITMAPINFO bmi = {};
-    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth       = (LONG)w;
-    bmi.bmiHeader.biHeight      = -(LONG)h; // top-down DIB
-    bmi.bmiHeader.biPlanes      = 1;
-    bmi.bmiHeader.biBitCount    = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void* dibBits = nullptr;
-    HBITMAP hbm = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &dibBits, nullptr, 0);
-    if (hbm && dibBits) {
-        HGDIOBJ oldBm = SelectObject(hdc, hbm);
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, RGB(255, 255, 255));
-
-        uint32_t numPx = w * h;
-        std::vector<uint8_t> shadowMask(numPx, 0);
-        std::vector<uint8_t> glyphMask(numPx, 0);
-
-        // 1. Render 1px drop-shadow mask at (+6, +4)
-        memset(dibBits, 0, numPx * 4);
-        RECT rcShadow = { 8, 4, (LONG)w, (LONG)h };
-        DrawTextW(hdc, text, -1, &rcShadow, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
-        GdiFlush();
-        const uint32_t* px = reinterpret_cast<const uint32_t*>(dibBits);
-        for (uint32_t i = 0; i < numPx; ++i) {
-            uint8_t r = (uint8_t)((px[i] >> 16) & 0xFF);
-            uint8_t g = (uint8_t)((px[i] >> 8)  & 0xFF);
-            uint8_t b = (uint8_t)(px[i] & 0xFF);
-            uint8_t m = r > g ? r : g;
-            shadowMask[i] = m > b ? m : b;
-        }
-
-        // 2. Render crisp foreground glyph mask at (+7, +3)
-        memset(dibBits, 0, numPx * 4);
-        RECT rcGlyph = { 7, 3, (LONG)w - 1, (LONG)h - 1 };
-        DrawTextW(hdc, text, -1, &rcGlyph, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
-        GdiFlush();
-        for (uint32_t i = 0; i < numPx; ++i) {
-            uint8_t r = (uint8_t)((px[i] >> 16) & 0xFF);
-            uint8_t g = (uint8_t)((px[i] >> 8)  & 0xFF);
-            uint8_t b = (uint8_t)(px[i] & 0xFF);
-            uint8_t m = r > g ? r : g;
-            glyphMask[i] = m > b ? m : b;
-        }
-
-        // 3. Composite semi-transparent rounded dark pill + shadow + bright glyph into BGRA8
-        std::vector<uint32_t> outBgra(numPx, 0);
-        for (uint32_t y = 0; y < h; ++y) {
-            for (uint32_t x = 0; x < w; ++x) {
-                // 3px corner bevel clip for rounded badge
-                uint32_t dx = (x < 3) ? (2 - x) : ((x >= w - 3) ? (x - (w - 3)) : 0);
-                uint32_t dy = (y < 3) ? (2 - y) : ((y >= h - 3) ? (y - (h - 3)) : 0);
-                bool insidePill = (dx + dy <= 2);
-
-                uint32_t idx = y * w + x;
-                float bgA = insidePill ? (135.0f / 255.0f) : 0.0f;
-                float shA = shadowMask[idx] * (1.0f / 255.0f);
-                float fgA = glyphMask[idx]  * (1.0f / 255.0f);
-
-                // Base dark translucent pill color: RGB(12, 16, 22)
-                float r = 12.0f * (1.0f - shA);
-                float g = 16.0f * (1.0f - shA);
-                float b = 22.0f * (1.0f - shA);
-                float a = bgA + shA * (1.0f - bgA);
-
-                // Blend foreground glyph: RGB(240, 246, 255)
-                r = r * (1.0f - fgA) + 240.0f * fgA;
-                g = g * (1.0f - fgA) + 246.0f * fgA;
-                b = b * (1.0f - fgA) + 255.0f * fgA;
-                a = a + fgA * (1.0f - a);
-
-                uint32_t outR = (uint32_t)(r + 0.5f); if (outR > 255) outR = 255;
-                uint32_t outG = (uint32_t)(g + 0.5f); if (outG > 255) outG = 255;
-                uint32_t outB = (uint32_t)(b + 0.5f); if (outB > 255) outB = 255;
-                uint32_t outA = (uint32_t)(a * 255.0f + 0.5f); if (outA > 255) outA = 255;
-
-                outBgra[idx] = (outA << 24) | (outR << 16) | (outG << 8) | outB;
-            }
-        }
-
-        if (!g_osdTex || g_osdTexW != w || g_osdTexH != h) {
-            if (g_osdSRV) { g_osdSRV->Release(); g_osdSRV = nullptr; }
-            if (g_osdTex) { g_osdTex->Release(); g_osdTex = nullptr; }
-            g_osdTexW = w;
-            g_osdTexH = h;
-
-            D3D11_TEXTURE2D_DESC td = {};
-            td.Width            = w;
-            td.Height           = h;
-            td.MipLevels        = 1;
-            td.ArraySize        = 1;
-            td.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
-            td.SampleDesc.Count = 1;
-            td.Usage            = D3D11_USAGE_DEFAULT;
-            td.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
-
-            D3D11_SUBRESOURCE_DATA initData = {};
-            initData.pSysMem     = outBgra.data();
-            initData.SysMemPitch = w * 4;
-            if (SUCCEEDED(g_d3dDevice->CreateTexture2D(&td, &initData, &g_osdTex))) {
-                g_d3dDevice->CreateShaderResourceView(g_osdTex, nullptr, &g_osdSRV);
-            }
-        } else {
-            g_d3dCtx->UpdateSubresource(g_osdTex, 0, nullptr, outBgra.data(), w * 4, 0);
-        }
-
-        SelectObject(hdc, oldBm);
-        DeleteObject(hbm);
-    }
-
-    SelectObject(hdc, oldFont);
-    DeleteDC(hdc);
-}
-
-void DrawOsdOverlayOnBackbuffer() {
-    if (!g_d3dDevice || !g_d3dCtx || !g_rtv || !g_vs || !g_ps || !g_cbPerDraw) return;
-    if (!g_osdShowFps) return;
-
-    wchar_t curText[64];
-    swprintf(curText, 64, L"%.1f FPS", g_osdCurrentFps);
-
-    if (wcscmp(curText, g_lastOsdText) != 0 || !g_osdSRV) {
-        wcscpy(g_lastOsdText, curText);
-        UpdateOsdTexture(curText);
-    }
-    if (!g_osdSRV || g_osdTexW == 0 || g_osdTexH == 0) return;
-
-    if (!g_osdVB) {
-        D3D11_BUFFER_DESC bd = {};
-        bd.ByteWidth      = 4 * sizeof(UnifiedVertex);
-        bd.Usage          = D3D11_USAGE_DYNAMIC;
-        bd.BindFlags      = D3D11_BIND_VERTEX_BUFFER;
-        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        if (FAILED(g_d3dDevice->CreateBuffer(&bd, nullptr, &g_osdVB))) return;
-    }
-
-    float x0 = (float)(640 - (int)g_osdTexW - 8);
-    float y0 = 8.0f;
-    float x1 = x0 + (float)g_osdTexW;
-    float y1 = y0 + (float)g_osdTexH;
-
-    UnifiedVertex quad[4] = {};
-    quad[0] = { x0, y0, 0.0f, 1.0f, 0,0,1, 1,1,1,1, 0.0f, 0.0f, 0,0, 0,0, 0,0 };
-    quad[1] = { x1, y0, 0.0f, 1.0f, 0,0,1, 1,1,1,1, 1.0f, 0.0f, 0,0, 0,0, 0,0 };
-    quad[2] = { x0, y1, 0.0f, 1.0f, 0,0,1, 1,1,1,1, 0.0f, 1.0f, 0,0, 0,0, 0,0 };
-    quad[3] = { x1, y1, 0.0f, 1.0f, 0,0,1, 1,1,1,1, 1.0f, 1.0f, 0,0, 0,0, 0,0 };
-
-    D3D11_MAPPED_SUBRESOURCE mappedVB = {};
-    if (SUCCEEDED(g_d3dCtx->Map(g_osdVB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedVB))) {
-        memcpy(mappedVB.pData, quad, sizeof(quad));
-        g_d3dCtx->Unmap(g_osdVB, 0);
-    }
-
-    PerDrawCBData cb = {};
-    cb.viewport[0]    = 0.0f;
-    cb.viewport[1]    = 0.0f;
-    cb.viewport[2]    = 640.0f;
-    cb.viewport[3]    = 480.0f;
-    cb.stage0Ops[0]   = 2u; // D3DTOP_SELECTARG1
-    cb.stage0Ops[1]   = 2u; // D3DTA_TEXTURE
-    cb.stage0Alpha[0] = 2u; // D3DTOP_SELECTARG1
-    cb.stage0Alpha[1] = 2u; // D3DTA_TEXTURE
-    cb.flags[0]       = 1u; // isRhw = 1
-    cb.flags[1]       = 1u; // texMask = Stage 0
-    cb.alphaTest[2]   = 1.0f; // gamma = 1.0
-    cb.alphaTest[3]   = 1.0f; // brightness = 1.0
-    cb.uvScale01[0]   = 1.0f;
-    cb.uvScale01[1]   = 1.0f;
-
-    D3D11_MAPPED_SUBRESOURCE mappedCB = {};
-    if (SUCCEEDED(g_d3dCtx->Map(g_cbPerDraw, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedCB))) {
-        memcpy(mappedCB.pData, &cb, sizeof(cb));
-        g_d3dCtx->Unmap(g_cbPerDraw, 0);
-    }
-
-    g_d3dCtx->OMSetRenderTargets(1, &g_rtv, nullptr);
-    D3D11_VIEWPORT vp11 = { 0.0f, 0.0f, 640.0f, 480.0f, 0.0f, 1.0f };
-    g_d3dCtx->RSSetViewports(1, &vp11);
-
-    ID3D11BlendState*        bs  = GetBlendState(1u, 5u /* SRCALPHA */, 6u /* INVSRCALPHA */, 1u /* ADD */, 0x0Fu);
-    ID3D11DepthStencilState* ds  = GetDepthState(0u, 0u, 8u, 0u, 1u, 1u, 1u, 8u, 0xFFu, 0xFFu);
-    ID3D11RasterizerState*   rs  = GetRastState(0u, 3u, 0u, false, 0x0900u);
-    ID3D11SamplerState*      smp = GetSamplerState(kXboxTexAddressClamp, kXboxTexAddressClamp, kXboxTexFilterPoint, 0u);
-
-    float blendFactor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-    g_d3dCtx->OMSetBlendState(bs, blendFactor, 0xFFFFFFFFu);
-    g_d3dCtx->OMSetDepthStencilState(ds, 0);
-    g_d3dCtx->RSSetState(rs);
-
-    g_d3dCtx->IASetInputLayout(g_inputLayout);
-    UINT stride = sizeof(UnifiedVertex);
-    UINT offset = 0;
-    g_d3dCtx->IASetVertexBuffers(0, 1, &g_osdVB, &stride, &offset);
-    g_d3dCtx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-
-    g_d3dCtx->VSSetShader(g_vs, nullptr, 0);
-    g_d3dCtx->VSSetConstantBuffers(0, 1, &g_cbPerDraw);
-    ID3D11PixelShader* osdPS = GetPixelShaderPermutation(0u);
-    g_d3dCtx->PSSetShader(osdPS ? osdPS : g_ps, nullptr, 0);
-    g_d3dCtx->PSSetConstantBuffers(0, 1, &g_cbPerDraw);
-
-    ID3D11ShaderResourceView* srvs[4] = { g_osdSRV, nullptr, nullptr, nullptr };
-    ID3D11SamplerState*       smps[4] = { smp, smp, smp, smp };
-    g_d3dCtx->PSSetShaderResources(0, 4, srvs);
-    g_d3dCtx->PSSetSamplers(0, 4, smps);
-
-    g_d3dCtx->Draw(4, 0);
-
-    ID3D11ShaderResourceView* nullSrv = nullptr;
-    g_d3dCtx->PSSetShaderResources(0, 1, &nullSrv);
 }
 
 static DWORD __stdcall Bridge_D3DDevice_Swap(DWORD Flags) {
@@ -1098,34 +841,33 @@ static void __cdecl Bridge_rlMain_SetGamma(float gamma, float brightness) {
 // Device Creation (_Direct3D_CreateDevice@24 at 0x006BCD20)
 // ============================================================================
 
-static constexpr uint32_t kNumPsPermutations = 30u; // 0 = fixed-function, 1..28 = aPixelShaders[0..27], 29 = dynamic RC
+static constexpr uint32_t kNumPsPermutations = 29u; // 0 = fixed-function, 1..28 = aPixelShaders[0..27]
 static ID3D11PixelShader* g_psPermutations[kNumPsPermutations] = {};
 
 ID3D11PixelShader* GetPixelShaderPermutation(uint32_t psMode) {
-    if (!g_d3dDevice || psMode >= kNumPsPermutations) return g_ps;
+    if (!g_d3dDevice) return nullptr;
+    if (psMode >= kNumPsPermutations) psMode = 0u;
     if (g_psPermutations[psMode]) return g_psPermutations[psMode];
 
-    char modeBuf[16];
-    snprintf(modeBuf, sizeof(modeBuf), "%uu", psMode);
-    const D3D_SHADER_MACRO macros[] = {
-        { "FIXED_PS_MODE", modeBuf },
-        { nullptr, nullptr }
-    };
-    ID3DBlob* psBlob  = nullptr;
-    ID3DBlob* errBlob = nullptr;
-    HRESULT hr = D3DCompile(
-        kGhostHLSL, strlen(kGhostHLSL), "GhostPSPerm",
-        macros, nullptr, "PSMain", "ps_4_0",
-        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &errBlob);
-    if (SUCCEEDED(hr) && psBlob) {
-        g_d3dDevice->CreatePixelShader(
-            psBlob->GetBufferPointer(), psBlob->GetBufferSize(),
-            nullptr, &g_psPermutations[psMode]);
-        psBlob->Release();
+    const char* baseName = "fixed_ps";
+    if (psMode > 0u) {
+        uint32_t pt = psMode - 1u;
+        if (pt == 13u) pt = 12u; // gaussBlur_ms.xpu -> gaussBlur.xpu
+        if (pt == 14u) pt = 11u; // gaussBlur_Source_ms.xpu -> gaussBlurSource.xpu
+        const char* relPath = *reinterpret_cast<const char* const*>(0x007D1210u + pt * 8u);
+        if (relPath && reinterpret_cast<uintptr_t>(relPath) >= kMinValidXboxAddress) {
+            const char* s1 = strrchr(relPath, '\\');
+            const char* s2 = strrchr(relPath, '/');
+            const char* s  = (s1 > s2) ? s1 : s2;
+            baseName = s ? (s + 1) : relPath;
+        }
     }
-    if (errBlob) errBlob->Release();
-    if (!g_psPermutations[psMode]) {
-        g_psPermutations[psMode] = g_ps;
+
+    void*  csoData = nullptr;
+    size_t csoSize = 0;
+    if (LoadShaderCsoFromDisk(baseName, &csoData, &csoSize) && csoData && csoSize > 0) {
+        g_d3dDevice->CreatePixelShader(csoData, csoSize, nullptr, &g_psPermutations[psMode]);
+        free(csoData);
     }
     return g_psPermutations[psMode];
 }
@@ -1236,14 +978,11 @@ bool InitD3D11HostDevice() {
     UpdateGammaLutTexture(identRamp);
     g_hasGammaRamp = false;
 
-    // Compile HLSL Vertex & Pixel Shaders
-    ID3DBlob* vsBlob = nullptr;
-    ID3DBlob* psBlob = nullptr;
-    ID3DBlob* errBlob = nullptr;
-
-    hr = D3DCompile(kGhostHLSL, strlen(kGhostHLSL), "GhostVS", nullptr, nullptr, "VSMain", "vs_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsBlob, &errBlob);
-    if (SUCCEEDED(hr) && vsBlob) {
-        g_d3dDevice->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &g_vs);
+    // Load fixed-function Vertex & Pixel Shaders from disk cache (GhostWin11_Data\shaders\*.cso)
+    void*  vsData = nullptr;
+    size_t vsSize = 0;
+    if (LoadShaderCsoFromDisk("fixed_vs", &vsData, &vsSize) && vsData && vsSize > 0) {
+        g_d3dDevice->CreateVertexShader(vsData, vsSize, nullptr, &g_vs);
         D3D11_INPUT_ELEMENT_DESC ied[] = {
             { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
             { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT,    0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0 },
@@ -1255,19 +994,10 @@ bool InitD3D11HostDevice() {
             { "TEXCOORD", 4, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 76, D3D11_INPUT_PER_VERTEX_DATA, 0 },
             { "COLOR",    1, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 92, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         };
-        g_d3dDevice->CreateInputLayout(ied, 9, vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), &g_inputLayout);
-        vsBlob->Release();
+        g_d3dDevice->CreateInputLayout(ied, 9, vsData, vsSize, &g_inputLayout);
+        free(vsData);
     }
-    if (errBlob) { errBlob->Release(); errBlob = nullptr; }
 
-    hr = D3DCompile(kGhostHLSL, strlen(kGhostHLSL), "GhostPS", nullptr, nullptr, "PSMain", "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &errBlob);
-    if (SUCCEEDED(hr) && psBlob) {
-        g_d3dDevice->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &g_ps);
-        psBlob->Release();
-    }
-    if (errBlob) { errBlob->Release(); errBlob = nullptr; }
-
-    // Pre-compile fixed-function pixel shader permutation (mode 0)
     GetPixelShaderPermutation(0u);
 
     D3D11_BUFFER_DESC cbd = {};

@@ -4,7 +4,8 @@
 // Path & Config INI Helpers (<exeDir>\GhostWin11_Data\config.ini)
 // ============================================================================
 
-GhostKeyBindings g_editKeyBindings = {};
+GhostKeyBindings g_editKeyBindings        = {};
+bool             g_enableHavokDebugServer = false;
 
 KeyBindSlotMeta g_keySlots[23] = {
     { L"Crouch",      L"",      L"Crouch (L-Trigger)",                   &g_editKeyBindings.vkCrouch,      { 272, 108, 408, 138 } },
@@ -34,6 +35,9 @@ KeyBindSlotMeta g_keySlots[23] = {
 
 void TrimTrailingSlashesW(wchar_t* path) {
     if (!path) return;
+    if (path[0] >= L'a' && path[0] <= L'z' && path[1] == L':') {
+        path[0] = (wchar_t)(path[0] - L'a' + L'A');
+    }
     size_t len = wcslen(path);
     while (len > 0 && (path[len - 1] == L' ' || path[len - 1] == L'\t' || path[len - 1] == L'\r' || path[len - 1] == L'\n')) {
         path[--len] = L'\0';
@@ -54,13 +58,6 @@ void JoinPathW(wchar_t* outBuf, size_t maxCount, const wchar_t* baseDir, const w
     bool hasSlash = (baseDir[len - 1] == L'\\' || baseDir[len - 1] == L'/');
     swprintf(outBuf, maxCount, hasSlash ? L"%ls%ls" : L"%ls\\%ls", baseDir, subPath);
 }
-
-#define GHOST_WIDEN_IMPL(x) L#x
-#define GHOST_WIDEN(x)      GHOST_WIDEN_IMPL(x)
-#ifndef GHOST_PROJECT_NAME
-#define GHOST_PROJECT_NAME  GhostWin11
-#endif
-static constexpr const wchar_t* kAppDataFolderNameW = GHOST_WIDEN(GHOST_PROJECT_NAME) L"_Data";
 
 void GetExeDirW(wchar_t* outDirW, size_t maxCount) {
     if (!outDirW || maxCount == 0) return;
@@ -162,6 +159,36 @@ void LoadKeyBindingsFromIniW(const wchar_t* iniPathW) {
         }
     }
     g_keyBindings = g_editKeyBindings;
+    g_osdShowFps             = GetPrivateProfileIntW(L"OSD", L"ShowFps", 0, iniPathW) != 0;
+    g_enableHavokDebugServer = GetPrivateProfileIntW(L"Compatibility", L"EnableHavokDebugServer", 0, iniPathW) != 0;
+}
+
+void SaveOsdStateToIni() {
+    wchar_t dataDirW[MAX_PATH] = {};
+    wchar_t iniPathW[MAX_PATH] = {};
+    GetAppDataAndIniPathsW(dataDirW, MAX_PATH, iniPathW, MAX_PATH);
+    if (iniPathW[0]) {
+        CreateDirectoryW(dataDirW, nullptr);
+        WritePrivateProfileStringW(L"OSD", L"ShowFps", g_osdShowFps ? L"1" : L"0", iniPathW);
+    }
+}
+
+bool IsShaderCacheCompiledInIni() {
+    wchar_t dataDirW[MAX_PATH] = {};
+    wchar_t iniPathW[MAX_PATH] = {};
+    GetAppDataAndIniPathsW(dataDirW, MAX_PATH, iniPathW, MAX_PATH);
+    if (!iniPathW[0] || GetFileAttributesW(iniPathW) == INVALID_FILE_ATTRIBUTES) return false;
+    return GetPrivateProfileIntW(L"Shaders", L"Compiled", 0, iniPathW) != 0;
+}
+
+void SetShaderCacheCompiledInIni(bool compiled) {
+    wchar_t dataDirW[MAX_PATH] = {};
+    wchar_t iniPathW[MAX_PATH] = {};
+    GetAppDataAndIniPathsW(dataDirW, MAX_PATH, iniPathW, MAX_PATH);
+    if (iniPathW[0]) {
+        CreateDirectoryW(dataDirW, nullptr);
+        WritePrivateProfileStringW(L"Shaders", L"Compiled", compiled ? L"1" : L"0", iniPathW);
+    }
 }
 
 void SaveKeyBindingsToIniW(const wchar_t* iniPathW) {
@@ -184,11 +211,22 @@ void PersistAndInitUserDataDir(const wchar_t* gameDirW) {
     CreateDirectoryW(userDataDirW, nullptr);
     WideCharToMultiByte(CP_ACP, 0, userDataDirW, -1, g_appRootDir, sizeof(g_appRootDir), nullptr, nullptr);
 
+    wchar_t prevGameDirW[MAX_PATH] = {};
+    GetPrivateProfileStringW(L"Paths", L"GameDir", L"", prevGameDirW, MAX_PATH, iniPathW);
+    TrimTrailingSlashesW(prevGameDirW);
+    int shadersCompiled = (int)GetPrivateProfileIntW(L"Shaders", L"Compiled", 0, iniPathW);
+    if (prevGameDirW[0] != L'\0' && _wcsicmp(prevGameDirW, gameDirW) != 0) {
+        shadersCompiled = 0;
+    }
+
     wchar_t numBuf[32];
     swprintf(numBuf, 32, L"%d", g_selectedAdapterIndex);
 
     WritePrivateProfileStringW(L"Paths", L"GameDir", gameDirW, iniPathW);
     WritePrivateProfileStringW(L"Graphics", L"AdapterIndex", numBuf, iniPathW);
     WritePrivateProfileStringW(L"Graphics", L"AdapterName", g_selectedAdapterName, iniPathW);
+    WritePrivateProfileStringW(L"OSD", L"ShowFps", g_osdShowFps ? L"1" : L"0", iniPathW);
+    WritePrivateProfileStringW(L"Shaders", L"Compiled", shadersCompiled ? L"1" : L"0", iniPathW);
+    WritePrivateProfileStringW(L"Compatibility", L"EnableHavokDebugServer", g_enableHavokDebugServer ? L"1" : L"0", iniPathW);
     SaveKeyBindingsToIniW(iniPathW);
 }

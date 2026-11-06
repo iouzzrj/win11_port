@@ -18,11 +18,12 @@ struct GpuAdapterInfo {
 };
 
 enum LauncherCtrlIds {
-    IDC_COMBO_GPU     = 101,
-    IDC_STATIC_INFO   = 104,
-    IDC_EDIT_GAMEDIR  = 105,
-    IDC_BTN_BROWSE    = 106,
-    IDC_BTN_KEYCONFIG = 107,
+    IDC_COMBO_GPU           = 101,
+    IDC_STATIC_INFO         = 104,
+    IDC_EDIT_GAMEDIR        = 105,
+    IDC_BTN_BROWSE          = 106,
+    IDC_BTN_KEYCONFIG       = 107,
+    IDC_CHK_COMPILE_SHADERS = 108,
 };
 
 static std::vector<GpuAdapterInfo> s_gpuAdapters;
@@ -52,15 +53,7 @@ static bool TryPortableFallbackToExeDir() {
 static int ResolveGpuComboSelectionFromIniW(const wchar_t* iniPathW) {
     if (s_gpuAdapters.empty()) return 0;
 
-    // Default to the hardware GPU with the highest dedicated VRAM (discrete GPU on dual-GPU laptops)
     int bestSel = 0;
-    SIZE_T bestVram = 0;
-    for (size_t i = 0; i < s_gpuAdapters.size(); ++i) {
-        if (!s_gpuAdapters[i].isSoftware && s_gpuAdapters[i].dedicatedVramMB > bestVram) {
-            bestVram = s_gpuAdapters[i].dedicatedVramMB;
-            bestSel = (int)i;
-        }
-    }
 
     if (iniPathW && iniPathW[0] && GetFileAttributesW(iniPathW) != INVALID_FILE_ATTRIBUTES) {
         int savedAdapterIdx = (int)GetPrivateProfileIntW(L"Graphics", L"AdapterIndex", -1, iniPathW);
@@ -609,6 +602,99 @@ static bool BrowseForGameFolder(HWND hParent) {
     return selectedValid;
 }
 
+static LRESULT CALLBACK LauncherWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+// Page 1 & Page 2 shared Launcher UI handles & state
+static HWND     s_hTitle             = nullptr;
+static HWND     s_hSub               = nullptr;
+static HWND     s_hGrpDir            = nullptr;
+static HWND     s_hLblDir            = nullptr;
+static HWND     s_hBtnBrowse         = nullptr;
+static HWND     s_hGrpGpu            = nullptr;
+static HWND     s_hLblGpu            = nullptr;
+static HWND     s_hChkCompileShaders = nullptr;
+static HWND     s_hBtnKeys           = nullptr;
+static HWND     s_hBtnOk             = nullptr;
+static HWND     s_hBtnCancel         = nullptr;
+static HFONT    s_hFontTitle         = nullptr;
+static HFONT    s_hFontUI            = nullptr;
+static HFONT    s_hFontBold          = nullptr;
+static HFONT    s_hFontSmall         = nullptr;
+
+static bool     s_inShaderCompilePage    = false;
+static bool     s_shaderCompileCancelled = false;
+static uint32_t s_shaderDoneCount        = 0;
+static uint32_t s_shaderTotalCount       = 308;
+static char     s_currentShaderName[128] = "fixed_ps";
+
+static void UpdateShaderCheckboxState() {
+    if (!s_hChkCompileShaders) return;
+
+    wchar_t exeDataDirW[MAX_PATH] = {};
+    wchar_t exeIniPathW[MAX_PATH] = {};
+    GetAppDataAndIniPathsW(exeDataDirW, MAX_PATH, exeIniPathW, MAX_PATH);
+
+    UINT compiledVal = GetPrivateProfileIntW(L"Shaders", L"Compiled", 0, exeIniPathW);
+
+    wchar_t savedGameDirW[MAX_PATH] = {};
+    GetPrivateProfileStringW(L"Paths", L"GameDir", L"", savedGameDirW, MAX_PATH, exeIniPathW);
+    TrimTrailingSlashesW(savedGameDirW);
+
+    bool gameDirMatches = (savedGameDirW[0] != L'\0' && _wcsicmp(savedGameDirW, s_selectedGameDirW) == 0);
+
+    wchar_t fixedVsCsoW[MAX_PATH] = {};
+    wchar_t fixedPsCsoW[MAX_PATH] = {};
+    JoinPathW(fixedVsCsoW, MAX_PATH, exeDataDirW, L"shaders\\fixed_vs.cso");
+    JoinPathW(fixedPsCsoW, MAX_PATH, exeDataDirW, L"shaders\\fixed_ps.cso");
+    bool csoExists = (GetFileAttributesW(fixedVsCsoW) != INVALID_FILE_ATTRIBUTES &&
+                      GetFileAttributesW(fixedPsCsoW) != INVALID_FILE_ATTRIBUTES);
+
+    if (compiledVal != 0 && gameDirMatches && csoExists) {
+        // Compiled=1: Unchecked by default, enabled so the user can check it to force recompilation
+        SetWindowTextW(s_hChkCompileShaders, L"Recompile Shaders");
+        SendMessageW(s_hChkCompileShaders, BM_SETCHECK, BST_UNCHECKED, 0);
+        EnableWindow(s_hChkCompileShaders, TRUE);
+    } else {
+        // Compiled=0 (or cache missing / game folder changed): Automatically checked and grayed out
+        SetWindowTextW(s_hChkCompileShaders, L"Compile Shaders");
+        SendMessageW(s_hChkCompileShaders, BM_SETCHECK, BST_CHECKED, 0);
+        EnableWindow(s_hChkCompileShaders, FALSE);
+    }
+}
+
+static bool OnLauncherShaderProgressTick(uint32_t doneCount, uint32_t totalCount, const char* currentShaderName, void* userData) {
+    HWND hWnd = reinterpret_cast<HWND>(userData);
+    s_shaderDoneCount  = doneCount;
+    s_shaderTotalCount = (totalCount > 0) ? totalCount : 308u;
+    if (currentShaderName) {
+        strncpy(s_currentShaderName, currentShaderName, sizeof(s_currentShaderName) - 1);
+        s_currentShaderName[sizeof(s_currentShaderName) - 1] = '\0';
+    }
+
+    MSG msg;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) {
+            s_shaderCompileCancelled = true;
+        }
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+            s_shaderCompileCancelled = true;
+            continue;
+        }
+        if (!IsDialogMessageW(hWnd, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    if (hWnd && IsWindow(hWnd)) {
+        RECT rcProgressZone = { 0, 0, 580, 276 };
+        InvalidateRect(hWnd, &rcProgressZone, FALSE);
+        UpdateWindow(hWnd);
+    }
+
+    return !s_shaderCompileCancelled;
+}
+
 static LRESULT CALLBACK LauncherWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CTLCOLORSTATIC: {
@@ -616,6 +702,142 @@ static LRESULT CALLBACK LauncherWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, RGB(30, 34, 42));
             return (LRESULT)(s_hDlgBrush ? s_hDlgBrush : GetSysColorBrush(COLOR_BTNFACE));
+        }
+        case WM_PAINT: {
+            if (!s_inShaderCompilePage) {
+                break;
+            }
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hWnd, &ps);
+
+            // Double-buffer the upper wizard page area (y = 0..276) so the bottom buttons never flicker
+            const int w = 580;
+            const int h = 276;
+            HDC memDC = CreateCompatibleDC(hdc);
+            HBITMAP memBmp = CreateCompatibleBitmap(hdc, w, h);
+            HGDIOBJ oldBmp = SelectObject(memDC, memBmp);
+
+            RECT rcUpper = { 0, 0, w, h };
+            HBRUSH hBgBrush = CreateSolidBrush(RGB(243, 244, 248));
+            FillRect(memDC, &rcUpper, hBgBrush);
+
+            SetBkMode(memDC, TRANSPARENT);
+            HGDIOBJ oldFont = SelectObject(memDC, s_hFontTitle);
+
+            // 1. Top Title & Subtitle (matching exact Page 1 coordinates)
+            SetTextColor(memDC, RGB(30, 34, 42));
+            RECT rcTitle = { 22, 16, 558, 42 };
+            DrawTextW(memDC, L"StarCraft: Ghost (PC Native Port)", -1, &rcTitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+            SelectObject(memDC, s_hFontUI);
+            SetTextColor(memDC, RGB(60, 66, 78));
+            RECT rcSub = { 22, 44, 558, 64 };
+            DrawTextW(memDC, L"Precompiling Xbox NV2A shaders (.xpu / .xvu) to Direct3D 11...",
+                      -1, &rcSub, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+            // 2. GroupBox Frame (18, 80 .. 562, 268) matching Page 1's GroupBoxes
+            RECT rcGroup = { 18, 80, 562, 268 };
+            HBRUSH hGroupBorder = CreateSolidBrush(RGB(208, 213, 222));
+            FrameRect(memDC, &rcGroup, hGroupBorder);
+            DeleteObject(hGroupBorder);
+
+            SelectObject(memDC, s_hFontBold);
+            SetBkMode(memDC, OPAQUE);
+            SetBkColor(memDC, RGB(243, 244, 248));
+            SetTextColor(memDC, RGB(30, 34, 42));
+            RECT rcGrpTitle = { 28, 71, 310, 91 };
+            DrawTextW(memDC, L" Direct3D 11 Shader Precompilation ", -1, &rcGrpTitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            SetBkMode(memDC, TRANSPARENT);
+
+            // 3. Shader Compilation Description, Current File & Percentage
+            uint32_t done  = s_shaderDoneCount;
+            uint32_t total = (s_shaderTotalCount > 0) ? s_shaderTotalCount : 308u;
+            if (done > total) done = total;
+            int pct = (int)((done * 100u) / total);
+
+            SelectObject(memDC, s_hFontUI);
+            SetTextColor(memDC, RGB(68, 74, 88));
+            RECT rcDesc = { 34, 106, 546, 126 };
+            DrawTextW(memDC, L"Decompiling Xbox (.xpu / .xvu) shaders to HLSL and compiling DXBC (.cso):",
+                      -1, &rcDesc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+            SelectObject(memDC, s_hFontBold);
+            SetTextColor(memDC, RGB(24, 28, 36));
+            char statusBuf[256];
+            if (done >= total) {
+                snprintf(statusBuf, sizeof(statusBuf), "Completed (%u / %u shaders)", done, total);
+            } else {
+                snprintf(statusBuf, sizeof(statusBuf), "Compiling (%u / %u): %s",
+                         done, total, s_currentShaderName[0] ? s_currentShaderName : "fixed_ps");
+            }
+            RECT rcStatus = { 34, 138, 486, 158 };
+            DrawTextA(memDC, statusBuf, -1, &rcStatus, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+            char pctBuf[32];
+            snprintf(pctBuf, sizeof(pctBuf), "%d%%", pct);
+            RECT rcPct = { 488, 138, 546, 158 };
+            DrawTextA(memDC, pctBuf, -1, &rcPct, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+
+            // 4. Segmented Block-by-Block Progress Bar (32 discrete blocks)
+            RECT rcOuter = { 31, 168, 549, 202 };
+            HBRUSH hFrameBrush = CreateSolidBrush(RGB(158, 165, 178));
+            HBRUSH hTrackBrush = CreateSolidBrush(RGB(255, 255, 255));
+            FillRect(memDC, &rcOuter, hTrackBrush);
+            FrameRect(memDC, &rcOuter, hFrameBrush);
+            DeleteObject(hFrameBrush);
+            DeleteObject(hTrackBrush);
+
+            constexpr int kNumBlocks = 32;
+            int filledBlocks = (int)((done * (uint32_t)kNumBlocks) / total);
+            if (done > 0 && filledBlocks == 0) filledBlocks = 1;
+            if (filledBlocks > kNumBlocks) filledBlocks = kNumBlocks;
+
+            HBRUSH hFillTopBrush  = CreateSolidBrush(RGB(44, 198, 78));
+            HBRUSH hFillBotBrush  = CreateSolidBrush(RGB(16, 166, 50));
+            HBRUSH hFillEdgeBrush = CreateSolidBrush(RGB(10, 134, 38));
+            HBRUSH hEmptyBgBrush  = CreateSolidBrush(RGB(233, 236, 242));
+            HBRUSH hEmptyEdgeBrush = CreateSolidBrush(RGB(214, 219, 228));
+
+            for (int b = 0; b < kNumBlocks; ++b) {
+                int bx = 35 + b * 16;
+                RECT rcCell = { bx, 173, bx + 14, 197 };
+                if (b < filledBlocks) {
+                    RECT rcTop = { bx + 1, 174, bx + 13, 185 };
+                    RECT rcBot = { bx + 1, 185, bx + 13, 196 };
+                    FillRect(memDC, &rcTop, hFillTopBrush);
+                    FillRect(memDC, &rcBot, hFillBotBrush);
+                    FrameRect(memDC, &rcCell, hFillEdgeBrush);
+                } else {
+                    FillRect(memDC, &rcCell, hEmptyBgBrush);
+                    FrameRect(memDC, &rcCell, hEmptyEdgeBrush);
+                }
+            }
+
+            DeleteObject(hFillTopBrush);
+            DeleteObject(hFillBotBrush);
+            DeleteObject(hFillEdgeBrush);
+            DeleteObject(hEmptyBgBrush);
+            DeleteObject(hEmptyEdgeBrush);
+
+            // 5. Footer Note inside GroupBox
+            SelectObject(memDC, s_hFontSmall);
+            SetTextColor(memDC, RGB(106, 114, 128));
+            RECT rcFooter = { 34, 220, 546, 240 };
+            wchar_t footerText[256] = {};
+            swprintf(footerText, 256,
+                     L"Shader cache is saved to %ls\\shaders\\ — future launches start immediately.",
+                     kAppDataFolderNameW);
+            DrawTextW(memDC, footerText, -1, &rcFooter, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+            SelectObject(memDC, oldFont);
+            DeleteObject(hBgBrush);
+
+            BitBlt(hdc, 0, 0, w, h, memDC, 0, 0, SRCCOPY);
+            SelectObject(memDC, oldBmp);
+            DeleteObject(memBmp);
+            DeleteDC(memDC);
+            EndPaint(hWnd, &ps);
+            return 0;
         }
         case WM_COMMAND: {
             WORD id   = LOWORD(wParam);
@@ -626,6 +848,7 @@ static LRESULT CALLBACK LauncherWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
             }
             if (id == IDC_BTN_BROWSE && code == BN_CLICKED) {
                 BrowseForGameFolder(hWnd);
+                UpdateShaderCheckboxState();
                 SetForegroundWindow(hWnd);
                 return 0;
             }
@@ -634,6 +857,9 @@ static LRESULT CALLBACK LauncherWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
                 return 0;
             }
             if (id == IDOK && code == BN_CLICKED) {
+                if (s_inShaderCompilePage) {
+                    return 0;
+                }
                 if (!IsValidGameDirW(s_selectedGameDirW)) {
                     TryPortableFallbackToExeDir();
                 }
@@ -642,9 +868,11 @@ static LRESULT CALLBACK LauncherWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
                         L"Please select a valid Game Directory containing 'Ghost.exe' first.",
                         L"Game Directory Required", MB_ICONINFORMATION | MB_OK);
                     if (!BrowseForGameFolder(hWnd) || !IsValidGameDirW(s_selectedGameDirW)) {
+                        UpdateShaderCheckboxState();
                         SetForegroundWindow(hWnd);
                         return 0;
                     }
+                    UpdateShaderCheckboxState();
                 }
                 int gpuSel = (int)SendMessageW(s_hComboGpu, CB_GETCURSEL, 0, 0);
                 if (gpuSel >= 0 && gpuSel < (int)s_gpuAdapters.size()) {
@@ -652,12 +880,79 @@ static LRESULT CALLBACK LauncherWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
                     wcsncpy(g_selectedAdapterName, s_gpuAdapters[gpuSel].description, 127);
                     g_selectedAdapterName[127] = L'\0';
                 }
+
+                bool shouldCompileShaders = (s_hChkCompileShaders &&
+                    SendMessageW(s_hChkCompileShaders, BM_GETCHECK, 0, 0) == BST_CHECKED);
+
+                // Persist selected GameDir & GPU to config.ini and load Ghost.exe image
+                PersistAndInitUserDataDir(s_selectedGameDirW);
+                if (shouldCompileShaders) {
+                    ClearShaderCacheDirectory();
+                    SetShaderCacheCompiledInIni(false);
+                }
+                SetCurrentDirectoryA(g_gameRootDir);
+
+                char ghostExePath[MAX_PATH] = {};
+                snprintf(ghostExePath, sizeof(ghostExePath), "%s\\Ghost.exe", g_gameRootDir);
+                if (!LoadGhostXboxPeImage(ghostExePath)) {
+                    MessageBoxW(hWnd, L"Failed to load Ghost.exe from the selected Game Directory!", L"Error", MB_ICONERROR);
+                    return 0;
+                }
+
+                // If checkbox is checked or shaders are not yet compiled, transition this window to Page 2
+                if (shouldCompileShaders || !IsShaderCacheReadyOnDisk()) {
+                    s_inShaderCompilePage    = true;
+                    s_shaderCompileCancelled = false;
+                    s_shaderDoneCount        = 0;
+                    s_shaderTotalCount       = 308;
+                    strncpy(s_currentShaderName, "fixed_ps", sizeof(s_currentShaderName) - 1);
+
+                    ShowWindow(s_hTitle,             SW_HIDE);
+                    ShowWindow(s_hSub,               SW_HIDE);
+                    ShowWindow(s_hGrpDir,            SW_HIDE);
+                    ShowWindow(s_hLblDir,            SW_HIDE);
+                    ShowWindow(s_hEditGameDir,       SW_HIDE);
+                    ShowWindow(s_hBtnBrowse,         SW_HIDE);
+                    ShowWindow(s_hGrpGpu,            SW_HIDE);
+                    ShowWindow(s_hLblGpu,            SW_HIDE);
+                    ShowWindow(s_hComboGpu,          SW_HIDE);
+                    ShowWindow(s_hStaticInfo,        SW_HIDE);
+                    ShowWindow(s_hChkCompileShaders, SW_HIDE);
+
+                    EnableWindow(s_hBtnKeys, FALSE);
+                    SetWindowTextW(s_hBtnOk, L"Compiling...");
+                    EnableWindow(s_hBtnOk, FALSE);
+                    SetWindowTextW(s_hBtnCancel, L"Cancel");
+                    SetWindowTextW(hWnd, L"StarCraft: Ghost — Compiling Shaders");
+
+                    InvalidateRect(hWnd, nullptr, FALSE);
+                    UpdateWindow(hWnd);
+
+                    bool ok = CompileAllGameShadersToCache(OnLauncherShaderProgressTick, hWnd);
+                    if (ok && IsWindow(hWnd)) {
+                        RECT rcProgressZone = { 0, 0, 580, 276 };
+                        InvalidateRect(hWnd, &rcProgressZone, FALSE);
+                        UpdateWindow(hWnd);
+                        Sleep(160);
+                    }
+                    s_launcherOk   = ok;
+                    s_launcherDone = true;
+                    if (IsWindow(hWnd)) {
+                        DestroyWindow(hWnd);
+                    }
+                    return 0;
+                }
+
                 s_launcherOk   = true;
                 s_launcherDone = true;
                 DestroyWindow(hWnd);
                 return 0;
             }
             if (id == IDCANCEL && code == BN_CLICKED) {
+                if (s_inShaderCompilePage) {
+                    s_shaderCompileCancelled = true;
+                    return 0;
+                }
                 s_launcherOk   = false;
                 s_launcherDone = true;
                 DestroyWindow(hWnd);
@@ -666,12 +961,17 @@ static LRESULT CALLBACK LauncherWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
             break;
         }
         case WM_CLOSE:
+            if (s_inShaderCompilePage) {
+                s_shaderCompileCancelled = true;
+                return 0;
+            }
             s_launcherOk   = false;
             s_launcherDone = true;
             DestroyWindow(hWnd);
             return 0;
         case WM_DESTROY:
             s_launcherDone = true;
+            PostMessageW(nullptr, WM_NULL, 0, 0);
             return 0;
     }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
@@ -744,7 +1044,7 @@ bool ShowLauncherDialog(HINSTANCE hInst) {
     RegisterClassExW(&wc);
 
     const int clientW = 580;
-    const int clientH = 308;
+    const int clientH = 334;
     RECT rc = { 0, 0, clientW, clientH };
     DWORD dlgStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&rc, dlgStyle, FALSE);
@@ -766,62 +1066,62 @@ bool ShowLauncherDialog(HINSTANCE hInst) {
         return true;
     }
 
-    HFONT hFontTitle = CreateFontW(-19, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+    s_hFontTitle = CreateFontW(-19, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-    HFONT hFontUI = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    s_hFontUI = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-    HFONT hFontBold = CreateFontW(-14, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+    s_hFontBold = CreateFontW(-14, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-    HFONT hFontSmall = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    s_hFontSmall = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
 
     // Title & Subtitle
-    HWND hTitle = CreateWindowExW(0, L"STATIC", L"StarCraft: Ghost (PC Native Port)",
+    s_hTitle = CreateWindowExW(0, L"STATIC", L"StarCraft: Ghost (PC Native Port)",
         WS_CHILD | WS_VISIBLE, 22, 16, 536, 26, hDlg, nullptr, hInst, nullptr);
-    SendMessageW(hTitle, WM_SETFONT, (WPARAM)hFontTitle, TRUE);
+    SendMessageW(s_hTitle, WM_SETFONT, (WPARAM)s_hFontTitle, TRUE);
 
-    HWND hSub = CreateWindowExW(0, L"STATIC", L"Configure game directory and Direct3D 11 graphics adapter:",
+    s_hSub = CreateWindowExW(0, L"STATIC", L"Configure game directory and Direct3D 11 graphics adapter:",
         WS_CHILD | WS_VISIBLE, 22, 44, 536, 20, hDlg, nullptr, hInst, nullptr);
-    SendMessageW(hSub, WM_SETFONT, (WPARAM)hFontUI, TRUE);
+    SendMessageW(s_hSub, WM_SETFONT, (WPARAM)s_hFontUI, TRUE);
 
     // 1. Game Directory GroupBox
-    HWND hGrpDir = CreateWindowExW(0, L"BUTTON", L"Game Directory (Ghost.exe)",
+    s_hGrpDir = CreateWindowExW(0, L"BUTTON", L"Game Directory (Ghost.exe)",
         WS_CHILD | WS_VISIBLE | BS_GROUPBOX, 18, 72, 544, 72, hDlg, nullptr, hInst, nullptr);
-    SendMessageW(hGrpDir, WM_SETFONT, (WPARAM)hFontBold, TRUE);
+    SendMessageW(s_hGrpDir, WM_SETFONT, (WPARAM)s_hFontBold, TRUE);
 
-    HWND hLblDir = CreateWindowExW(0, L"STATIC", L"Game Folder:",
+    s_hLblDir = CreateWindowExW(0, L"STATIC", L"Game Folder:",
         WS_CHILD | WS_VISIBLE, 34, 104, 100, 22, hDlg, nullptr, hInst, nullptr);
-    SendMessageW(hLblDir, WM_SETFONT, (WPARAM)hFontUI, TRUE);
+    SendMessageW(s_hLblDir, WM_SETFONT, (WPARAM)s_hFontUI, TRUE);
 
     s_hEditGameDir = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT",
         s_selectedGameDirW[0] ? s_selectedGameDirW : L"<Click 'Browse...' to select folder containing Ghost.exe>",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_READONLY,
         136, 100, 312, 24, hDlg, (HMENU)(uintptr_t)IDC_EDIT_GAMEDIR, hInst, nullptr);
-    SendMessageW(s_hEditGameDir, WM_SETFONT, (WPARAM)hFontUI, TRUE);
+    SendMessageW(s_hEditGameDir, WM_SETFONT, (WPARAM)s_hFontUI, TRUE);
 
-    HWND hBtnBrowse = CreateWindowExW(0, L"BUTTON", L"Browse...",
+    s_hBtnBrowse = CreateWindowExW(0, L"BUTTON", L"Browse...",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
         456, 99, 88, 26, hDlg, (HMENU)(uintptr_t)IDC_BTN_BROWSE, hInst, nullptr);
-    SendMessageW(hBtnBrowse, WM_SETFONT, (WPARAM)hFontUI, TRUE);
+    SendMessageW(s_hBtnBrowse, WM_SETFONT, (WPARAM)s_hFontUI, TRUE);
 
-    // 2. Graphics Adapter GroupBox
-    HWND hGrp = CreateWindowExW(0, L"BUTTON", L"Graphics Adapter",
-        WS_CHILD | WS_VISIBLE | BS_GROUPBOX, 18, 154, 544, 92, hDlg, nullptr, hInst, nullptr);
-    SendMessageW(hGrp, WM_SETFONT, (WPARAM)hFontBold, TRUE);
+    // 2. Graphics Adapter & Shaders GroupBox
+    s_hGrpGpu = CreateWindowExW(0, L"BUTTON", L"Graphics Adapter",
+        WS_CHILD | WS_VISIBLE | BS_GROUPBOX, 18, 154, 544, 116, hDlg, nullptr, hInst, nullptr);
+    SendMessageW(s_hGrpGpu, WM_SETFONT, (WPARAM)s_hFontBold, TRUE);
 
     // GPU Adapter Label & ComboBox
-    HWND hLblGpu = CreateWindowExW(0, L"STATIC", L"GPU Device:",
+    s_hLblGpu = CreateWindowExW(0, L"STATIC", L"GPU Device:",
         WS_CHILD | WS_VISIBLE, 34, 186, 100, 22, hDlg, nullptr, hInst, nullptr);
-    SendMessageW(hLblGpu, WM_SETFONT, (WPARAM)hFontUI, TRUE);
+    SendMessageW(s_hLblGpu, WM_SETFONT, (WPARAM)s_hFontUI, TRUE);
 
     s_hComboGpu = CreateWindowExW(0, L"COMBOBOX", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
         136, 182, 408, 240, hDlg, (HMENU)(uintptr_t)IDC_COMBO_GPU, hInst, nullptr);
-    SendMessageW(s_hComboGpu, WM_SETFONT, (WPARAM)hFontUI, TRUE);
+    SendMessageW(s_hComboGpu, WM_SETFONT, (WPARAM)s_hFontUI, TRUE);
 
     for (size_t i = 0; i < s_gpuAdapters.size(); ++i) {
         const GpuAdapterInfo& a = s_gpuAdapters[i];
@@ -836,33 +1136,41 @@ bool ShowLauncherDialog(HINSTANCE hInst) {
 
     // Adapter Detail Info Label
     s_hStaticInfo = CreateWindowExW(0, L"STATIC", L"",
-        WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP, 138, 214, 406, 18, hDlg, (HMENU)(uintptr_t)IDC_STATIC_INFO, hInst, nullptr);
-    SendMessageW(s_hStaticInfo, WM_SETFONT, (WPARAM)hFontSmall, TRUE);
+        WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP, 138, 212, 406, 18, hDlg, (HMENU)(uintptr_t)IDC_STATIC_INFO, hInst, nullptr);
+    SendMessageW(s_hStaticInfo, WM_SETFONT, (WPARAM)s_hFontSmall, TRUE);
     UpdateAdapterDetailLabel();
 
+    // Compile Shaders Checkbox (auto-checked & disabled when Compiled=0; unchecked & enabled when Compiled=1)
+    s_hChkCompileShaders = CreateWindowExW(0, L"BUTTON", L"Compile Shaders",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        136, 238, 408, 22, hDlg, (HMENU)(uintptr_t)IDC_CHK_COMPILE_SHADERS, hInst, nullptr);
+    SendMessageW(s_hChkCompileShaders, WM_SETFONT, (WPARAM)s_hFontUI, TRUE);
+    UpdateShaderCheckboxState();
+
     // Keyboard Config, Launch & Exit Buttons
-    HWND hBtnKeys = CreateWindowExW(0, L"BUTTON", L"Keyboard Config...",
+    s_hBtnKeys = CreateWindowExW(0, L"BUTTON", L"Keyboard Config...",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        18, 258, 155, 34, hDlg, (HMENU)(uintptr_t)IDC_BTN_KEYCONFIG, hInst, nullptr);
-    SendMessageW(hBtnKeys, WM_SETFONT, (WPARAM)hFontUI, TRUE);
+        18, 284, 155, 34, hDlg, (HMENU)(uintptr_t)IDC_BTN_KEYCONFIG, hInst, nullptr);
+    SendMessageW(s_hBtnKeys, WM_SETFONT, (WPARAM)s_hFontUI, TRUE);
 
-    HWND hBtnOk = CreateWindowExW(0, L"BUTTON", L"Launch Game",
+    s_hBtnOk = CreateWindowExW(0, L"BUTTON", L"Launch Game",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-        322, 258, 125, 34, hDlg, (HMENU)(uintptr_t)IDOK, hInst, nullptr);
-    SendMessageW(hBtnOk, WM_SETFONT, (WPARAM)hFontBold, TRUE);
+        322, 284, 125, 34, hDlg, (HMENU)(uintptr_t)IDOK, hInst, nullptr);
+    SendMessageW(s_hBtnOk, WM_SETFONT, (WPARAM)s_hFontBold, TRUE);
 
-    HWND hBtnCancel = CreateWindowExW(0, L"BUTTON", L"Exit",
+    s_hBtnCancel = CreateWindowExW(0, L"BUTTON", L"Exit",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        457, 258, 105, 34, hDlg, (HMENU)(uintptr_t)IDCANCEL, hInst, nullptr);
-    SendMessageW(hBtnCancel, WM_SETFONT, (WPARAM)hFontUI, TRUE);
+        457, 284, 105, 34, hDlg, (HMENU)(uintptr_t)IDCANCEL, hInst, nullptr);
+    SendMessageW(s_hBtnCancel, WM_SETFONT, (WPARAM)s_hFontUI, TRUE);
 
-    s_launcherOk   = false;
-    s_launcherDone = false;
+    s_launcherOk          = false;
+    s_launcherDone        = false;
+    s_inShaderCompilePage = false;
 
     ShowWindow(hDlg, SW_SHOW);
     UpdateWindow(hDlg);
     SetForegroundWindow(hDlg);
-    SetFocus(hBtnOk);
+    SetFocus(s_hBtnOk);
 
     MSG msg;
     while (!s_launcherDone && GetMessageW(&msg, nullptr, 0, 0)) {
@@ -876,20 +1184,15 @@ bool ShowLauncherDialog(HINSTANCE hInst) {
         }
     }
 
-    DeleteObject(hFontTitle);
-    DeleteObject(hFontUI);
-    DeleteObject(hFontBold);
-    DeleteObject(hFontSmall);
+    DeleteObject(s_hFontTitle);
+    DeleteObject(s_hFontUI);
+    DeleteObject(s_hFontBold);
+    DeleteObject(s_hFontSmall);
+    s_hFontTitle = s_hFontUI = s_hFontBold = s_hFontSmall = nullptr;
     if (s_hDlgBrush) {
         DeleteObject(s_hDlgBrush);
         s_hDlgBrush = nullptr;
     }
 
-    if (!s_launcherOk) {
-        return false;
-    }
-
-    // Persist selected GameDir & GPU to <exeDir>\GhostWin11\config.ini
-    PersistAndInitUserDataDir(s_selectedGameDirW);
-    return true;
+    return s_launcherOk;
 }
